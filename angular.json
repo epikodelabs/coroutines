@@ -13,25 +13,27 @@
           "style": "scss"
         }
       },
-      "root": "",
-      "sourceRoot": "src",
+      "root": "projects/apps/app1",
+      "sourceRoot": "projects/apps/app1/src",
       "prefix": "app",
       "architect": {
         "build": {
           "builder": "@angular/build:application",
           "options": {
-            "browser": "src/main.ts",
-            "tsConfig": "tsconfig.app.json",
+            "outputPath": "dist/apps/app1",
+            "index": "projects/apps/app1/src/index.html",
+            "browser": "projects/apps/app1/src/main.ts",
+            "polyfills": [],
+            "tsConfig": "projects/apps/app1/tsconfig.app.json",
             "inlineStyleLanguage": "scss",
             "assets": [
               {
                 "glob": "**/*",
-                "input": "public"
+                "input": "projects/apps/app1/public"
               }
             ],
-            "styles": [
-              "src/styles.scss"
-            ]
+            "styles": ["projects/apps/app1/src/styles.scss"],
+            "scripts": []
           },
           "configurations": {
             "production": {
@@ -69,8 +71,43 @@
           },
           "defaultConfiguration": "development"
         },
+        "extract-i18n": {
+          "builder": "@angular/build:extract-i18n"
+        },
         "test": {
-          "builder": "@angular/build:unit-test"
+          "builder": "@angular/build:unit-test",
+          "options": {
+            "tsConfig": "projects/apps/app1/tsconfig.spec.json"
+          }
+        }
+      }
+    },
+    "swiftly": {
+      "projectType": "library",
+      "root": "projects/libraries/swiftly",
+      "sourceRoot": "projects/libraries/swiftly/src",
+      "prefix": "lib",
+      "architect": {
+        "build": {
+          "builder": "@angular/build:ng-packagr",
+          "options": {
+            "project": "projects/libraries/swiftly/ng-package.json"
+          },
+          "configurations": {
+            "production": {
+              "tsConfig": "projects/libraries/swiftly/tsconfig.lib.prod.json"
+            },
+            "development": {
+              "tsConfig": "projects/libraries/swiftly/tsconfig.lib.json"
+            }
+          },
+          "defaultConfiguration": "production"
+        },
+        "test": {
+          "builder": "@angular/build:unit-test",
+          "options": {
+            "tsConfig": "projects/libraries/swiftly/tsconfig.spec.json"
+          }
         }
       }
     }

@@ -1,0 +1,660 @@
+import {
+  background,
+  channel,
+  CHANNEL_INTERNALS,
+  ChannelClosedError,
+  ContextCancelledError,
+  createAbortError,
+  otherwise,
+  receive,
+  select,
+  send,
+  withCancel,
+  withDeadline,
+  withTimeout,
+} from "../public-api";
+
+describe("channel", () => {
+  it("should create an unbuffered channel by default", () => {
+    const ch = channel<number>();
+    expect(ch.capacity).toBe(0);
+    expect(ch.size).toBe(0);
+    expect(ch.closed).toBeFalse();
+  });
+
+  it("should create a buffered channel", () => {
+    const ch = channel<string>(3);
+    expect(ch.capacity).toBe(3);
+    expect(ch.size).toBe(0);
+  });
+
+  it("should throw for negative capacity", () => {
+    expect(() => channel(-1)).toThrowError(/non-negative integer/);
+  });
+
+  it("should throw for non-integer capacity", () => {
+    expect(() => channel(1.5)).toThrowError(/non-negative integer/);
+  });
+
+  it("should hand off values on an unbuffered channel", async () => {
+    const ch = channel<number>();
+
+    const receive$ = ch.receive();
+    await ch.send(42);
+    const value = await receive$;
+
+    expect(value).toBe(42);
+  });
+
+  it("should buffer sends while space remains", async () => {
+    const ch = channel<number>(2);
+
+    await ch.send(1); // buffered
+    await ch.send(2); // buffered
+
+    expect(ch.size).toBe(2);
+    expect(await ch.receive()).toBe(1);
+    expect(await ch.receive()).toBe(2);
+  });
+
+  it("should block send when buffer is full", async () => {
+    const ch = channel<number>(1);
+    await ch.send(1);
+
+    let sent = false;
+    const pending = ch.send(2).then(() => {
+      sent = true;
+    });
+
+    await new Promise(r => setTimeout(r, 5));
+    expect(sent).toBeFalse();
+
+    await ch.receive();
+    await pending;
+    expect(sent).toBeTrue();
+  });
+
+  it("trySend should succeed when space is available", async () => {
+    const ch = channel<number>(1);
+    expect(ch.trySend(7)).toBeTrue();
+    expect(ch.size).toBe(1);
+  });
+
+  it("trySend should fail on unbuffered channel with no receiver", () => {
+    const ch = channel<number>();
+    expect(ch.trySend(7)).toBeFalse();
+  });
+
+  it("trySend should fail when buffer is full", async () => {
+    const ch = channel<number>(1);
+    await ch.send(1);
+    expect(ch.trySend(2)).toBeFalse();
+  });
+
+  it("tryReceive should return buffered values", async () => {
+    const ch = channel<number>(1);
+    await ch.send(99);
+
+    const result = ch.tryReceive();
+    expect(result).toEqual(jasmine.objectContaining({ ok: true, value: 99 }));
+  });
+
+  it("tryReceive should return undefined when empty", () => {
+    const ch = channel<number>();
+    expect(ch.tryReceive()).toBeUndefined();
+  });
+
+  it("tryReceive should return ok:false when closed and empty", () => {
+    const ch = channel<number>();
+    ch.close();
+    expect(ch.tryReceive()).toEqual(jasmine.objectContaining({ ok: false }));
+  });
+
+  it("should close and reject pending senders", async () => {
+    const ch = channel<number>();
+
+    const pendingSend = ch.send(1);
+    ch.close();
+
+    await expectAsync(pendingSend).toBeRejectedWithError(ChannelClosedError);
+  });
+
+  it("should close and resolve pending receivers with undefined", async () => {
+    const ch = channel<number>();
+
+    const pendingReceive = ch.receive();
+    ch.close();
+
+    expect(await pendingReceive).toBeUndefined();
+  });
+
+  it("should reject send on a closed channel", async () => {
+    const ch = channel<number>();
+    ch.close();
+
+    await expectAsync(ch.send(1)).toBeRejectedWithError(ChannelClosedError);
+  });
+
+  it("should return undefined when receiving from closed empty channel", async () => {
+    const ch = channel<number>();
+    ch.close();
+
+    expect(await ch.receive()).toBeUndefined();
+  });
+
+  it("should be async iterable", async () => {
+    const ch = channel<number>(2);
+    await ch.send(1);
+    await ch.send(2);
+    ch.close();
+
+    const values: number[] = [];
+    for await (const v of ch) {
+      values.push(v);
+    }
+
+    expect(values).toEqual([1, 2]);
+  });
+
+  it("should reject send when signal is already aborted", async () => {
+    const ch = channel<number>();
+    const controller = new AbortController();
+    controller.abort(new ContextCancelledError("stopped"));
+
+    await expectAsync(ch.send(1, controller.signal)).toBeRejectedWithError(/stopped/);
+  });
+
+  it("should reject receive when signal is already aborted", async () => {
+    const ch = channel<number>();
+    const controller = new AbortController();
+    controller.abort(new ContextCancelledError("stopped"));
+
+    await expectAsync(ch.receive(controller.signal)).toBeRejectedWithError(/stopped/);
+  });
+
+  it("should abort a blocked send via signal", async () => {
+    const ch = channel<number>();
+    const controller = new AbortController();
+
+    const pending = ch.send(1, controller.signal);
+    controller.abort(new ContextCancelledError("stopped"));
+
+    await expectAsync(pending).toBeRejectedWithError(/stopped/);
+  });
+
+  it("should abort a blocked receive via signal", async () => {
+    const ch = channel<number>();
+    const controller = new AbortController();
+
+    const pending = ch.receive(controller.signal);
+    controller.abort(new ContextCancelledError("stopped"));
+
+    await expectAsync(pending).toBeRejectedWithError(/stopped/);
+  });
+});
+
+describe("context", () => {
+  it("background creates a non-aborted context", () => {
+    const ctx = background();
+    expect(ctx.signal.aborted).toBeFalse();
+    expect(ctx.reason).toBeUndefined();
+  });
+
+  it("withCancel cancel aborts the child signal", () => {
+    const [ctx, cancel] = withCancel();
+    expect(ctx.signal.aborted).toBeFalse();
+
+    cancel();
+    expect(ctx.signal.aborted).toBeTrue();
+    expect(ctx.reason).toBeInstanceOf(ContextCancelledError);
+  });
+
+  it("withCancel cancel accepts a custom reason", () => {
+    const [ctx, cancel] = withCancel();
+    const err = new Error("custom");
+    cancel(err);
+    expect(ctx.reason).toBe(err);
+  });
+
+  it("withCancel child is aborted when parent aborts", async () => {
+    const [parent, cancelParent] = withCancel(background());
+    const [child] = withCancel(parent);
+
+    expect(child.signal.aborted).toBeFalse();
+    cancelParent();
+    expect(child.signal.aborted).toBeTrue();
+  });
+
+  it("withTimeout aborts after the specified delay", async () => {
+    const [ctx, cancel] = withTimeout(background(), 20);
+    expect(ctx.signal.aborted).toBeFalse();
+
+    await new Promise(r => setTimeout(r, 50));
+    expect(ctx.signal.aborted).toBeTrue();
+    expect(String(ctx.reason)).toContain("timeout");
+
+    cancel(); // idempotent cleanup
+  });
+
+  it("withTimeout manual cancel clears the timer", () => {
+    const [ctx, cancel] = withTimeout(background(), 10000);
+    cancel();
+    expect(ctx.signal.aborted).toBeTrue();
+  });
+
+  it("withDeadline aborts at the deadline", async () => {
+    const [ctx] = withDeadline(background(), Date.now() + 20);
+    expect(ctx.signal.aborted).toBeFalse();
+
+    await new Promise(r => setTimeout(r, 50));
+    expect(ctx.signal.aborted).toBeTrue();
+  });
+
+  it("withDeadline accepts a Date object", async () => {
+    const [ctx] = withDeadline(background(), new Date(Date.now() + 20));
+    await new Promise(r => setTimeout(r, 50));
+    expect(ctx.signal.aborted).toBeTrue();
+  });
+
+  it("withDeadline with past deadline aborts soon after", async () => {
+    const [ctx] = withDeadline(background(), Date.now() - 10);
+    // setTimeout(0) schedules on next tick; wait a bit
+    await new Promise(r => setTimeout(r, 10));
+    expect(ctx.signal.aborted).toBeTrue();
+  });
+
+  it("done resolves when cancelled", async () => {
+    const [ctx, cancel] = withCancel();
+    let resolved = false;
+    ctx.done.then(() => { resolved = true; });
+
+    cancel();
+    await ctx.done;
+    expect(resolved).toBeTrue();
+  });
+
+  it("value and withValue form a chain", () => {
+    const root = background();
+    const child = root.withValue("key", 42);
+    const grandchild = child.withValue("other", "x");
+
+    expect(child.value("key")).toBe(42);
+    expect(grandchild.value("key")).toBe(42);
+    expect(grandchild.value("other")).toBe("x");
+    expect(root.value("key")).toBeUndefined();
+  });
+
+  it("createAbortError returns the Error reason unchanged", () => {
+    const err = new Error("boom");
+    const ctrl = new AbortController();
+    ctrl.abort(err);
+    expect(createAbortError(ctrl.signal)).toBe(err);
+  });
+
+  it("createAbortError wraps string reason in ContextCancelledError", () => {
+    const ctrl = new AbortController();
+    ctrl.abort("stopped");
+    const result = createAbortError(ctrl.signal);
+    expect(result).toBeInstanceOf(ContextCancelledError);
+    expect(result.message).toBe("stopped");
+  });
+
+  it("createAbortError with ContextCancelledError reason returns it", () => {
+    const err = new ContextCancelledError("my cancel");
+    const ctrl = new AbortController();
+    ctrl.abort(err);
+    expect(createAbortError(ctrl.signal)).toBe(err);
+  });
+});
+
+describe("selection", () => {
+  it("receive builds a receive case", () => {
+    const ch = channel<number>();
+    const c = receive(ch, "myCase");
+    expect(c.op).toBe("receive");
+    expect(c.channel).toBe(ch);
+    expect(c.name).toBe("myCase");
+  });
+
+  it("send builds a send case", () => {
+    const ch = channel<number>();
+    const c = send(ch, 42, "myCase");
+    expect(c.op).toBe("send");
+    expect(c.channel).toBe(ch);
+    expect(c.value).toBe(42);
+    expect(c.name).toBe("myCase");
+  });
+
+  it("otherwise builds a default case", () => {
+    const c = otherwise("fallback");
+    expect(c.op).toBe("default");
+    expect(c.name).toBe("fallback");
+  });
+
+  it("select chooses a ready receive case", async () => {
+    const ch = channel<number>(1);
+    await ch.send(7);
+
+    const result = await select([receive(ch, "r")]);
+    expect(result.op).toBe("receive");
+    expect(result.name).toBe("r");
+    expect(result.value).toBe(7);
+    expect(result.ok).toBeTrue();
+  });
+
+  it("select chooses a ready send case", async () => {
+    const ch = channel<number>(1);
+
+    const result = await select([send(ch, 8, "s")]);
+    expect(result.op).toBe("send");
+    expect(result.name).toBe("s");
+    expect(result.ok).toBeTrue();
+    expect(await ch.receive()).toBe(8);
+  });
+
+  it("select falls back to default when nothing is ready", async () => {
+    const ch = channel<number>();
+
+    const result = await select([receive(ch, "r"), otherwise("def")]);
+    expect(result.op).toBe("default");
+    expect(result.name).toBe("def");
+    expect(result.ok).toBeTrue();
+  });
+
+  it("select blocks until a case is ready", async () => {
+    const ch = channel<number>();
+
+    const pending = select([receive(ch, "r")]);
+    setTimeout(() => ch.send(99), 10);
+
+    const result = await pending;
+    expect(result.value).toBe(99);
+  });
+
+  it("select receive on closed channel returns ok:false", async () => {
+    const ch = channel<number>();
+    ch.close();
+
+    const result = await select([receive(ch, "r")]);
+    expect(result.op).toBe("receive");
+    expect(result.ok).toBeFalse();
+  });
+
+  it("select send on closed channel throws ChannelClosedError", async () => {
+    const ch = channel<number>();
+    ch.close();
+
+    await expectAsync(select([send(ch, 1, "s")])).toBeRejectedWithError(ChannelClosedError);
+  });
+
+  it("select throws when context is already aborted", async () => {
+    const ch = channel<number>();
+    const err = new ContextCancelledError("pre-aborted");
+    const fakeSignal = {
+      aborted: true,
+      reason: err,
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      dispatchEvent: () => false,
+    } as unknown as AbortSignal;
+
+    const fakeCtx = {
+      signal: fakeSignal,
+      done: Promise.resolve(),
+      reason: err,
+      value: () => undefined,
+      withValue: () => fakeCtx,
+    } as any;
+
+    await expectAsync(select([receive(ch, "r")], fakeCtx)).toBeRejectedWithError(/pre-aborted/);
+  });
+
+  it("select aborts when context is cancelled while waiting", async () => {
+    const ch = channel<number>();
+    const [ctx, cancel] = withCancel();
+
+    const pending = select([receive(ch, "r")], ctx);
+    cancel();
+
+    await expectAsync(pending).toBeRejectedWithError(ContextCancelledError);
+  });
+
+  it("select with multiple ready cases chooses exactly one", async () => {
+    const a = channel<number>(1);
+    const b = channel<number>(1);
+    await a.send(1);
+    await b.send(2);
+
+    const result = await select([receive(a, "a"), receive(b, "b")]);
+    expect(["a", "b"]).toContain(result.name!);
+    expect(result.ok).toBeTrue();
+
+    // Only one value should be consumed
+    const remaining = [a.tryReceive(), b.tryReceive()].filter(r => r !== undefined);
+    expect(remaining.length).toBe(1);
+    expect(remaining[0]).toEqual(jasmine.objectContaining({ ok: true }));
+  });
+
+  it("select send case paired with waiting receiver", async () => {
+    const ch = channel<number>();
+
+    const pendingReceive = ch.receive();
+    const result = await select([send(ch, 123, "s")]);
+
+    expect(result.op).toBe("send");
+    expect(await pendingReceive).toBe(123);
+  });
+
+  it("select receive case paired with waiting sender", async () => {
+    const ch = channel<number>();
+
+    const pendingSend = ch.send(456);
+    const result = await select([receive(ch, "r")]);
+
+    expect(result.op).toBe("receive");
+    expect(result.value).toBe(456);
+    await pendingSend;
+  });
+
+  it("select cleans up registrations after resolution", async () => {
+    const a = channel<number>();
+    const b = channel<number>();
+
+    const pending = select([receive(a, "a"), receive(b, "b")]);
+    await a.send(1);
+
+    const result = await pending;
+    expect(result.name).toBe("a");
+
+    // b should still be able to receive normally later
+    setTimeout(() => b.send(2), 5);
+    expect(await b.receive()).toBe(2);
+  });
+
+  it("select resolves a pending receive with ok:false when the channel closes", async () => {
+    const ch = channel<number>();
+
+    const pending = select([receive(ch, "r")]);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    ch.close();
+
+    const result = await pending;
+    expect(result.op).toBe("receive");
+    expect(result.name).toBe("r");
+    expect(result.ok).toBeFalse();
+    expect(result.value).toBeUndefined();
+  });
+
+  it("select resolves a pending send when a receiver arrives later", async () => {
+    const ch = channel<number>();
+
+    const pending = select([send(ch, 123, "s")]);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const receive$ = ch.receive();
+    const result = await pending;
+
+    expect(result.op).toBe("send");
+    expect(result.name).toBe("s");
+    expect(result.ok).toBeTrue();
+    expect(await receive$).toBe(123);
+  });
+
+  it("select rejects a pending send when the channel closes", async () => {
+    const ch = channel<number>();
+
+    const pending = select([send(ch, 1, "s")]);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    ch.close();
+
+    await expectAsync(pending).toBeRejectedWithError(ChannelClosedError);
+  });
+
+  it("select flushes a queued send into the buffer after space is freed", async () => {
+    const ch = channel<number>(1);
+    await ch.send(1);
+
+    const pending = select([send(ch, 2, "s")]);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(await ch.receive()).toBe(1);
+
+    const result = await pending;
+    expect(result.op).toBe("send");
+    expect(result.name).toBe("s");
+    expect(result.ok).toBeTrue();
+    expect(await ch.receive()).toBe(2);
+  });
+
+  it("channel internals reject select sends registered after close", () => {
+    const ch = channel<number>();
+    ch.close();
+
+    const registration = {
+      id: Symbol("select"),
+      isSettled: () => false,
+      settle: () => false,
+      reject: jasmine.createSpy("reject").and.returnValue(true),
+    };
+
+    const unregister = (ch as any)[CHANNEL_INTERNALS].registerSelectSend(1, registration, {
+      index: 0,
+      caseRef: send(ch, 1, "s"),
+      name: "s",
+    });
+
+    expect(registration.reject).toHaveBeenCalledWith(jasmine.any(ChannelClosedError));
+    unregister();
+  });
+
+  it("channel internals can unregister a pending select send more than once", () => {
+    const ch = channel<number>();
+
+    const unregister = (ch as any)[CHANNEL_INTERNALS].registerSelectSend(
+      1,
+      {
+        id: Symbol("select"),
+        isSettled: () => false,
+        settle: () => false,
+        reject: () => false,
+      },
+      {
+        index: 0,
+        caseRef: send(ch, 1, "s"),
+        name: "s",
+      }
+    );
+
+    unregister();
+    unregister();
+
+    expect(ch.tryReceive()).toBeUndefined();
+  });
+
+  it("channel internals discard settled select receivers before dispatch", () => {
+    const ch = channel<number>();
+
+    const unregister = (ch as any)[CHANNEL_INTERNALS].registerSelectReceive(
+      {
+        id: Symbol("receive"),
+        isSettled: () => true,
+        settle: () => true,
+        reject: () => false,
+      },
+      {
+        index: 0,
+        caseRef: receive(ch, "r"),
+        name: "r",
+      }
+    );
+
+    expect(ch.trySend(1)).toBeFalse();
+
+    unregister();
+  });
+
+  it("channel internals discard settled select senders before receiving", () => {
+    const ch = channel<number>();
+
+    const unregister = (ch as any)[CHANNEL_INTERNALS].registerSelectSend(
+      1,
+      {
+        id: Symbol("send"),
+        isSettled: () => true,
+        settle: () => true,
+        reject: () => false,
+      },
+      {
+        index: 0,
+        caseRef: send(ch, 1, "s"),
+        name: "s",
+      }
+    );
+
+    expect(ch.tryReceive()).toBeUndefined();
+
+    unregister();
+  });
+
+  it("channel internals pair queued select senders with queued select receivers during flush", async () => {
+    const ch = channel<number>(1);
+    const internals = (ch as any)[CHANNEL_INTERNALS];
+
+    await ch.send(1);
+
+    const receiverRegistration = {
+      id: Symbol("receive"),
+      isSettled: () => false,
+      settle: jasmine.createSpy("settleReceive").and.returnValue(true),
+      reject: jasmine.createSpy("rejectReceive").and.returnValue(false),
+    };
+    const senderRegistration = {
+      id: Symbol("send"),
+      isSettled: () => false,
+      settle: jasmine.createSpy("settleSend").and.returnValue(true),
+      reject: jasmine.createSpy("rejectSend").and.returnValue(false),
+    };
+
+    const unregisterReceive = internals.registerSelectReceive(receiverRegistration, {
+      index: 0,
+      caseRef: receive(ch, "r"),
+      name: "r",
+    });
+    const unregisterSend = internals.registerSelectSend(2, senderRegistration, {
+      index: 1,
+      caseRef: send(ch, 2, "s"),
+      name: "s",
+    });
+
+    expect(ch.tryReceive()).toEqual(jasmine.objectContaining({ ok: true, value: 1 }));
+    expect(receiverRegistration.settle).toHaveBeenCalledWith(
+      jasmine.objectContaining({ op: "receive", value: 2, ok: true, name: "r" })
+    );
+    expect(senderRegistration.settle).toHaveBeenCalledWith(
+      jasmine.objectContaining({ op: "send", ok: true, name: "s" })
+    );
+
+    unregisterReceive();
+    unregisterSend();
+  });
+});

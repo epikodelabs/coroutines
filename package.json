@@ -1,12 +1,16 @@
 {
-  "name": "app1",
-  "version": "0.0.0",
+  "name": "swiftly",
+  "version": "1.0.1",
   "scripts": {
     "ng": "ng",
-    "start": "ng serve",
-    "build": "ng build",
-    "watch": "ng build --watch --configuration development",
-    "test": "ng test"
+    "start": "ng serve app1",
+    "build": "ng build app1 && ng build swiftly",
+    "build:app": "ng build app1",
+    "build:lib": "ng build swiftly",
+    "watch": "ng build app1 --watch --configuration development",
+    "test": "ng test app1",
+    "test:app": "ng test app1",
+    "test:lib": "ng test swiftly"
   },
   "private": true,
   "packageManager": "npm@10.9.8",
@@ -17,6 +21,7 @@
     "@angular/forms": "^22.0.0",
     "@angular/platform-browser": "^22.0.0",
     "@angular/router": "^22.0.0",
+    "@epikodelabs/testify": "^1.0.36",
     "rxjs": "~7.8.0",
     "tslib": "^2.3.0"
   },
@@ -24,7 +29,7 @@
     "@angular/build": "^22.0.8",
     "@angular/cli": "^22.0.8",
     "@angular/compiler-cli": "^22.0.0",
-    "jsdom": "^28.0.0",
+    "ng-packagr": "^22.0.0",
     "prettier": "^3.8.1",
     "typescript": "~6.0.2",
     "vitest": "^4.0.8"
