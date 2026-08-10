@@ -552,3 +552,15 @@ notified.
 Stress coverage exercises repeated select cancellation, context-value chaining,
 and mass timer cancellation to verify that cancellation leaves no channel
 waiters or timer workers behind.
+
+
+## Timer host isolation
+
+The shared timer runtime binds its cached worker to the host `Worker`
+constructor that created it. If the host changes while the timer runtime is
+idle—for example between isolated browser test environments—the old worker is
+discarded rather than reused across environments.
+
+Test worker mocks implement the same `set` / `clear` timer protocol as the real
+timer worker, so actor restart delays, context timeouts, and direct timer tests
+exercise the same scheduling semantics.

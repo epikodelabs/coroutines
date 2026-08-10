@@ -72,6 +72,7 @@ idescribe("actor", () => {
       private taskId = "";
       private pendingWorkerRequests = new Map<string, { resolve: (value: any) => void; reject: (error: Error) => void }>();
       private requestCounter = 0;
+      private timers = new Map<number, ReturnType<typeof setTimeout>>();
 
       constructor(_url: string, _options?: any) {
         this.workerId = Math.floor(Math.random() * 100000);
@@ -227,6 +228,25 @@ idescribe("actor", () => {
           throw injectedError;
         }
 
+        if (msg?.type === "set" && typeof msg.id === "number") {
+          const handle = setTimeout(() => {
+            this.timers.delete(msg.id);
+            const event = { data: { type: "elapsed", id: msg.id } } as any;
+            this.onmessage?.(event);
+          }, msg.ms);
+          this.timers.set(msg.id, handle);
+          return;
+        }
+
+        if (msg?.type === "clear" && typeof msg.id === "number") {
+          const handle = this.timers.get(msg.id);
+          if (handle !== undefined) {
+            clearTimeout(handle);
+            this.timers.delete(msg.id);
+          }
+          return;
+        }
+
         setTimeout(() => {
           if (this.terminated) return;
 
@@ -317,6 +337,8 @@ idescribe("actor", () => {
       terminate() {
         this.terminated = true;
         this.actorRunning = false;
+        for (const handle of this.timers.values()) clearTimeout(handle);
+        this.timers.clear();
         this.workerInbox.close();
         this.listeners = {};
         this.onmessage = null;

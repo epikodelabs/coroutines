@@ -32,6 +32,7 @@ type PendingTimer = {
 };
 
 let worker: Worker | undefined;
+let workerConstructor: typeof Worker | undefined;
 let nextTimerId = 0;
 const pending = new Map<number, PendingTimer>();
 
@@ -45,6 +46,7 @@ const releaseWorkerIfIdle = (): void => {
 
   worker.terminate();
   worker = undefined;
+  workerConstructor = undefined;
   releaseBlobUrl(TIMER_WORKER_SCRIPT);
 };
 
@@ -54,6 +56,7 @@ const failPendingTimers = (error: Error): void => {
 
   worker?.terminate();
   worker = undefined;
+  workerConstructor = undefined;
   releaseBlobUrl(TIMER_WORKER_SCRIPT);
 
   let callbackError: unknown;
@@ -71,9 +74,26 @@ const failPendingTimers = (error: Error): void => {
 };
 
 const ensureTimerWorker = (): Worker => {
-  if (worker) return worker;
   if (typeof Worker === "undefined") {
     throw new Error("worker-backed timers require Web Worker support");
+  }
+
+  if (worker) {
+    if (workerConstructor === Worker) {
+      return worker;
+    }
+
+    // The host Worker implementation changed (common in isolated browser tests).
+    // Reusing a worker created by a previous host would cross environment
+    // boundaries. Only an idle worker may be replaced safely.
+    if (pending.size !== 0) {
+      throw new Error("timer worker host changed while timers are pending");
+    }
+
+    worker.terminate();
+    worker = undefined;
+    workerConstructor = undefined;
+    releaseBlobUrl(TIMER_WORKER_SCRIPT);
   }
 
   const blobUrl = acquireBlobUrl(TIMER_WORKER_SCRIPT);
@@ -82,6 +102,7 @@ const ensureTimerWorker = (): Worker => {
   try {
     createdWorker = new Worker(blobUrl);
     worker = createdWorker;
+    workerConstructor = Worker;
   } catch (error) {
     releaseBlobUrl(TIMER_WORKER_SCRIPT);
     throw error;

@@ -15,6 +15,10 @@ class MockWorker {
   static instances: MockWorker[] = [];
   static postMessageError: unknown = null;
 
+  onmessage: ((event: MessageEvent<any>) => void) | null = null;
+  onerror: ((event: ErrorEvent) => void) | null = null;
+  private timers = new Map<number, ReturnType<typeof setTimeout>>();
+
   readonly listeners = new Map<string, Array<(event: any) => void>>();
   readonly sentMessages: WorkerProtocolMessage[] = [];
   readonly sentTransfers: Transferable[][] = [];
@@ -38,17 +42,37 @@ class MockWorker {
     if (index >= 0) listeners.splice(index, 1);
   }
 
-  postMessage(message: WorkerProtocolMessage, transfer: Transferable[] = []) {
+  postMessage(message: WorkerProtocolMessage | any, transfer: Transferable[] = []) {
     if (MockWorker.postMessageError !== null) {
       throw MockWorker.postMessageError;
     }
 
     this.sentMessages.push(message);
     this.sentTransfers.push([...transfer]);
+
+    if (message?.type === "set" && typeof message.id === "number") {
+      const handle = setTimeout(() => {
+        this.timers.delete(message.id);
+        this.onmessage?.({
+          data: { type: "elapsed", id: message.id },
+        } as MessageEvent<any>);
+      }, message.ms);
+      this.timers.set(message.id, handle);
+    } else if (message?.type === "clear" && typeof message.id === "number") {
+      const handle = this.timers.get(message.id);
+      if (handle !== undefined) {
+        clearTimeout(handle);
+        this.timers.delete(message.id);
+      }
+    }
   }
 
   terminate() {
     this.terminated = true;
+    for (const handle of this.timers.values()) clearTimeout(handle);
+    this.timers.clear();
+    this.onmessage = null;
+    this.onerror = null;
   }
 
   dispatch(message: WorkerProtocolMessage) {
