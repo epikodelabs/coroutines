@@ -127,14 +127,26 @@ export function withCancel(parent: Context = background()): [Context, Cancel] {
  * @returns A tuple of `[childContext, cancel]`.
  */
 export function withTimeout(parent: Context, ms: number): [Context, Cancel] {
+  if (!Number.isFinite(ms) || ms < 0) {
+    throw new RangeError("timer duration must be a finite non-negative number");
+  }
+
   const [ctx, cancel] = withCancel(parent);
-  const timer = scheduleWorkerTimer(
-    ms,
-    () => cancel(new ContextCancelledError(`context timeout after ${ms}ms`)),
-    (error) => cancel(error),
-  );
-  ctx.done.finally(() => timer.cancel());
-  return [ctx, cancel];
+
+  try {
+    const timer = scheduleWorkerTimer(
+      ms,
+      () => cancel(new ContextCancelledError(`context timeout after ${ms}ms`)),
+      (error) => cancel(error),
+    );
+    ctx.done.finally(() => timer.cancel());
+    return [ctx, cancel];
+  } catch (error) {
+    // Timer construction can fail (for example when Worker is unavailable).
+    // Cancel the derived context first so its parent listener is detached.
+    cancel(error);
+    throw error;
+  }
 }
 
 /**

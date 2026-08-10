@@ -455,3 +455,17 @@ This keeps two distinct completion modes on one ownership primitive:
 - `settle()` — inspect the full structured outcome.
 
 No separate task-collection or `allSettled` abstraction is introduced.
+
+
+## Hardening invariants
+
+Swiftly treats cancellation cleanup as part of the concurrency contract:
+
+- timer/context construction failures must not leave parent cancellation listeners attached;
+- completed or cancelled timer workers must not affect later worker generations;
+- a failed timer-worker command fails remaining timers coherently instead of stranding them;
+- `select()` accepts at most one default branch, so selection policy is never ambiguous;
+- task-group reports are complete by construction and never contain internal placeholder states.
+
+These rules do not add new primitives; they tighten the lifecycle guarantees of
+the existing model.

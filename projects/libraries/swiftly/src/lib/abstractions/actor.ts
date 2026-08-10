@@ -744,6 +744,10 @@ const __streamixWithCancel = (parent = __streamixBackground()) => {
 };
 
 const __streamixWithTimeout = (parent, ms) => {
+  if (!Number.isFinite(ms) || ms < 0) {
+    throw new RangeError("timer duration must be a finite non-negative number");
+  }
+
   const [ctx, cancel] = __streamixWithCancel(parent);
   const timer = setTimeout(() => cancel(new __streamixContextCancelledError("context timeout after " + ms + "ms")), ms);
   ctx.done.finally(() => clearTimeout(timer));
@@ -808,7 +812,13 @@ const __streamixSelect = async (cases, ctx = __streamixBackground()) => {
     throw new RangeError("select requires at least one case");
   }
 
-  const defaultIndex = cases.findIndex((item) => item.op === "default");
+  const defaultIndices = cases
+    .map((item, index) => item.op === "default" ? index : -1)
+    .filter((index) => index >= 0);
+  if (defaultIndices.length > 1) {
+    throw new RangeError("select accepts at most one default case");
+  }
+  const defaultIndex = defaultIndices[0] ?? -1;
   const channelIndices = cases
     .map((item, i) => ({ item, i }))
     .filter(({ item }) => item.op === "receive" || item.op === "send")

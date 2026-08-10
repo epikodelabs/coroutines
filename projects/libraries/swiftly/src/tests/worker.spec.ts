@@ -6,6 +6,7 @@ import {
 } from "../lib/worker";
 import { createTaskPool } from "../lib/worker/pool";
 import { createTaskRunner } from "../lib/worker/runner";
+import { scheduleWorkerTimer } from "../lib/worker/timer";
 import { idescribe } from "./env.spec";
 
 const flush = () => new Promise(resolve => setTimeout(resolve, 0));
@@ -870,4 +871,52 @@ idescribe("worker helpers", () => {
       }
     });
   });
+
+  describe("worker timer lifecycle", () => {
+    it("fails remaining timers coherently when timer cancellation cannot post", async () => {
+      let otherError: Error | undefined;
+
+      const first = scheduleWorkerTimer(1000, () => fail("first timer should be cancelled"));
+      scheduleWorkerTimer(
+        1000,
+        () => fail("second timer should fail with the worker"),
+        (error) => {
+          otherError = error;
+        },
+      );
+
+      MockWorker.postMessageError = new Error("timer post failed");
+
+      expect(first.cancel()).toBeTrue();
+      expect(otherError?.message).toBe("timer post failed");
+      expect(MockWorker.instances[0].terminated).toBeTrue();
+    });
+
+    it("ignores stale timer worker errors after the worker has been released", () => {
+      const timer = scheduleWorkerTimer(1000, () => {});
+      const oldWorker = MockWorker.instances[0] as any;
+
+      expect(timer.cancel()).toBeTrue();
+      expect(oldWorker.terminated).toBeTrue();
+
+      let failed = false;
+      const current = scheduleWorkerTimer(
+        1000,
+        () => {},
+        () => {
+          failed = true;
+        },
+      );
+
+      oldWorker.onerror?.({
+        error: new Error("stale failure"),
+        message: "stale failure",
+      });
+
+      expect(failed).toBeFalse();
+      current.cancel();
+    });
+  });
+
+
 });

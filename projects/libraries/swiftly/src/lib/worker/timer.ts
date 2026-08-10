@@ -69,14 +69,17 @@ const ensureTimerWorker = (): Worker => {
 
   const blobUrl = acquireBlobUrl(TIMER_WORKER_SCRIPT);
 
+  let createdWorker: Worker;
   try {
-    worker = new Worker(blobUrl);
+    createdWorker = new Worker(blobUrl);
+    worker = createdWorker;
   } catch (error) {
     releaseBlobUrl(TIMER_WORKER_SCRIPT);
     throw error;
   }
 
-  worker.onmessage = ({ data }: MessageEvent<{ type?: string; id?: number }>) => {
+  createdWorker.onmessage = ({ data }: MessageEvent<{ type?: string; id?: number }>) => {
+    if (worker !== createdWorker) return;
     if (data?.type !== "elapsed" || typeof data.id !== "number") return;
 
     const timer = pending.get(data.id);
@@ -87,11 +90,12 @@ const ensureTimerWorker = (): Worker => {
     releaseWorkerIfIdle();
   };
 
-  worker.onerror = (event) => {
+  createdWorker.onerror = (event) => {
+    if (worker !== createdWorker) return;
     failPendingTimers(normalizeWorkerError(event));
   };
 
-  return worker;
+  return createdWorker;
 };
 
 export type WorkerTimer = {
@@ -130,8 +134,19 @@ export function scheduleWorkerTimer(
     cancel(): boolean {
       if (!pending.delete(id)) return false;
 
-      timerWorker.postMessage({ type: "clear", id });
-      releaseWorkerIfIdle();
+      try {
+        timerWorker.postMessage({ type: "clear", id });
+      } catch (error) {
+        // A failed post means this worker can no longer be trusted for the
+        // remaining timers. Fail them coherently instead of stranding them.
+        if (worker === timerWorker) {
+          failPendingTimers(
+            error instanceof Error ? error : new Error(String(error)),
+          );
+        }
+      } finally {
+        releaseWorkerIfIdle();
+      }
       return true;
     },
   };

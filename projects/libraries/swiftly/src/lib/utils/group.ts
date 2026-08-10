@@ -95,7 +95,7 @@ export function group(options: GroupOptions = {}): TaskGroup {
   const controller = new AbortController();
   const gate: Semaphore | undefined = concurrency === undefined ? undefined : semaphore(concurrency);
   const waiters: GroupWaiter[] = [];
-  const outcomes: GroupOutcome[] = [];
+  const outcomes: Array<GroupOutcome | undefined> = [];
 
   let running = 0;
   let accepting = true;
@@ -109,7 +109,14 @@ export function group(options: GroupOptions = {}): TaskGroup {
   const createReport = (): GroupReport => {
     if (finalReport) return finalReport;
     finalReport = Object.freeze({
-      outcomes: Object.freeze([...outcomes]),
+      outcomes: Object.freeze(
+        outcomes.map((outcome) => {
+          if (!outcome) {
+            throw new Error("task group settled with an incomplete child outcome");
+          }
+          return outcome;
+        }),
+      ),
       error: groupError(),
     });
     return finalReport;
@@ -162,7 +169,7 @@ export function group(options: GroupOptions = {}): TaskGroup {
 
     const outcomeIndex = outcomes.length;
     // Reserve the slot so completion order can never affect report ordering.
-    outcomes.push(undefined as unknown as GroupOutcome);
+    outcomes.push(undefined);
     running += 1;
 
     const child = (async () => {

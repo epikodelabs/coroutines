@@ -5,12 +5,15 @@ import {
   ChannelClosedError,
   ContextCancelledError,
   createAbortError,
+  event,
   otherwise,
   operation,
   receive,
   select,
+  semaphore,
   send,
   withCancel,
+  waitGroup,
   withDeadline,
   withTimeout,
 } from "../public-api";
@@ -247,6 +250,18 @@ describe("context", () => {
     expect(child.signal.aborted).toBeTrue();
   });
 
+
+  it("withTimeout rejects invalid durations before deriving a live child context", () => {
+    expect(() => withTimeout(background(), -1)).toThrowError(
+      RangeError,
+      "timer duration must be a finite non-negative number",
+    );
+    expect(() => withTimeout(background(), Number.POSITIVE_INFINITY)).toThrowError(
+      RangeError,
+      "timer duration must be a finite non-negative number",
+    );
+  });
+
   it("withTimeout aborts after the specified delay", async () => {
     const [ctx, cancel] = withTimeout(background(), 20);
     expect(ctx.signal.aborted).toBeFalse();
@@ -381,6 +396,16 @@ describe("selection", () => {
     expect(result.op).toBe("default");
     expect(result.name).toBe("def");
     expect(result.ok).toBeTrue();
+  });
+
+
+  it("select rejects multiple default branches", async () => {
+    await expectAsync(
+      select([otherwise("first"), otherwise("second")]),
+    ).toBeRejectedWithError(
+      RangeError,
+      "select accepts at most one default case",
+    );
   });
 
   it("select blocks until a case is ready", async () => {
@@ -835,4 +860,42 @@ describe("operation selection", () => {
   it("select rejects an empty case list", async () => {
     await expectAsync(select([])).toBeRejectedWithError(/at least one case/);
   });
+
+  it("repeated cancellation leaves coordination primitives reusable", async () => {
+    const ch = channel<number>();
+    const gate = event();
+    const sem = semaphore(1);
+    const wg = waitGroup();
+
+    for (let index = 0; index < 100; index++) {
+      const controller = new AbortController();
+
+      const receivePending = ch.receive(controller.signal);
+      const eventPending = gate.wait(controller.signal);
+
+      const held = await sem.acquire();
+      const acquirePending = sem.acquire(controller.signal);
+
+      wg.add();
+      const waitPending = wg.wait(controller.signal);
+
+      controller.abort(new ContextCancelledError("stress cancel"));
+
+      await expectAsync(receivePending).toBeRejected();
+      await expectAsync(eventPending).toBeRejected();
+      await expectAsync(acquirePending).toBeRejected();
+      await expectAsync(waitPending).toBeRejected();
+
+      held();
+      wg.done();
+
+      expect(gate.waiting).toBe(0);
+      expect(sem.waiting).toBe(0);
+      expect(wg.waiting).toBe(0);
+    }
+
+    ch.close();
+  });
+
+
 });

@@ -212,7 +212,13 @@ export async function select<T = any>(cases: SelectCase<T>[], ctx: Context = bac
     throw new RangeError("select requires at least one case");
   }
 
-  const defaultIndex = cases.findIndex((item) => item.op === "default");
+  const defaultIndices = cases
+    .map((item, index) => item.op === "default" ? index : -1)
+    .filter((index) => index >= 0);
+  if (defaultIndices.length > 1) {
+    throw new RangeError("select accepts at most one default case");
+  }
+  const defaultIndex = defaultIndices[0] ?? -1;
   const channelIndices = cases
     .map((item, i) => ({ item, i }))
     .filter(({ item }) => item.op === "receive" || item.op === "send")
