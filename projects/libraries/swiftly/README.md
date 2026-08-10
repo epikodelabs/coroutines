@@ -519,3 +519,19 @@ are refused. Async main-thread handlers that finish after the source generation
 has stopped do not write responses back into the dead worker.
 
 These are internal guarantees; they do not add public actor API.
+
+
+## Select registration invariants
+
+Channel select registration is now defensive on its own, not only correct when
+entered through the public `select()` fast path.
+
+- already-settled registrations are ignored;
+- receive registration against a closed channel settles immediately with
+  `{ ok: false }`;
+- send registration against a closed channel rejects immediately;
+- newly registered compatible send/receive waiters are reconciled immediately;
+- one select containing send and receive cases on the same unbuffered channel
+  can never satisfy itself.
+
+The same invariants are embedded in actor-worker channels.

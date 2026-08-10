@@ -655,15 +655,35 @@ const __streamixChannel = (capacity = 0) => {
     },
     [__streamixChannelInternals]: {
       registerSelectReceive(registration, meta) {
+        if (registration.isSettled()) {
+          return () => {};
+        }
+
+        if (isClosed) {
+          registration.settle({
+            index: meta.index,
+            caseRef: meta.caseRef,
+            op: "receive",
+            name: meta.name,
+            ok: false,
+          });
+          return () => {};
+        }
+
         const receiver = {
           resolve() {},
           reject() {},
           select: { registration, meta },
         };
         receivers.push(receiver);
+        flushSenders();
         return () => removeReceiver(receiver);
       },
       registerSelectSend(value, registration, meta) {
+        if (registration.isSettled()) {
+          return () => {};
+        }
+
         if (isClosed) {
           registration.reject(new __streamixChannelClosedError());
           return () => {};
@@ -676,6 +696,7 @@ const __streamixChannel = (capacity = 0) => {
           select: { registration, meta },
         };
         senders.push(sender);
+        flushSenders();
         return () => removeSender(sender);
       },
     },

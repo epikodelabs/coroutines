@@ -439,6 +439,41 @@ idescribe("actor", () => {
     await main.outbox.stop(name);
   });
 
+
+  it("actor worker select keeps same-registration send/receive cases from self-matching", async () => {
+    async function behavior(msg: any, state: number, utils: any) {
+      if (msg !== "check") return state;
+
+      const ch = utils.concurrency.channel();
+      const [ctx, cancel] = utils.concurrency.withCancel();
+
+      const pending = utils.concurrency.select([
+        utils.concurrency.receive(ch, "receive"),
+        utils.concurrency.send(ch, 1, "send"),
+      ], ctx);
+
+      await Promise.resolve();
+      cancel(new utils.concurrency.ContextCancelledError("worker select cancelled"));
+
+      let rejected = false;
+      try {
+        await pending;
+      } catch (error: any) {
+        rejected = error?.message === "worker select cancelled";
+      }
+
+      return rejected && ch.tryReceive() === undefined && ch.trySend(2) === false
+        ? 1
+        : -1;
+    }
+
+    (globalThis as any).currentMainTask = behavior;
+    const a = actor(nextActorName(), behavior, 0);
+
+    expect(await main.outbox.request(a, "check", "check")).toBe(1);
+    await main.outbox.stop(a);
+  });
+
   it("should validate bounded actor mailbox capacity", () => {
     async function behavior(_msg: any, state: number) {
       return state;

@@ -473,12 +473,33 @@ export function channel<T>(capacity = 0): Channel<T> {
         registration: SelectRegistration<T>,
         meta: SelectCaseMeta
       ) {
+        if (registration.isSettled()) {
+          return () => {};
+        }
+
+        if (isClosed) {
+          registration.settle({
+            index: meta.index,
+            caseRef: meta.caseRef,
+            op: "receive",
+            name: meta.name,
+            ok: false,
+          });
+          return () => {};
+        }
+
         const receiver: WaitingReceiver<T> = {
           resolve: () => {},
           reject: () => {},
           select: { registration, meta },
         };
         receivers.push(receiver);
+
+        // Reconcile against any sender that may already be waiting. Public
+        // select normally catches this in its fast path, but the internal hook
+        // remains atomic and correct on its own.
+        flushSenders();
+
         return () => removeReceiver(receiver);
       },
       registerSelectSend(
@@ -486,6 +507,10 @@ export function channel<T>(capacity = 0): Channel<T> {
         registration: SelectRegistration<T>,
         meta: SelectCaseMeta
       ) {
+        if (registration.isSettled()) {
+          return () => {};
+        }
+
         if (isClosed) {
           registration.reject(new ChannelClosedError());
           return () => {};
@@ -498,6 +523,11 @@ export function channel<T>(capacity = 0): Channel<T> {
           select: { registration, meta },
         };
         senders.push(sender);
+
+        // Reconcile immediately with a compatible receiver or available buffer
+        // capacity instead of relying on some later channel operation to flush.
+        flushSenders();
+
         return () => removeSender(sender);
       },
     } satisfies ChannelSelectInternals<T>,

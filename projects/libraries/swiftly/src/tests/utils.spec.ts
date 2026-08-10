@@ -663,6 +663,175 @@ describe("selection", () => {
     unregister();
   });
 
+
+  it("channel internals settle a select receive registered after close", () => {
+    const ch = channel<number>();
+    ch.close();
+
+    const registration = {
+      id: Symbol("closed-receive"),
+      isSettled: () => false,
+      settle: jasmine.createSpy("settleClosedReceive").and.returnValue(true),
+      reject: jasmine.createSpy("rejectClosedReceive").and.returnValue(false),
+    };
+
+    const unregister = (ch as any)[CHANNEL_INTERNALS].registerSelectReceive(
+      registration,
+      {
+        index: 0,
+        caseRef: receive(ch, "closed"),
+        name: "closed",
+      },
+    );
+
+    expect(registration.settle).toHaveBeenCalledWith(
+      jasmine.objectContaining({
+        op: "receive",
+        ok: false,
+        name: "closed",
+      }),
+    );
+    expect(registration.reject).not.toHaveBeenCalled();
+    unregister();
+  });
+
+  it("channel internals ignore already-settled registrations", () => {
+    const ch = channel<number>();
+    const settle = jasmine.createSpy("settle");
+    const reject = jasmine.createSpy("reject");
+    const registration = {
+      id: Symbol("settled"),
+      isSettled: () => true,
+      settle,
+      reject,
+    };
+
+    const unregisterReceive = (ch as any)[CHANNEL_INTERNALS].registerSelectReceive(
+      registration,
+      {
+        index: 0,
+        caseRef: receive(ch, "r"),
+        name: "r",
+      },
+    );
+    const unregisterSend = (ch as any)[CHANNEL_INTERNALS].registerSelectSend(
+      1,
+      registration,
+      {
+        index: 1,
+        caseRef: send(ch, 1, "s"),
+        name: "s",
+      },
+    );
+
+    expect(ch.tryReceive()).toBeUndefined();
+    expect(ch.trySend(2)).toBeFalse();
+    expect(settle).not.toHaveBeenCalled();
+    expect(reject).not.toHaveBeenCalled();
+
+    unregisterReceive();
+    unregisterSend();
+  });
+
+  it("channel internals reconcile compatible select waiters immediately", () => {
+    const ch = channel<number>();
+    const receiveRegistration = {
+      id: Symbol("receive"),
+      isSettled: () => false,
+      settle: jasmine.createSpy("receiveSettle").and.returnValue(true),
+      reject: jasmine.createSpy("receiveReject").and.returnValue(false),
+    };
+    const sendRegistration = {
+      id: Symbol("send"),
+      isSettled: () => false,
+      settle: jasmine.createSpy("sendSettle").and.returnValue(true),
+      reject: jasmine.createSpy("sendReject").and.returnValue(false),
+    };
+
+    const unregisterReceive = (ch as any)[CHANNEL_INTERNALS].registerSelectReceive(
+      receiveRegistration,
+      {
+        index: 0,
+        caseRef: receive(ch, "r"),
+        name: "r",
+      },
+    );
+
+    const unregisterSend = (ch as any)[CHANNEL_INTERNALS].registerSelectSend(
+      7,
+      sendRegistration,
+      {
+        index: 1,
+        caseRef: send(ch, 7, "s"),
+        name: "s",
+      },
+    );
+
+    expect(receiveRegistration.settle).toHaveBeenCalledWith(
+      jasmine.objectContaining({
+        op: "receive",
+        value: 7,
+        ok: true,
+      }),
+    );
+    expect(sendRegistration.settle).toHaveBeenCalledWith(
+      jasmine.objectContaining({
+        op: "send",
+        ok: true,
+      }),
+    );
+
+    unregisterReceive();
+    unregisterSend();
+  });
+
+  it("same select send and receive cases never self-match on an unbuffered channel", async () => {
+    const ch = channel<number>();
+    const [ctx, cancel] = withCancel();
+
+    const pending = select([
+      receive(ch, "receive"),
+      send(ch, 1, "send"),
+    ], ctx);
+
+    await Promise.resolve();
+    cancel(new ContextCancelledError("stop self-select"));
+
+    await expectAsync(pending).toBeRejectedWithError(
+      ContextCancelledError,
+      "stop self-select",
+    );
+
+    expect(ch.tryReceive()).toBeUndefined();
+    expect(ch.trySend(2)).toBeFalse();
+  });
+
+  it("close and cancellation cannot settle one select twice", async () => {
+    const ch = channel<number>();
+    const [ctx, cancel] = withCancel();
+    let settlements = 0;
+
+    const pending = select([receive(ch, "r")], ctx);
+    pending.then(
+      () => settlements += 1,
+      () => settlements += 1,
+    );
+
+    await Promise.resolve();
+    ch.close();
+    cancel(new ContextCancelledError("late cancel"));
+
+    await expectAsync(pending).toBeResolvedTo(
+      jasmine.objectContaining({
+        op: "receive",
+        ok: false,
+      }),
+    );
+    await Promise.resolve();
+
+    expect(settlements).toBe(1);
+  });
+
   it("channel internals pair queued select senders with queued select receivers during flush", async () => {
     const ch = channel<number>(1);
     const internals = (ch as any)[CHANNEL_INTERNALS];
