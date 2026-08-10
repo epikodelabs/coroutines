@@ -195,7 +195,10 @@ idescribe("actor", () => {
 
       postMessage(msg: any) {
         const injectedError = (globalThis as any).actorPostMessageError;
-        if (injectedError) {
+        if (typeof injectedError === "function") {
+          const error = injectedError(msg);
+          if (error) throw error;
+        } else if (injectedError) {
           throw injectedError;
         }
 
@@ -1598,6 +1601,71 @@ idescribe("actor", () => {
 
     await pause(35);
     expect(await main.outbox.request(supervised, "state", undefined)).toBe(0);
+    await main.outbox.stop(supervised);
+  });
+
+
+  it("rejects replacement generations that change the supervised actor name", async () => {
+    async function behavior(msg: any, state: number) {
+      return msg === "state" ? state : state;
+    }
+
+    (globalThis as any).currentMainTask = behavior;
+    const name = nextActorName();
+    const wrongName = `${name}-wrong`;
+    let generations = 0;
+
+    const supervised = supervisor(
+      () => {
+        generations += 1;
+        if (generations === 2) return actor(wrongName, behavior, 99);
+        return actor(name, behavior, 7);
+      },
+      { maxRestarts: 2 },
+    );
+
+    (globalThis as any).lastMockWorker.emitError(new Error("restart"));
+    await pause(35);
+
+    expect(generations).toBe(3);
+    expect(supervised.restarts).toBe(2);
+    expect(supervised.running).toBeTrue();
+    expect(await main.outbox.request(name, "state", "state")).toBe(7);
+    await expectAsync(main.outbox.request(wrongName, "state", "state")).toBeRejectedWithError(
+      /Unknown actor target/,
+    );
+
+    await main.outbox.stop(supervised);
+  });
+
+  it("keeps lifecycle observation attached when buffered ingress fails during restart flush", async () => {
+    async function behavior(msg: any, state: number) {
+      return msg === "state" ? state : state;
+    }
+
+    (globalThis as any).currentMainTask = behavior;
+    const name = nextActorName();
+    const supervised = supervisor(
+      () => actor(name, behavior, 11),
+      { maxRestarts: 2, restartDelay: 10, capacity: 1 },
+    );
+
+    (globalThis as any).lastMockWorker.emitError(new Error("first generation failed"));
+    await pause(2);
+    main.outbox.send(supervised, "queued", "value");
+    expect(supervised.pending).toBe(1);
+
+    (globalThis as any).actorPostMessageError = (msg: any) =>
+      msg.type === "notify" ? new Error("flush transport failed") : undefined;
+
+    await pause(35);
+    delete (globalThis as any).actorPostMessageError;
+
+    expect(supervised.restarts).toBe(2);
+    expect(supervised.running).toBeTrue();
+    expect(supervised.pending).toBe(0);
+    expect(await main.outbox.request(supervised, "state", "state")).toBe(11);
+
     await main.outbox.stop(supervised);
   });
 

@@ -483,3 +483,24 @@ by `coroutine()` and `compute()`.
 
 `dispose()` remains immediate and can override a concurrent graceful close;
 the close promise is settled by that teardown rather than being left pending.
+
+
+## Terminal ownership invariants
+
+Cancellation and failure now close structured ownership immediately. A cancelled
+or failed `group()` reports `accepting === false` even before `wait()`/`settle()`
+is called, and its parent abort listener is detached as soon as the last owned
+child finishes. Calling `wait()` or `settle()` then establishes the final closed
+boundary for subsequent `spawn()` calls.
+
+Supervised actor identity is also enforced across generations: every replacement
+must use the original actor name. A mismatched generation is stopped and consumes
+restart budget rather than silently changing routing identity. Lifecycle
+observation is attached before buffered ingress is flushed, so a transport
+failure during restart delivery cannot leave the supervisor watching a dead
+generation incorrectly.
+
+Dedicated runners and compute pools are regression-tested for the same lifecycle
+pressure: worker failure during graceful close must continue draining admitted
+queued work, while `dispose()` may escalate an in-progress close and settle the
+close promise without stranding callers.

@@ -274,6 +274,61 @@ idescribe("worker helpers", () => {
       await runner.dispose();
     });
 
+
+    it("continues graceful runner draining after the active worker fails", async () => {
+      const runner = createTaskRunner<number, number>({
+        name: "closing-failure-runner",
+        main: (value: number) => value,
+        functions: [],
+        generateWorkerScript: () => "runner-worker-script",
+      });
+
+      const active = runner.run(1);
+      const queued = runner.run(2);
+      await flush();
+
+      const closing = runner.close();
+      const failedWorker = MockWorker.instances[0];
+      failedWorker.dispatchError(new Error("active failed during close"));
+
+      await expectAsync(active).toBeRejectedWithError("active failed during close");
+      await flush();
+
+      expect(MockWorker.instances.length).toBe(2);
+      const replacement = MockWorker.instances[1];
+      replacement.dispatch({
+        ...replacement.sentMessages[0],
+        type: "response",
+        payload: 20,
+      });
+
+      await expectAsync(queued).toBeResolvedTo(20);
+      await expectAsync(closing).toBeResolved();
+      expect(replacement.terminated).toBeTrue();
+    });
+
+    it("allows dispose to escalate a runner that is already closing", async () => {
+      const runner = createTaskRunner<number, number>({
+        name: "close-dispose-runner",
+        main: (value: number) => value,
+        functions: [],
+        generateWorkerScript: () => "runner-worker-script",
+      });
+
+      const active = runner.run(1);
+      const queued = runner.run(2);
+      await flush();
+      const worker = MockWorker.instances[0];
+
+      const closing = runner.close();
+      await runner.dispose();
+
+      await expectAsync(active).toBeRejectedWithError(/disposed/);
+      await expectAsync(queued).toBeRejectedWithError(/disposed/);
+      await expectAsync(closing).toBeResolved();
+      expect(worker.terminated).toBeTrue();
+    });
+
     it("cancels an active task, terminates its worker, and continues queued work", async () => {
       const runner = createTaskRunner<number, number>({
         name: "cancellable-runner",
@@ -772,6 +827,67 @@ idescribe("worker helpers", () => {
         "finalizing-pool is finalizing"
       );
       expect(warnSpy).not.toHaveBeenCalledWith("Worker not found.");
+    });
+
+
+    it("continues graceful pool draining after an active worker fails", async () => {
+      const pool = createTaskPool<number, number>({
+        name: "closing-failure-pool",
+        concurrency: 1,
+        maxQueued: 2,
+        main: (value: number) => value,
+        functions: [],
+        generateWorkerScript: () => "worker-script",
+      });
+
+      const active = pool.run(1);
+      await flush();
+      const queued = pool.run(2);
+      const closing = pool.close();
+
+      const failedWorker = MockWorker.instances[0];
+      failedWorker.dispatchError(new Error("pool worker failed during close"));
+
+      await expectAsync(active).toBeRejectedWithError("pool worker failed during close");
+      await flush();
+
+      expect(MockWorker.instances.length).toBe(2);
+      const replacement = MockWorker.instances[1];
+      replacement.dispatch({
+        ...replacement.sentMessages[0],
+        type: "response",
+        payload: 22,
+      });
+
+      await expectAsync(queued).toBeResolvedTo(22);
+      await expectAsync(closing).toBeResolved();
+      expect(replacement.terminated).toBeTrue();
+    });
+
+    it("allows dispose to escalate a pool that is already closing", async () => {
+      const pool = createTaskPool<number, number>({
+        name: "close-dispose-pool",
+        concurrency: 1,
+        maxQueued: 2,
+        main: (value: number) => value,
+        functions: [],
+        generateWorkerScript: () => "worker-script",
+      });
+
+      const active = pool.run(1);
+      await flush();
+      const queued = pool.run(2);
+      const worker = MockWorker.instances[0];
+
+      const closing = pool.close();
+      await pool.dispose();
+
+      await expectAsync(active).toBeRejectedWithError(/finalized before the worker task completed/);
+      await expectAsync(queued).toBeRejectedWithError(/finalized before a worker became available/);
+      await expectAsync(closing).toBeResolved();
+      expect(worker.terminated).toBeTrue();
+      expect(pool.active).toBe(0);
+      expect(pool.queued).toBe(0);
     });
 
     it("uses a custom message handler and treats dispose as idempotent", async () => {

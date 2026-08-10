@@ -1739,7 +1739,11 @@ export function supervisor(
     while (ingress.length > 0 && current === active && active.running) {
       const entry = ingress.shift()!;
       if (entry.kind === "post") {
-        actorInternalsMap.get(active)?.post(entry.msg);
+        try {
+          actorInternalsMap.get(active)?.post(entry.msg);
+        } catch (error) {
+          warnAsyncActorBusFailure("Supervisor buffered delivery", error);
+        }
         continue;
       }
 
@@ -1749,7 +1753,13 @@ export function supervisor(
         continue;
       }
 
-      actorInternalsMap.get(active)!
+      const internals = actorInternalsMap.get(active);
+      if (!internals) {
+        entry.reject(new Error("Supervised actor generation is unavailable"));
+        continue;
+      }
+
+      internals
         .request(entry.topic, entry.msg, entry.signal)
         .then(entry.resolve, entry.reject);
     }
@@ -1788,11 +1798,25 @@ export function supervisor(
       // ordinary main-thread message dispatch.
       unregisterActorBusTarget(handle);
 
+      let next: Actor | undefined;
       try {
-        const next = factory();
+        next = factory();
+        if (next.name !== first.name) {
+          const error = new Error(
+            `supervisor replacement name must remain "${first.name}"; received "${next.name}"`,
+          );
+          await actorInternalsMap.get(next)?.stop();
+          next = undefined;
+          throw error;
+        }
+
         bindCurrent(next);
         return;
       } catch (error) {
+        if (next && current !== next) {
+          await actorInternalsMap.get(next)?.stop().catch(() => undefined);
+        }
+
         lastError = error instanceof Error ? error : new Error(String(error));
 
         if (!stopping && !settled) {
@@ -1806,13 +1830,21 @@ export function supervisor(
   };
 
   const bindCurrent = (next: Actor) => {
-    current = next;
-    // The generation registers itself during actor(); replace that public
-    // registration with the stable supervisor handle.
-    unregisterActorBusTarget(next);
-    registerActorBusTarget(next.name, handle);
-    flushIngress();
+    if (next.name !== first.name) {
+      throw new Error(
+        `supervisor replacement name must remain "${first.name}"; received "${next.name}"`,
+      );
+    }
 
+    // The generation registers itself during actor(); replace that public
+    // registration with the stable supervisor handle before exposing it as
+    // current. This keeps name routing transactional across restarts.
+    unregisterActorBusTarget(next);
+    registerActorBusTarget(first.name, handle);
+    current = next;
+
+    // Attach lifecycle observation before flushing buffered traffic. A
+    // synchronous transport failure during flush can terminate the generation.
     void next.done.then((exit) => {
       if (current !== next || settled) return;
       totalDropped += next.dropped;
@@ -1825,6 +1857,8 @@ export function supervisor(
 
       void scheduleRestart(exit.error);
     });
+
+    flushIngress();
   };
 
   const first = factory();

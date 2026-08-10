@@ -218,4 +218,48 @@ describe("task group", () => {
   });
 
 
+
+  it("closes acceptance immediately on cancellation and detaches the parent listener without wait", async () => {
+    const listeners = new Set<EventListenerOrEventListenerObject>();
+    const parentSignal = {
+      aborted: false,
+      reason: undefined,
+      addEventListener(type: string, listener: EventListenerOrEventListenerObject) {
+        if (type === "abort") listeners.add(listener);
+      },
+      removeEventListener(type: string, listener: EventListenerOrEventListenerObject) {
+        if (type === "abort") listeners.delete(listener);
+      },
+    } as unknown as AbortSignal;
+
+    const work = group({ signal: parentSignal });
+    expect(listeners.size).toBe(1);
+    expect(work.accepting).toBeTrue();
+
+    work.cancel(new ContextCancelledError("cancel now"));
+
+    expect(work.accepting).toBeFalse();
+    expect(listeners.size).toBe(0);
+    await expectAsync(work.spawn(async () => 1)).toBeRejectedWithError(
+      ContextCancelledError,
+      "cancel now",
+    );
+  });
+
+  it("closes acceptance immediately when a child failure owns the group", async () => {
+    const work = group();
+    const failed = work.spawn(async () => {
+      throw new Error("terminal child failure");
+    });
+
+    await expectAsync(failed).toBeRejectedWithError("terminal child failure");
+    expect(work.accepting).toBeFalse();
+    await expectAsync(work.spawn(async () => 2)).toBeRejectedWithError(
+      "terminal child failure",
+    );
+    await expectAsync(work.wait()).toBeRejectedWithError("terminal child failure");
+    await expectAsync(work.spawn(async () => 3)).toBeRejectedWithError("task group is closed");
+  });
+
+
 });

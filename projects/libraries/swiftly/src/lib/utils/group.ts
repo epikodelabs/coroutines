@@ -99,6 +99,7 @@ export function group(options: GroupOptions = {}): TaskGroup {
 
   let running = 0;
   let accepting = true;
+  let settlementRequested = false;
   let firstError: Error | undefined;
   let finalReport: GroupReport | undefined;
 
@@ -131,7 +132,9 @@ export function group(options: GroupOptions = {}): TaskGroup {
   };
 
   const cancel = (reason: unknown = new ContextCancelledError("task group cancelled")): void => {
+    accepting = false;
     if (!controller.signal.aborted) controller.abort(reason);
+    if (running === 0) detachParent();
     settleWaiters();
   };
 
@@ -160,11 +163,14 @@ export function group(options: GroupOptions = {}): TaskGroup {
     if (typeof operation !== "function") {
       return Promise.reject(new TypeError("group operation must be a function"));
     }
-    if (!accepting) {
+    if (settlementRequested) {
       return Promise.reject(new Error("task group is closed"));
     }
     if (controller.signal.aborted) {
       return Promise.reject(createAbortError(controller.signal));
+    }
+    if (!accepting) {
+      return Promise.reject(new Error("task group is closed"));
     }
 
     const outcomeIndex = outcomes.length;
@@ -187,6 +193,7 @@ export function group(options: GroupOptions = {}): TaskGroup {
 
         if (!firstError && !alreadyCancelled) {
           firstError = error;
+          accepting = false;
           outcomes[outcomeIndex] = { status: "rejected", error };
           controller.abort(error);
         } else {
@@ -211,6 +218,7 @@ export function group(options: GroupOptions = {}): TaskGroup {
   };
 
   const settle = (): Promise<GroupReport> => {
+    settlementRequested = true;
     accepting = false;
 
     if (running === 0) {
