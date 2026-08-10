@@ -1,3 +1,4 @@
+export * from "./barrier";
 export * from "./channel";
 export * from "./compose";
 export * from "./context";
