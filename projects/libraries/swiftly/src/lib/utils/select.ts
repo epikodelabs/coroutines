@@ -306,12 +306,6 @@ export async function select<T = any>(cases: SelectCase<T>[], ctx: Context = bac
       ctx.signal.addEventListener("abort", onContextAbort, { once: true });
       cleanupFns.push(() => ctx.signal.removeEventListener("abort", onContextAbort));
 
-      type StartedOperation = {
-        index: number;
-        item: SelectOperationCase<T>;
-        promise: Promise<T>;
-      };
-
       const operationStarts: Array<{
         index: number;
         item: SelectOperationCase<T>;
@@ -352,51 +346,67 @@ export async function select<T = any>(cases: SelectCase<T>[], ctx: Context = bac
 
       if (settled) return;
 
-      // Phase 2: invoke every operation before observing any completion. This
-      // guarantees that a synchronous failure in one contender still has real
-      // started siblings to cancel.
-      const startedOperations: StartedOperation[] = operationStarts.map(
-        ({ index, item, controller }) => {
-          try {
-            return {
-              index,
-              item,
-              promise: Promise.resolve(item.run(controller.signal)),
-            };
-          } catch (error) {
-            return {
-              index,
-              item,
-              promise: Promise.reject(error),
-            };
-          }
+      void Promise.resolve().then(() => {
+        if (settled) {
+          return;
         }
-      );
+        if (ctx.signal.aborted) {
+          rejectSelection(createAbortError(ctx.signal));
+          return;
+        }
 
-      // Phase 3: observe operation completion/failure only after all contenders
-      // have started.
-      for (const { index, item, promise } of startedOperations) {
-        void promise.then(
-          (value) => {
-            settle({
-              index,
-              case: item,
-              op: item.op,
-              name: item.name,
-              value,
-              ok: true,
-            });
-          },
-          (error) => {
-            rejectSelection(
-              error instanceof Error
-                ? error
-                : new Error(error ? String(error) : "select operation failed"),
-              index
-            );
+        type StartedOperation = {
+          index: number;
+          item: SelectOperationCase<T>;
+          promise: Promise<T>;
+        };
+
+        // Phase 2: invoke every operation before observing any completion. This
+        // guarantees that a synchronous failure in one contender still has real
+        // started siblings to cancel.
+        const startedOperations: StartedOperation[] = operationStarts.map(
+          ({ index, item, controller }) => {
+            try {
+              return {
+                index,
+                item,
+                promise: Promise.resolve(item.run(controller.signal)),
+              };
+            } catch (error) {
+              return {
+                index,
+                item,
+                promise: Promise.reject(error),
+              };
+            }
           }
         );
-      }
+
+        // Phase 3: observe operation completion/failure only after all contenders
+        // have started.
+        for (const { index, item, promise } of startedOperations) {
+          void promise.then(
+            (value) => {
+              settle({
+                index,
+                case: item,
+                op: item.op,
+                name: item.name,
+                value,
+                ok: true,
+              });
+            },
+            (error) => {
+              rejectSelection(
+                error instanceof Error
+                  ? error
+                  : new Error(error ? String(error) : "select operation failed"),
+                index
+              );
+            }
+          );
+        }
+      });
     });
   } finally {
     while (cleanupFns.length > 0) {

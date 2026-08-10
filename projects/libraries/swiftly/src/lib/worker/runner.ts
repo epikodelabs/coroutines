@@ -62,8 +62,8 @@ export function createTaskRunner<T, R>({
   let workerMessageHandler: ((event: MessageEvent<WorkerProtocolMessage>) => void) | null = null;
   let workerErrorHandler: ((event: ErrorEvent) => void) | null = null;
   let isProcessing = false;
-  let isAccepting = true;
-  let isDisposed = false;
+  let lifecycle: "open" | "closing" | "finalizing" = "open";
+  let isFinalized = false;
   let closePromise: Promise<void> | null = null;
   let resolveClose: (() => void) | null = null;
   let hasReleasedBlobUrl = false;
@@ -96,6 +96,11 @@ export function createTaskRunner<T, R>({
       target.removeEventListener("error", workerErrorHandler);
     }
   };
+
+  const createFinalizedQueuedError = () =>
+    new Error(`${name} finalized before a worker became available because it was disposed`);
+  const createFinalizedActiveError = () =>
+    new Error(`${name} finalized before the worker task completed because it was disposed`);
 
   const getWorker = (): Worker => {
     if (worker) {
@@ -185,11 +190,17 @@ export function createTaskRunner<T, R>({
   };
 
   const finalizeGracefulClose = (): void => {
-    if (isAccepting || isDisposed || isProcessing || queuedTasks.length > 0 || pendingMessages.size > 0) {
+    if (
+      lifecycle !== "closing" ||
+      isFinalized ||
+      isProcessing ||
+      queuedTasks.length > 0 ||
+      pendingMessages.size > 0
+    ) {
       return;
     }
 
-    isDisposed = true;
+    isFinalized = true;
 
     if (worker) {
       detachWorker(worker);
@@ -205,7 +216,7 @@ export function createTaskRunner<T, R>({
   };
 
   const drainQueue = async (): Promise<void> => {
-    if (isProcessing || isDisposed) {
+    if (isProcessing || lifecycle === "finalizing" || isFinalized) {
       return;
     }
 
@@ -241,8 +252,11 @@ export function createTaskRunner<T, R>({
   };
 
   const run = (value: T, signal?: AbortSignal): Promise<R> => {
-    if (!isAccepting || isDisposed) {
+    if (lifecycle === "closing") {
       return Promise.reject(new Error(`${name} is closed`));
+    }
+    if (lifecycle === "finalizing" || isFinalized) {
+      return Promise.reject(createFinalizedQueuedError());
     }
     if (signal?.aborted) {
       return Promise.reject(createAbortError(signal));
@@ -268,7 +282,7 @@ export function createTaskRunner<T, R>({
   };
 
   const close = (): Promise<void> => {
-    if (isDisposed) {
+    if (isFinalized || lifecycle === "finalizing") {
       return Promise.resolve();
     }
 
@@ -276,7 +290,7 @@ export function createTaskRunner<T, R>({
       return closePromise;
     }
 
-    isAccepting = false;
+    lifecycle = "closing";
     closePromise = new Promise<void>((resolve) => {
       resolveClose = resolve;
     });
@@ -287,21 +301,21 @@ export function createTaskRunner<T, R>({
   };
 
   const dispose = async () => {
-    if (isDisposed) {
+    if (isFinalized || lifecycle === "finalizing") {
       return;
     }
 
-    isAccepting = false;
-    isDisposed = true;
+    lifecycle = "finalizing";
+    isFinalized = true;
 
     while (queuedTasks.length > 0) {
       const task = queuedTasks.shift()!;
       if (task.signal && task.abort) task.signal.removeEventListener("abort", task.abort);
-      task.reject(new Error(`${name} disposed before a worker became available`));
+      task.reject(createFinalizedQueuedError());
     }
 
     pendingMessages.forEach(({ reject }) => {
-      reject(new Error(`${name} disposed before the worker task completed`));
+      reject(createFinalizedActiveError());
     });
     pendingMessages.clear();
 
