@@ -1,4 +1,4 @@
-import { compute, computeScript } from "../public-api";
+import { channel, compute, computeScript, group } from "../public-api";
 import { idescribe } from "./env.spec";
 
 idescribe("compute", () => {
@@ -86,4 +86,114 @@ idescribe("compute", () => {
     expect(result).toBe(9);
     await run.dispose();
   });
+
+  it("should expose and enforce bounded pool admission", async () => {
+    const run = compute<number, number>(
+      async (x: number) => {
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        return x * 2;
+      },
+      { concurrency: 1, maxQueued: 1 },
+    );
+
+    expect(run.concurrency).toBe(1);
+
+    const first = run(1);
+    const second = run(2);
+    const third = run(3);
+
+    expect(run.queued).toBe(1);
+    await expectAsync(third).toBeRejectedWithError(/queue capacity exceeded/);
+
+    expect(await first).toBe(2);
+    expect(await second).toBe(4);
+    expect(run.queued).toBe(0);
+
+    await run.dispose();
+  });
+
+  it("should preserve helper-function overloads with compute options support", async () => {
+    function addOne(x: number) {
+      return x + 1;
+    }
+
+    const legacy = compute<number, number>(
+      (x: number) => addOne(x),
+      addOne,
+    );
+    const configured = compute<number, number>(
+      (x: number) => addOne(x),
+      { concurrency: 2 },
+      addOne,
+    );
+
+    expect(await legacy(4)).toBe(5);
+    expect(await configured(4)).toBe(5);
+    expect(configured.concurrency).toBe(2);
+
+    await legacy.dispose();
+    await configured.dispose();
+  });
+
+  it("should apply pool options to computeScript", async () => {
+    const run = computeScript<number, number>(
+      { main: (x: number) => x + 1 },
+      { concurrency: 1, maxQueued: 0 },
+    );
+
+    expect(run.concurrency).toBe(1);
+    expect(run.queued).toBe(0);
+
+    await run.dispose();
+  });
+
+
+
+  it("should compose bounded channels, groups, and compute without an extra pipeline abstraction", async () => {
+    const input = channel<number>(2);
+    const output = channel<number>(2);
+    const run = compute<number, number>(
+      async (x: number) => {
+        await new Promise((resolve) => setTimeout(resolve, 2));
+        return x * x;
+      },
+      { concurrency: 2, maxQueued: 2 },
+    );
+    const work = group({ concurrency: 3 });
+    const collected: number[] = [];
+
+    const collector = (async () => {
+      for await (const value of output) {
+        collected.push(value);
+      }
+    })();
+
+    work.spawn(async (signal) => {
+      for (const value of [1, 2, 3, 4, 5, 6]) {
+        await input.send(value, signal);
+      }
+      input.close();
+    });
+
+    for (let worker = 0; worker < 2; worker++) {
+      work.spawn(async (signal) => {
+        while (true) {
+          const received = await input.receive(signal);
+          if (!received.ok) return;
+          const result = await run(received.value, signal);
+          await output.send(result, signal);
+        }
+      });
+    }
+
+    await work.wait();
+    output.close();
+    await collector;
+
+    expect(collected.slice().sort((a, b) => a - b)).toEqual([1, 4, 9, 16, 25, 36]);
+    expect(run.queued).toBe(0);
+    await run.dispose();
+  });
+
+
 });

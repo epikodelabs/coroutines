@@ -78,8 +78,8 @@ export type Channel<T> = AsyncIterable<T> & {
   readonly closed: boolean;
   /** Sends a value. Blocks if the channel is unbuffered and no receiver is waiting, or if the buffer is full. Rejects if the channel is closed. */
   send(value: T, signal?: AbortSignal): Promise<void>;
-  /** Receives a value. Returns the value directly, or `undefined` when the channel is closed. Blocks if the channel is empty. */
-  receive(signal?: AbortSignal): Promise<T | undefined>;
+  /** Receives one channel result. `ok: false` means the channel is closed and drained. */
+  receive(signal?: AbortSignal): Promise<ReceiveResult<T>>;
   /** Non-blocking send. Returns `true` if the value was accepted immediately. */
   trySend(value: T): boolean;
   /** Non-blocking receive. Returns the result immediately, or `undefined` if nothing is available. */
@@ -389,25 +389,25 @@ export function channel<T>(capacity = 0): Channel<T> {
       return isClosed;
     },
     send,
-    async receive(signal?: AbortSignal) {
+    async receive(signal?: AbortSignal): Promise<ReceiveResult<T>> {
       if (buffer.length > 0) {
         const value = buffer.shift()!;
         flushSenders();
-        return value;
+        return { ok: true, value };
       }
 
       const matchedSender = tryAcquireFromWaitingSender();
       if (matchedSender) {
-        return matchedSender.ok ? matchedSender.value : undefined;
+        return matchedSender;
       }
 
       if (isClosed) {
-        return undefined;
+        return { ok: false, value: undefined };
       }
 
       if (signal?.aborted) return Promise.reject(createAbortError(signal));
 
-      const result = await new Promise<ReceiveResult<T>>((resolve, reject) => {
+      return new Promise<ReceiveResult<T>>((resolve, reject) => {
         const receiver: WaitingReceiver<T> = { resolve, reject, signal };
         if (signal) {
           receiver.abort = () => {
@@ -418,7 +418,6 @@ export function channel<T>(capacity = 0): Channel<T> {
         }
         receivers.push(receiver);
       });
-      return result.ok ? result.value : undefined;
     },
     trySend(value: T) {
       if (isClosed) return false;
@@ -504,9 +503,9 @@ export function channel<T>(capacity = 0): Channel<T> {
     } satisfies ChannelSelectInternals<T>,
     async *[Symbol.asyncIterator]() {
       while (true) {
-        const item = await this.receive();
-        if (item === undefined) return;
-        yield item;
+        const result = await this.receive();
+        if (!result.ok) return;
+        yield result.value;
       }
     },
   };

@@ -85,7 +85,10 @@ const __createWorkerUtils = (workerId, taskId) => {
   return {
     outbox,
     inbox: {
-      listen: (signal) => __workerInbox.receive(signal),
+      listen: async (signal) => {
+        const result = await __workerInbox.receive(signal);
+        return result.ok ? result.value : undefined;
+      },
     },
     concurrency: __streamixConcurrency,
   };
@@ -101,8 +104,9 @@ const __runBehaviorLoop = async (workerId, taskId) => {
   const utils = __createWorkerUtils(workerId, taskId);
 
   while (__actorRunning) {
-    const envelope = await __actorMailbox.receive();
-    if (!envelope) break;
+    const received = await __actorMailbox.receive();
+    if (!received.ok) break;
+    const envelope = received.value;
 
     let msg = envelope;
     let replyId = null;

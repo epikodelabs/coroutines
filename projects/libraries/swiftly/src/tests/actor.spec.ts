@@ -119,7 +119,10 @@ idescribe("actor", () => {
         return {
           outbox,
           inbox: {
-            listen: (signal?: AbortSignal) => this.busInbox.receive(signal),
+            listen: async (signal?: AbortSignal) => {
+              const result = await this.busInbox.receive(signal);
+              return result.ok ? result.value : undefined;
+            },
           },
           concurrency: {
             channel,
@@ -141,8 +144,9 @@ idescribe("actor", () => {
         if (!mainTask) return;
 
         while (this.actorRunning && !this.terminated) {
-          const envelope = await this.workerInbox.receive();
-          if (!envelope) break;
+          const received = await this.workerInbox.receive();
+          if (!received.ok) break;
+          const envelope = received.value;
 
           let item = envelope;
           let requestId = null;
@@ -445,7 +449,12 @@ idescribe("actor", () => {
       const s = send(c, 3, "s");
       const rc = receive(c, "r");
       const sel = await select([s, rc, otherwise("def")]);
-      return { state, r1, r2, selName: sel.name };
+      return {
+        state,
+        r1: r1.ok ? r1.value : undefined,
+        r2: r2.ok ? r2.value : undefined,
+        selName: sel.name,
+      };
     }
 
     (globalThis as any).currentMainTask = behavior;

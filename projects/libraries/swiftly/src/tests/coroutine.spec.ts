@@ -70,7 +70,10 @@ idescribe('coroutine', () => {
               this.listeners["message"]?.forEach(fn => fn(event));
             },
             request: (requestPayload: any) => this.handleDataRequest(requestPayload),
-            receive: (signal?: AbortSignal) => this.workerInbox.receive(signal),
+            receive: async (signal?: AbortSignal) => {
+              const result = await this.workerInbox.receive(signal);
+              return result.ok ? result.value : undefined;
+            },
             inbox: this.workerInbox,
           },
           concurrency: {

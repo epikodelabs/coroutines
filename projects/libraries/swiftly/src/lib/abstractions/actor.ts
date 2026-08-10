@@ -601,8 +601,7 @@ const __streamixChannel = (capacity = 0) => {
     },
     send: sendValue,
     async receive(signal) {
-      const result = await receiveValue(signal);
-      return result.ok ? result.value : undefined;
+      return receiveValue(signal);
     },
     trySend(value) {
       if (isClosed) return false;

@@ -6,8 +6,10 @@ import type { TaskRunner } from "./types";
 import { generateTaskId } from "./utils";
 import { createAbortError } from "../utils/context";
 
-type PoolOptions = {
+export type PoolOptions = {
   name: string;
+  concurrency?: number;
+  maxQueued?: number;
   config?: WorkerScriptConfig;
   main: Function;
   functions: Function[];
@@ -31,16 +33,36 @@ const toError = (error: unknown, fallback: string): Error =>
  * Unlike `createTaskRunner()`, this abstraction can create multiple workers
  * for the same baked task and lend them to queued compute submissions.
  */
+export interface TaskPool<T = any, R = any> extends TaskRunner<T, R> {
+  readonly concurrency: number;
+  readonly queued: number;
+  readonly active: number;
+}
+
 export function createTaskPool<T, R>({
   name,
+  concurrency,
+  maxQueued,
   config,
   main,
   functions,
   generateWorkerScript,
   createMessageHandler,
-}: PoolOptions): TaskRunner<T, R> {
+}: PoolOptions): TaskPool<T, R> {
   const maxWorkers =
-    (typeof navigator !== "undefined" ? navigator.hardwareConcurrency : undefined) || 4;
+    concurrency ??
+    ((typeof navigator !== "undefined" ? navigator.hardwareConcurrency : undefined) || 4);
+  const maxWaiting = maxQueued ?? Number.POSITIVE_INFINITY;
+
+  if (!Number.isInteger(maxWorkers) || maxWorkers <= 0) {
+    throw new RangeError(`${name} concurrency must be a positive integer`);
+  }
+  if (
+    maxWaiting !== Number.POSITIVE_INFINITY &&
+    (!Number.isInteger(maxWaiting) || maxWaiting < 0)
+  ) {
+    throw new RangeError(`${name} maxQueued must be a non-negative integer`);
+  }
   const idleWorkers: Worker[] = [];
   const waitingQueue: WaitingWorker[] = [];
   const activeWorkers = new Map<number, Worker>();
@@ -192,6 +214,10 @@ export function createTaskPool<T, R>({
       }
     }
 
+    if (waitingQueue.length >= maxWaiting) {
+      throw new Error(`${name} queue capacity exceeded`);
+    }
+
     return new Promise((resolve, reject) => {
       const waiter: WaitingWorker = { resolve, reject, signal };
       if (signal) {
@@ -319,6 +345,15 @@ export function createTaskPool<T, R>({
   };
 
   return {
+    get concurrency() {
+      return maxWorkers;
+    },
+    get queued() {
+      return waitingQueue.length;
+    },
+    get active() {
+      return Math.max(0, createdWorkersCount - idleWorkers.length);
+    },
     run,
     dispose,
   };

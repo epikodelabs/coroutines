@@ -145,3 +145,73 @@ controller.abort();
 
 This composes actor request lifetimes with task groups and contexts without
 inventing a separate timeout/retry API.
+
+
+## Bounded compute admission
+
+`compute()` can bound both execution and waiting work:
+
+```ts
+const hash = compute(
+  (value: string) => expensiveHash(value),
+  {
+    concurrency: 4,
+    maxQueued: 16,
+  },
+);
+```
+
+`concurrency` is the maximum worker count. `maxQueued` is the maximum number of
+submissions allowed to wait for a worker after the pool is saturated. When that
+queue is full, further submissions reject immediately instead of growing an
+unbounded backlog.
+
+Compute runners expose `concurrency`, `active`, and `queued` so pressure can be
+observed without exposing Worker objects.
+
+## Channel closure is explicit
+
+Channel receive results distinguish a value from closure:
+
+```ts
+const result = await ch.receive();
+
+if (!result.ok) {
+  // closed and drained
+  return;
+}
+
+use(result.value);
+```
+
+This means every JavaScript value, including `undefined`, can travel through a
+channel without being confused with end-of-stream. Async iteration follows the
+same rule internally and stops only after an explicit closed result.
+
+## Streaming work by composition
+
+Swiftly does not add a separate pipeline abstraction for bounded streaming work.
+Channels provide backpressure, groups own lifetime and failure propagation, and
+compute owns worker parallelism:
+
+```ts
+const input = channel<Job>(8);
+const output = channel<Result>(8);
+const workers = group({ concurrency: 4 });
+
+for (let i = 0; i < 4; i++) {
+  workers.spawn(async (signal) => {
+    while (true) {
+      const next = await input.receive(signal);
+      if (!next.ok) return;
+
+      const result = await process(next.value, signal);
+      await output.send(result, signal);
+    }
+  });
+}
+```
+
+The composition remains explicit: channel capacity bounds data in flight, group
+concurrency bounds owned operations, and compute pool settings bound worker and
+queue pressure.

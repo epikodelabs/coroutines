@@ -44,7 +44,7 @@ describe("channel", () => {
     await ch.send(42);
     const value = await receive$;
 
-    expect(value).toBe(42);
+    expect(value).toEqual({ ok: true, value: 42 });
   });
 
   it("should buffer sends while space remains", async () => {
@@ -54,8 +54,8 @@ describe("channel", () => {
     await ch.send(2); // buffered
 
     expect(ch.size).toBe(2);
-    expect(await ch.receive()).toBe(1);
-    expect(await ch.receive()).toBe(2);
+    expect(await ch.receive()).toEqual({ ok: true, value: 1 });
+    expect(await ch.receive()).toEqual({ ok: true, value: 2 });
   });
 
   it("should block send when buffer is full", async () => {
@@ -120,13 +120,13 @@ describe("channel", () => {
     await expectAsync(pendingSend).toBeRejectedWithError(ChannelClosedError);
   });
 
-  it("should close and resolve pending receivers with undefined", async () => {
+  it("should close and resolve pending receivers with ok:false", async () => {
     const ch = channel<number>();
 
     const pendingReceive = ch.receive();
     ch.close();
 
-    expect(await pendingReceive).toBeUndefined();
+    expect(await pendingReceive).toEqual({ ok: false, value: undefined });
   });
 
   it("should reject send on a closed channel", async () => {
@@ -136,11 +136,32 @@ describe("channel", () => {
     await expectAsync(ch.send(1)).toBeRejectedWithError(ChannelClosedError);
   });
 
-  it("should return undefined when receiving from closed empty channel", async () => {
+  it("should return ok:false when receiving from closed empty channel", async () => {
     const ch = channel<number>();
     ch.close();
 
-    expect(await ch.receive()).toBeUndefined();
+    expect(await ch.receive()).toEqual({ ok: false, value: undefined });
+  });
+
+  it("should carry undefined as a normal channel value", async () => {
+    const ch = channel<undefined>(1);
+    await ch.send(undefined);
+    ch.close();
+
+    expect(await ch.receive()).toEqual({ ok: true, value: undefined });
+    expect(await ch.receive()).toEqual({ ok: false, value: undefined });
+  });
+
+  it("async iteration should not treat undefined as channel closure", async () => {
+    const ch = channel<number | undefined>(2);
+    await ch.send(undefined);
+    await ch.send(1);
+    ch.close();
+
+    const values: Array<number | undefined> = [];
+    for await (const value of ch) values.push(value);
+
+    expect(values).toEqual([undefined, 1]);
   });
 
   it("should be async iterable", async () => {
@@ -350,7 +371,7 @@ describe("selection", () => {
     expect(result.op).toBe("send");
     expect(result.name).toBe("s");
     expect(result.ok).toBeTrue();
-    expect(await ch.receive()).toBe(8);
+    expect(await ch.receive()).toEqual({ ok: true, value: 8 });
   });
 
   it("select falls back to default when nothing is ready", async () => {
@@ -443,7 +464,7 @@ describe("selection", () => {
     const result = await select([send(ch, 123, "s")]);
 
     expect(result.op).toBe("send");
-    expect(await pendingReceive).toBe(123);
+    expect(await pendingReceive).toEqual({ ok: true, value: 123 });
   });
 
   it("select receive case paired with waiting sender", async () => {
@@ -469,7 +490,7 @@ describe("selection", () => {
 
     // b should still be able to receive normally later
     setTimeout(() => b.send(2), 5);
-    expect(await b.receive()).toBe(2);
+    expect(await b.receive()).toEqual({ ok: true, value: 2 });
   });
 
   it("select resolves a pending receive with ok:false when the channel closes", async () => {
@@ -498,7 +519,7 @@ describe("selection", () => {
     expect(result.op).toBe("send");
     expect(result.name).toBe("s");
     expect(result.ok).toBeTrue();
-    expect(await receive$).toBe(123);
+    expect(await receive$).toEqual({ ok: true, value: 123 });
   });
 
   it("select rejects a pending send when the channel closes", async () => {
@@ -518,13 +539,13 @@ describe("selection", () => {
     const pending = select([send(ch, 2, "s")]);
     await new Promise((resolve) => setTimeout(resolve, 0));
 
-    expect(await ch.receive()).toBe(1);
+    expect(await ch.receive()).toEqual({ ok: true, value: 1 });
 
     const result = await pending;
     expect(result.op).toBe("send");
     expect(result.name).toBe("s");
     expect(result.ok).toBeTrue();
-    expect(await ch.receive()).toBe(2);
+    expect(await ch.receive()).toEqual({ ok: true, value: 2 });
   });
 
   it("channel internals reject select sends registered after close", () => {
