@@ -362,3 +362,37 @@ already express shared-memory ownership and atomic coordination directly and can
 be passed as ordinary task data. Swiftly adds abstractions only where it owns
 additional semantics such as scheduling, cancellation, worker lifetime, or
 transfer ownership.
+
+
+## Actor mailbox pressure
+
+Actor mailboxes can be bounded at the generation itself:
+
+```ts
+const service = actor(
+  "service",
+  behavior,
+  initialState,
+  { capacity: 32 },
+);
+```
+
+`capacity` is the number of messages allowed to wait behind the behavior that is
+currently executing. Omit it to preserve the unbounded mailbox behavior.
+
+Requests that arrive after a bounded mailbox is saturated reject with
+`Actor mailbox capacity exceeded`. One-way sends cannot return a rejection, so
+they are dropped and counted through `actor.dropped`; Swiftly also emits a
+warning. Saturation does **not** terminate the actor.
+
+```ts
+service.mailboxCapacity; // 32
+service.dropped;         // one-way overflow count
+```
+
+`capacity: 0` provides rendezvous-like admission: a message is accepted only
+when the actor behavior loop is ready to receive it.
+
+Supervisor `capacity` remains a separate policy: it bounds traffic waiting
+between actor generations during restart. Actor `mailboxCapacity` bounds traffic
+inside the currently running generation.

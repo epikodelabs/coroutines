@@ -11,7 +11,8 @@ export type WorkerProtocolMessageType =
   | "notify"
   | "init"
   | "stop"
-  | "stopped";
+  | "stopped"
+  | "overflow";
 
 /**
  * `taskId` tracks the outer task lifecycle.
@@ -28,6 +29,8 @@ export type WorkerProtocolMessage = {
   to?: string | string[];
   /** Topic tag for targeted actor requests/messages. */
   topic?: string;
+  /** Internal actor mailbox capacity supplied during init. */
+  mailboxCapacity?: number;
 };
 
 /**

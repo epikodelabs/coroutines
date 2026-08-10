@@ -47,6 +47,13 @@ export type ActorExit =
   | { readonly reason: "stopped" }
   | { readonly reason: "error"; readonly error: Error };
 
+
+/** Bounded mailbox policy for an actor generation. */
+export type ActorOptions = {
+  /** Maximum number of messages allowed to wait behind the currently executing behavior. Omit for the legacy unbounded mailbox. */
+  readonly capacity?: number;
+};
+
 /**
  * Long-lived stateful worker with bidirectional messaging.
  *
@@ -66,6 +73,12 @@ export interface Actor {
 
   /** `true` while the behavior loop is running. */
   readonly running: boolean;
+
+  /** Configured bounded mailbox capacity, or `undefined` for an unbounded mailbox. */
+  readonly mailboxCapacity: number | undefined;
+
+  /** Number of one-way messages dropped because a bounded mailbox was saturated. */
+  readonly dropped: number;
 
   /** Resolves exactly once when the actor terminates. */
   readonly done: Promise<ActorExit>;

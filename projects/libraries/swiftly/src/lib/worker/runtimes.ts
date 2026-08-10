@@ -45,7 +45,7 @@ onmessage = async (event) => {
  * and `stop` messages. Uses `__streamixConcurrency` helpers injected
  * by the build script.
  */
-export const buildActorWorkerRuntime = (): string => `
+export const buildActorWorkerRuntime = (mailboxCapacity?: number): string => `
 const __serializeWorkerError = (error) => {
   if (error instanceof Error) return error.message || error.name || "Error";
   if (error === undefined) return "Worker task threw undefined";
@@ -105,7 +105,41 @@ const __createWorkerUtils = (workerId, taskId) => {
   };
 };
 
-const __actorMailbox = __streamixConcurrency.channel();
+const __actorMailboxCapacity = ${mailboxCapacity === undefined ? "undefined" : mailboxCapacity};
+const __actorMailbox = __actorMailboxCapacity === undefined
+  ? __streamixConcurrency.channel()
+  : __streamixConcurrency.channel(__actorMailboxCapacity);
+
+const __enqueueActorMessage = (value, requestId) => {
+  if (__actorMailboxCapacity === undefined) {
+    __actorMailbox.send(value).catch((error) => {
+      console.warn("Actor worker failed to enqueue message", error);
+    });
+    return true;
+  }
+
+  if (__actorMailbox.trySend(value)) {
+    return true;
+  }
+
+  if (requestId) {
+    __postToMain({
+      workerId: __workerId,
+      taskId: __actorId,
+      requestId,
+      type: "error",
+      error: "Actor mailbox capacity exceeded",
+    });
+  } else {
+    __postToMain({
+      workerId: __workerId,
+      taskId: __actorId,
+      type: "overflow",
+    });
+  }
+  return false;
+};
+
 let __actorState = undefined;
 let __actorRunning = false;
 let __actorId = null;
@@ -158,10 +192,13 @@ onmessage = async (event) => {
 
   if (type === "notify") {
     if (__actorRunning) {
-      __actorMailbox.send(payload).catch((error) => {
-        console.warn("Actor worker failed to enqueue message", error);
-      });
-      if (payload && typeof payload === "object" && payload.kind === "actor-bus") {
+      const accepted = __enqueueActorMessage(payload);
+      if (
+        accepted &&
+        payload &&
+        typeof payload === "object" &&
+        payload.kind === "actor-bus"
+      ) {
         __enqueueActorInbox(payload, "Actor worker failed to mirror bus message to inbox");
       }
     } else {
@@ -205,9 +242,7 @@ onmessage = async (event) => {
   }
 
   if (type === "request" && !!requestId) {
-    __actorMailbox.send({ msg: payload, requestId, topic }).catch((error) => {
-      console.warn("Actor worker failed to enqueue request", error);
-    });
+    __enqueueActorMessage({ msg: payload, requestId, topic }, requestId);
     return;
   }
 };`;

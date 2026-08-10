@@ -18,8 +18,8 @@ import { acquireBlobUrl, releaseBlobUrl } from "../worker/blob";
 import type { WorkerProtocolMessage } from "../worker/messages";
 import { buildActorWorkerRuntime } from "../worker/runtimes";
 import { buildWorkerScript } from "../worker/script";
-import type { Actor, ActorExit, Supervisor, SupervisorOptions } from "../worker/types";
-export type { Actor, ActorExit, Supervisor, SupervisorOptions } from "../worker/types";
+import type { Actor, ActorExit, ActorOptions, Supervisor, SupervisorOptions } from "../worker/types";
+export type { Actor, ActorExit, ActorOptions, Supervisor, SupervisorOptions } from "../worker/types";
 
 /**
  * Concurrency utils injected into actor workers.
@@ -1111,18 +1111,49 @@ export function actor<S = any, Q = any, D = any, FromMain = any>(
   behavior: ActorBehavior<S, Q, D, FromMain>,
   initialState?: S,
   ...helpers: (Function | string)[]
+): Actor;
+export function actor<S = any, Q = any, D = any, FromMain = any>(
+  name: string,
+  behavior: ActorBehavior<S, Q, D, FromMain>,
+  initialState: S | undefined,
+  options: ActorOptions,
+  ...helpers: (Function | string)[]
+): Actor;
+export function actor<S = any, Q = any, D = any, FromMain = any>(
+  name: string,
+  behavior: ActorBehavior<S, Q, D, FromMain>,
+  initialState?: S,
+  optionsOrHelper?: ActorOptions | Function | string,
+  ...remainingHelpers: (Function | string)[]
 ): Actor {
-  return createActor(name, behavior, initialState, helpers);
+  const options =
+    optionsOrHelper &&
+    typeof optionsOrHelper === "object" &&
+    !Array.isArray(optionsOrHelper)
+      ? optionsOrHelper as ActorOptions
+      : {};
+  const helpers =
+    typeof optionsOrHelper === "function" || typeof optionsOrHelper === "string"
+      ? [optionsOrHelper, ...remainingHelpers]
+      : remainingHelpers;
+
+  return createActor(name, behavior, initialState, options, helpers);
 }
 
 function createActor<S = any, Q = any, D = any, FromMain = any>(
   name: string,
   behavior: ActorBehavior<S, Q, D, FromMain>,
   initialState: S | undefined,
+  options: ActorOptions,
   helpers: (Function | string)[]
 ): Actor {
   if (!name || typeof name !== "string") {
     throw new Error("Actor name must be a non-empty string");
+  }
+
+  const capacity = options.capacity;
+  if (capacity !== undefined && (!Number.isInteger(capacity) || capacity < 0)) {
+    throw new RangeError("actor capacity must be a non-negative integer");
   }
 
   const functionHelpers = helpers.filter((h): h is Function => typeof h === "function");
@@ -1132,7 +1163,7 @@ function createActor<S = any, Q = any, D = any, FromMain = any>(
     helpers: [ACTOR_CONCURRENCY_RUNTIME, ...stringHelpers],
     main: behavior as any,
     functions: functionHelpers,
-    runtime: buildActorWorkerRuntime(),
+    runtime: buildActorWorkerRuntime(capacity),
   });
 
   const blobUrl = acquireBlobUrl(workerScript);
@@ -1141,6 +1172,7 @@ function createActor<S = any, Q = any, D = any, FromMain = any>(
 
   let worker: Worker | null = null;
   let running = false;
+  let dropped = 0;
   let nextRequestId = 1;
   const pendingRequests = new Map<string, PendingActorRequest<S>>();
   let shutdown$: Promise<void> | null = null;
@@ -1284,6 +1316,9 @@ function createActor<S = any, Q = any, D = any, FromMain = any>(
       rejectPendingRequests(error);
       unregisterActorBusTarget(actorRef);
       void shutdown(true, { reason: "error", error });
+    } else if (type === "overflow") {
+      dropped += 1;
+      console.warn(`Actor "${name}" mailbox capacity exceeded; message dropped`);
     } else if (type === "request") {
       handleRequest(msg, actorRef, worker!);
     } else if (type === "notify") {
@@ -1328,6 +1363,7 @@ function createActor<S = any, Q = any, D = any, FromMain = any>(
   postToWorker(worker, {
     taskId: actorTaskId,
     payload: initialState,
+    mailboxCapacity: capacity,
     type: "init",
   });
 
@@ -1336,6 +1372,14 @@ function createActor<S = any, Q = any, D = any, FromMain = any>(
 
     get running() {
       return running;
+    },
+
+    get mailboxCapacity() {
+      return capacity;
+    },
+
+    get dropped() {
+      return dropped;
     },
 
     done,
@@ -1609,6 +1653,7 @@ export function supervisor(
   const ingress: PendingIngress[] = [];
   let current: Actor | undefined;
   let restarts = 0;
+  let totalDropped = 0;
   let stopping = false;
   let settled = false;
   let restartController: AbortController | undefined;
@@ -1714,6 +1759,7 @@ export function supervisor(
 
     void next.done.then((exit) => {
       if (current !== next || settled) return;
+      totalDropped += next.dropped;
       current = undefined;
 
       if (stopping || exit.reason === "stopped") {
@@ -1733,6 +1779,12 @@ export function supervisor(
     },
     get running() {
       return current?.running ?? false;
+    },
+    get mailboxCapacity() {
+      return current?.mailboxCapacity ?? first.mailboxCapacity;
+    },
+    get dropped() {
+      return totalDropped + (current?.dropped ?? 0);
     },
     get current() {
       return current;

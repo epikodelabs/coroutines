@@ -63,6 +63,7 @@ idescribe("actor", () => {
       terminated = false;
       private workerInbox = channel<any>();
       private busInbox = channel<any>();
+      private mailboxCapacity: number | undefined;
       private actorState: any = undefined;
       private actorRunning = false;
       private workerId = 1;
@@ -199,6 +200,10 @@ idescribe("actor", () => {
           if (msg.type === "init") {
             this.taskId = msg.taskId;
             this.actorState = msg.payload;
+            this.mailboxCapacity = msg.mailboxCapacity;
+            if (this.mailboxCapacity !== undefined) {
+              this.workerInbox = channel<any>(this.mailboxCapacity);
+            }
             this.actorRunning = true;
             this.runBehaviorLoop(msg);
           } else if (msg.type === "stop") {
@@ -206,12 +211,44 @@ idescribe("actor", () => {
             this.workerInbox.close();
             this.busInbox.close();
           } else if (msg.type === "notify") {
-            this.workerInbox.send(msg.payload).catch(() => {});
-            if (msg.payload && typeof msg.payload === "object" && msg.payload.kind === "actor-bus") {
+            const accepted =
+              this.mailboxCapacity === undefined
+                ? (this.workerInbox.send(msg.payload).catch(() => {}), true)
+                : this.workerInbox.trySend(msg.payload);
+
+            if (!accepted) {
+              const overflowEvent = {
+                data: { workerId: this.workerId, taskId: this.taskId, type: "overflow" }
+              } as any;
+              this.onmessage?.(overflowEvent);
+              this.listeners["message"]?.forEach(fn => fn(overflowEvent));
+            } else if (
+              msg.payload &&
+              typeof msg.payload === "object" &&
+              msg.payload.kind === "actor-bus"
+            ) {
               this.busInbox.send(msg.payload).catch(() => {});
             }
           } else if (msg.type === "request" && msg.requestId) {
-            this.workerInbox.send({ msg: msg.payload, requestId: msg.requestId, topic: msg.topic }).catch(() => {});
+            const envelope = { msg: msg.payload, requestId: msg.requestId, topic: msg.topic };
+            const accepted =
+              this.mailboxCapacity === undefined
+                ? (this.workerInbox.send(envelope).catch(() => {}), true)
+                : this.workerInbox.trySend(envelope);
+
+            if (!accepted) {
+              const overflowEvent = {
+                data: {
+                  workerId: this.workerId,
+                  taskId: this.taskId,
+                  requestId: msg.requestId,
+                  type: "error",
+                  error: "Actor mailbox capacity exceeded",
+                }
+              } as any;
+              this.onmessage?.(overflowEvent);
+              this.listeners["message"]?.forEach(fn => fn(overflowEvent));
+            }
           } else if ((msg.type === "response" || msg.type === "error") && msg.requestId) {
             const pending = this.pendingWorkerRequests.get(msg.requestId);
             if (pending) {
@@ -268,6 +305,87 @@ idescribe("actor", () => {
     expect(() => actor("", async (_msg: unknown, state: number) => state, 0)).toThrowError(
       "Actor name must be a non-empty string"
     );
+  });
+
+
+  it("should validate bounded actor mailbox capacity", () => {
+    async function behavior(_msg: any, state: number) {
+      return state;
+    }
+
+    expect(() =>
+      actor(nextActorName(), behavior, 0, { capacity: -1 })
+    ).toThrowError(/non-negative integer/);
+
+    expect(() =>
+      actor(nextActorName(), behavior, 0, { capacity: 1.5 })
+    ).toThrowError(/non-negative integer/);
+  });
+
+  it("should bound queued actor requests without terminating the actor", async () => {
+    async function behavior(msg: number, state: number) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      return state + msg;
+    }
+
+    (globalThis as any).currentMainTask = behavior;
+    const a = actor(nextActorName(), behavior, 0, { capacity: 1 });
+
+    expect(a.mailboxCapacity).toBe(1);
+    expect(a.dropped).toBe(0);
+
+    const first = main.outbox.request(a, "add", 1);
+    const second = main.outbox.request(a, "add", 2);
+    const overflow = main.outbox.request(a, "add", 4);
+
+    await expectAsync(overflow).toBeRejectedWithError(/mailbox capacity exceeded/);
+    expect(await first).toBe(1);
+    expect(await second).toBe(3);
+    expect(a.running).toBeTrue();
+    expect(a.dropped).toBe(0);
+
+    await main.outbox.stop(a);
+  });
+
+  it("should count one-way messages dropped by a saturated bounded mailbox", async () => {
+    async function behavior(_msg: any, state: number) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      return state + 1;
+    }
+
+    (globalThis as any).currentMainTask = behavior;
+    const a = actor(nextActorName(), behavior, 0, { capacity: 1 });
+
+    main.outbox.send(a, "work", 1);
+    main.outbox.send(a, "work", 2);
+    main.outbox.send(a, "work", 3);
+
+    await pause(10);
+
+    expect(a.running).toBeTrue();
+    expect(a.dropped).toBe(1);
+
+    await pause(60);
+    await main.outbox.stop(a);
+  });
+
+  it("capacity zero allows only direct handoff while behavior is ready", async () => {
+    async function behavior(_msg: any, state: number) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      return state + 1;
+    }
+
+    (globalThis as any).currentMainTask = behavior;
+    const a = actor(nextActorName(), behavior, 0, { capacity: 0 });
+
+    const first = main.outbox.request(a, "work", undefined);
+    const second = main.outbox.request(a, "work", undefined);
+
+    await expectAsync(second).toBeRejectedWithError(/mailbox capacity exceeded/);
+    expect(await first).toBe(1);
+    expect(a.running).toBeTrue();
+
+    await main.outbox.stop(a);
   });
 
   it("should eagerly initialize behavior actor with state", async () => {
@@ -1162,6 +1280,35 @@ idescribe("actor", () => {
       () => actor(nextActorName(), behavior, 0),
       { capacity: -1 },
     )).toThrowError(/capacity/);
+  });
+
+
+  it("supervisor preserves mailbox drop accounting across generations", async () => {
+    async function behavior(_msg: any, state: number) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      return state;
+    }
+
+    (globalThis as any).currentMainTask = behavior;
+    const name = nextActorName();
+    const supervised = supervisor(
+      () => actor(name, behavior, 0, { capacity: 1 }),
+      { maxRestarts: 1 },
+    );
+
+    main.outbox.send(supervised, "work", 1);
+    main.outbox.send(supervised, "work", 2);
+    main.outbox.send(supervised, "work", 3);
+    await pause(10);
+
+    expect(supervised.mailboxCapacity).toBe(1);
+    expect(supervised.dropped).toBe(1);
+
+    (globalThis as any).lastMockWorker.emitError(new Error("restart"));
+    await pause(20);
+
+    expect(supervised.dropped).toBe(1);
+    await main.outbox.stop(supervised);
   });
 
   it("supervisor restarts failed actors behind a stable handle", async () => {
