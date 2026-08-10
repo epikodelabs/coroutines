@@ -1,3 +1,5 @@
+import type { TaskRunControl, WorkerTaskResult, WorkerTaskUtils } from "../utils/transfer";
+
 /**
  * Task descriptor ready to be baked into a worker blob.
  *
@@ -8,7 +10,7 @@ export interface CoroutineScript<T = any, R = any> {
   /** Raw worker-side snippets injected before the serialized functions. */
   helpers?: string[];
   /** Main task body executed inside the worker. */
-  main: (data: T) => R | Promise<R>;
+  main: (data: T, utils: WorkerTaskUtils) => WorkerTaskResult<R> | Promise<WorkerTaskResult<R>>;
   /** Additional named helper functions serialized alongside `main`. */
   functions?: Function[];
 }
@@ -18,7 +20,7 @@ export interface CoroutineScript<T = any, R = any> {
  */
 export interface TaskRunner<T = any, R = any> {
   /** Submits one value for worker-side processing. */
-  run: (data: T, signal?: AbortSignal) => Promise<R>;
+  run: (data: T, control?: TaskRunControl) => Promise<R>;
   /**
    * Stops accepting new work, drains already-admitted work, then releases resources.
    * Repeated calls share the same lifecycle completion.

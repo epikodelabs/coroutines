@@ -7,7 +7,7 @@ Swiftly treats concurrency as a programming model rather than exposing Web Worke
 ## Core model
 
 - `coroutine()` — reusable sequential submissions on one dedicated worker.
-- `compute()` — pooled worker execution for independent parallel submissions.
+- `compute()` — pooled worker execution for independent parallel submissions, including zero-copy transfer ownership.
 - `group()` — structured ownership for dynamic concurrent work, with fail-fast sibling cancellation and optional concurrency bounds.
 - `channel()` + `select()` — communication and coordination. `select()` can also race cancellable `operation()` cases.
 - `background()`, `withCancel()`, `withTimeout()`, `withDeadline()` — cancellation and lifetime propagation.
@@ -43,7 +43,7 @@ Calling `wait()` closes the group to new work. Cancelling the parent signal or c
 
 ## Cancellable worker submissions
 
-`Coroutine.run()` and compute runners accept an optional `AbortSignal`:
+`Coroutine.run()` and compute runners accept either an `AbortSignal` or per-run execution options:
 
 ```ts
 const parse = coroutine((text: string) => parseLargeDocument(text));
@@ -51,6 +51,9 @@ const controller = new AbortController();
 
 const result = parse.run(source, controller.signal);
 controller.abort();
+
+// Equivalent options form, also used when transferring ownership.
+parse.run(source, { signal: controller.signal });
 ```
 
 A worker task cannot be pre-empted safely inside arbitrary JavaScript, so Swiftly cancels an active worker submission by terminating that worker. Dedicated coroutine workers are recreated for later queued work; compute pools retire only the cancelled worker and restore pool capacity. Queued submissions can be cancelled without starting a worker task.
@@ -237,7 +240,9 @@ await worker.close();
 normal lifecycle boundary when submitted work must not be lost.
 
 `dispose()` means **terminate now**. Active and queued work is rejected and
-worker resources are released immediately.
+worker resources are released immediately. Worker-script blob URLs are acquired
+lazily on first execution, so constructing an unused coroutine or compute runner
+does not reserve browser worker resources.
 
 The same contract is shared by `coroutine()`, `compute()`, `computeScript()`,
 and `compose()`. `compose().close()` attempts to close every owned stage even if
@@ -282,3 +287,47 @@ collapse supervision immediately when restart capacity remains.
 
 The supervisor exposes `pending` and `capacity` for restart-window pressure
 without exposing its internal queue or worker generations.
+
+
+## Transferable ownership
+
+Large `ArrayBuffer`, `MessagePort`, `ImageBitmap`, and other transferable values
+can move across the worker boundary without structured-clone copying. Input
+ownership is declared on the existing run call:
+
+```ts
+const result = await transform(buffer, {
+  transfer: [buffer],
+});
+
+// `buffer` is detached after it is posted to the worker.
+```
+
+Worker task functions receive a small second argument. Its `transfer()` method
+marks a result for transfer back to the caller:
+
+```ts
+const transform = compute<ArrayBuffer, ArrayBuffer>(
+  (buffer, { transfer }) => {
+    const bytes = new Uint8Array(buffer);
+    mutate(bytes);
+
+    return transfer(buffer, buffer);
+  },
+);
+
+const input = new ArrayBuffer(1024 * 1024);
+const output = await transform(input, { transfer: [input] });
+```
+
+The transfer wrapper is worker-internal: callers receive `output` directly, not
+a wrapper object. Duplicate entries in a transfer list are rejected before the
+post where Swiftly owns the list, and queued submissions do not transfer their
+objects until they actually acquire a worker. Cancelling queued work therefore
+leaves its transferables owned by the caller.
+
+`compose()` applies an input transfer list to the first worker-backed stage only;
+it is never reused for later stages after ownership has moved. Transfer between
+stages inside one merged coroutine worker does not cross a worker boundary, so
+intermediate transfer wrappers are unwrapped locally and only a final-stage
+transfer is posted back to the caller.

@@ -16,6 +16,7 @@ class MockWorker {
 
   readonly listeners = new Map<string, Array<(event: any) => void>>();
   readonly sentMessages: WorkerProtocolMessage[] = [];
+  readonly sentTransfers: Transferable[][] = [];
   terminated = false;
   __id?: number;
 
@@ -36,12 +37,13 @@ class MockWorker {
     if (index >= 0) listeners.splice(index, 1);
   }
 
-  postMessage(message: WorkerProtocolMessage) {
+  postMessage(message: WorkerProtocolMessage, transfer: Transferable[] = []) {
     if (MockWorker.postMessageError !== null) {
       throw MockWorker.postMessageError;
     }
 
     this.sentMessages.push(message);
+    this.sentTransfers.push([...transfer]);
   }
 
   terminate() {
@@ -179,6 +181,69 @@ idescribe("worker helpers", () => {
   });
 
 
+  describe("worker script ownership", () => {
+    it("acquires blob URLs lazily and releases them only after worker use", async () => {
+      const createUrl = spyOn(URL, "createObjectURL").and.returnValue("blob:swiftly-lazy");
+      const revokeUrl = spyOn(URL, "revokeObjectURL");
+
+      const unused = createTaskRunner<number, number>({
+        name: "unused-runner",
+        main: (value: number) => value,
+        functions: [],
+        generateWorkerScript: () => "unused-lazy-worker-script",
+      });
+
+      expect(createUrl).not.toHaveBeenCalled();
+      await unused.dispose();
+      expect(createUrl).not.toHaveBeenCalled();
+      expect(revokeUrl).not.toHaveBeenCalled();
+
+      const used = createTaskRunner<number, number>({
+        name: "used-runner",
+        main: (value: number) => value,
+        functions: [],
+        generateWorkerScript: () => "used-lazy-worker-script",
+      });
+      const pending = used.run(1);
+      await flush();
+
+      expect(createUrl).toHaveBeenCalledTimes(1);
+      const worker = MockWorker.instances[MockWorker.instances.length - 1];
+      const message = worker.sentMessages[0];
+      worker.dispatch({ ...message, type: "response", payload: 1 });
+      await expectAsync(pending).toBeResolvedTo(1);
+      await used.close();
+
+      expect(revokeUrl).toHaveBeenCalledWith("blob:swiftly-lazy");
+    });
+
+    it("does not acquire a compute-pool blob until its first admitted run", async () => {
+      const createUrl = spyOn(URL, "createObjectURL").and.returnValue("blob:swiftly-pool-lazy");
+      const revokeUrl = spyOn(URL, "revokeObjectURL");
+
+      const pool = createTaskPool<number, number>({
+        name: "lazy-pool",
+        concurrency: 1,
+        main: (value: number) => value,
+        functions: [],
+        generateWorkerScript: () => "lazy-pool-worker-script",
+      });
+
+      expect(createUrl).not.toHaveBeenCalled();
+      const pending = pool.run(2);
+      await flush();
+      expect(createUrl).toHaveBeenCalledTimes(1);
+
+      const worker = MockWorker.instances[MockWorker.instances.length - 1];
+      const message = worker.sentMessages[0];
+      worker.dispatch({ ...message, type: "response", payload: 2 });
+      await expectAsync(pending).toBeResolvedTo(2);
+      await pool.close();
+
+      expect(revokeUrl).toHaveBeenCalledWith("blob:swiftly-pool-lazy");
+    });
+  });
+
   describe("createTaskRunner", () => {
     it("rejects the active task on worker failure and recreates the worker for queued work", async () => {
       const runner = createTaskRunner<number, number>({
@@ -234,6 +299,37 @@ idescribe("worker helpers", () => {
       replacement.dispatch({ ...message, type: "response", payload: 22 });
       await expectAsync(queued).toBeResolvedTo(22);
 
+      await runner.dispose();
+    });
+
+    it("passes transfer ownership only when a queued runner task is posted", async () => {
+      const runner = createTaskRunner<ArrayBuffer, number>({
+        name: "transfer-runner",
+        main: (value: ArrayBuffer) => value.byteLength,
+        functions: [],
+        generateWorkerScript: () => "runner-worker-script",
+      });
+
+      const firstBuffer = new ArrayBuffer(8);
+      const secondBuffer = new ArrayBuffer(16);
+      const controller = new AbortController();
+
+      const first = runner.run(firstBuffer, { transfer: [firstBuffer] });
+      await flush();
+      const worker = MockWorker.instances[0];
+      expect(worker.sentTransfers[0]).toEqual([firstBuffer]);
+
+      const second = runner.run(secondBuffer, {
+        signal: controller.signal,
+        transfer: [secondBuffer],
+      });
+      controller.abort(new Error("cancel before transfer"));
+      await expectAsync(second).toBeRejectedWithError("cancel before transfer");
+      expect(worker.sentMessages.length).toBe(1);
+
+      const message = worker.sentMessages[0];
+      worker.dispatch({ ...message, type: "response", payload: 8 });
+      await expectAsync(first).toBeResolvedTo(8);
       await runner.dispose();
     });
 
@@ -303,6 +399,32 @@ idescribe("worker helpers", () => {
       await pool.dispose();
     });
 
+
+    it("passes transfer lists through pooled submissions without reusing them", async () => {
+      Object.defineProperty(navigator, "hardwareConcurrency", {
+        value: 1,
+        configurable: true,
+      });
+
+      const pool = createTaskPool<ArrayBuffer, number>({
+        name: "transfer-pool",
+        main: (value: ArrayBuffer) => value.byteLength,
+        functions: [],
+        generateWorkerScript: () => "worker-script",
+      });
+
+      const buffer = new ArrayBuffer(32);
+      const pending = pool.run(buffer, { transfer: [buffer] });
+      await flush();
+
+      const worker = MockWorker.instances[0];
+      expect(worker.sentTransfers[0]).toEqual([buffer]);
+      const message = worker.sentMessages[0];
+      worker.dispatch({ ...message, type: "response", payload: 32 });
+
+      await expectAsync(pending).toBeResolvedTo(32);
+      await pool.dispose();
+    });
 
     it("rejects work owned by a failed worker and replaces it for queued work", async () => {
       Object.defineProperty(navigator, "hardwareConcurrency", {

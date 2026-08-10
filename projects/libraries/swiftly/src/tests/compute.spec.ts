@@ -240,4 +240,61 @@ idescribe("compute", () => {
   });
 
 
+  it("transfers ArrayBuffer ownership into and back out of compute workers", async () => {
+    const run = compute<ArrayBuffer, ArrayBuffer>((buffer, { transfer }) => {
+      const bytes = new Uint8Array(buffer);
+      bytes[0] += 1;
+      return transfer(buffer, buffer);
+    });
+
+    const input = new ArrayBuffer(8);
+    new Uint8Array(input)[0] = 41;
+
+    const pending = run(input, { transfer: [input] });
+    const output = await pending;
+
+    expect(input.byteLength).toBe(0);
+    expect(output.byteLength).toBe(8);
+    expect(new Uint8Array(output)[0]).toBe(42);
+
+    await run.dispose();
+  });
+
+  it("does not transfer queued compute input when cancellation wins first", async () => {
+    const run = compute<{ delay: number; buffer: ArrayBuffer }, number>(
+      async ({ delay, buffer }) => {
+        await new Promise((resolve) => setTimeout(resolve, delay));
+        return buffer.byteLength;
+      },
+      { concurrency: 1, maxQueued: 2 },
+    );
+
+    const occupying = run({ delay: 30, buffer: new ArrayBuffer(1) });
+    const controller = new AbortController();
+    const queuedBuffer = new ArrayBuffer(16);
+    const queued = run(
+      { delay: 0, buffer: queuedBuffer },
+      { signal: controller.signal, transfer: [queuedBuffer] },
+    );
+
+    controller.abort(new Error("cancel queued transfer"));
+
+    await expectAsync(queued).toBeRejectedWithError("cancel queued transfer");
+    expect(queuedBuffer.byteLength).toBe(16);
+    await occupying;
+    await run.dispose();
+  });
+
+  it("rejects duplicate input transfer ownership before posting work", async () => {
+    const run = compute<ArrayBuffer, number>((buffer) => buffer.byteLength);
+    const buffer = new ArrayBuffer(4);
+
+    await expectAsync(
+      run(buffer, { transfer: [buffer, buffer] }),
+    ).toBeRejectedWithError(/same transferable more than once/);
+    expect(buffer.byteLength).toBe(4);
+
+    await run.dispose();
+  });
+
 });

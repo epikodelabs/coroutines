@@ -5,6 +5,8 @@ import type { WorkerScriptConfig } from "./runner";
 import type { TaskRunner } from "./types";
 import { generateTaskId } from "./utils";
 import { createAbortError } from "../utils/context";
+import type { TaskRunControl } from "../utils/transfer";
+import { normalizeTaskRunControl } from "./control";
 
 export type PoolOptions = {
   name: string;
@@ -70,7 +72,7 @@ export function createTaskPool<T, R>({
   const workerErrorHandlers = new Map<number, (event: ErrorEvent) => void>();
   const pendingMessages: PendingTaskMap = new Map();
   const workerScript = generateWorkerScript(main, functions, config);
-  const blobUrl = acquireBlobUrl(workerScript);
+  let blobUrl: string | null = null;
 
   let createdWorkersCount = 0;
   let lifecycle: "open" | "closing" | "finalizing" = "open";
@@ -82,13 +84,20 @@ export function createTaskPool<T, R>({
   let nextWorkerId = 0;
   let hasReleasedBlobUrl = false;
 
+  const getWorkerScriptUrl = (): string => {
+    if (blobUrl) return blobUrl;
+    blobUrl = acquireBlobUrl(workerScript);
+    return blobUrl;
+  };
+
   const releaseWorkerScript = () => {
-    if (hasReleasedBlobUrl) {
+    if (hasReleasedBlobUrl || !blobUrl) {
       return;
     }
 
     hasReleasedBlobUrl = true;
     releaseBlobUrl(workerScript);
+    blobUrl = null;
   };
 
   const getWorkerId = (worker: Worker): number | undefined => {
@@ -206,7 +215,7 @@ export function createTaskPool<T, R>({
 
   const createWorker = async (): Promise<Worker> => {
     const workerId = ++nextWorkerId;
-    const worker = new Worker(blobUrl, { type: "module" });
+    const worker = new Worker(getWorkerScriptUrl(), { type: "module" });
     const messageHandler = createMessageHandler
       ? createMessageHandler(worker, pendingMessages)
       : createDefaultMessageHandler(worker, pendingMessages);
@@ -329,7 +338,12 @@ export function createTaskPool<T, R>({
     idleWorkers.push(worker);
   };
 
-  const submitTask = (worker: Worker, data: T, signal?: AbortSignal): Promise<R> => {
+  const submitTask = (
+    worker: Worker,
+    data: T,
+    signal?: AbortSignal,
+    transferables: Transferable[] = [],
+  ): Promise<R> => {
     if (signal?.aborted) {
       return Promise.reject(createAbortError(signal));
     }
@@ -366,7 +380,10 @@ export function createTaskPool<T, R>({
       pendingMessages.set(taskId, { workerId, resolve: finishResolve, reject: finishReject });
       signal?.addEventListener("abort", onAbort, { once: true });
       try {
-        worker.postMessage({ workerId, taskId, payload: data, type: "task" });
+        worker.postMessage(
+          { workerId, taskId, payload: data, type: "task" },
+          transferables,
+        );
       } catch (error) {
         pendingMessages.delete(taskId);
         finishReject(toError(error, `${name} worker postMessage failed`));
@@ -374,7 +391,9 @@ export function createTaskPool<T, R>({
     });
   };
 
-  const run = async (value: T, signal?: AbortSignal): Promise<R> => {
+  const run = async (value: T, control?: TaskRunControl): Promise<R> => {
+    const { signal, transfer } = normalizeTaskRunControl(control);
+
     if (lifecycle !== "open") {
       throw createRunClosedError();
     }
@@ -383,7 +402,7 @@ export function createTaskPool<T, R>({
     try {
       const worker = await checkoutWorker(signal);
       try {
-        return await submitTask(worker, value, signal);
+        return await submitTask(worker, value, signal, transfer);
       } finally {
         checkinWorker(worker);
       }

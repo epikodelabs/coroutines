@@ -1,4 +1,4 @@
-import { compose, coroutine } from "../public-api";
+import { compose, coroutine, type TaskRunControl } from "../public-api";
 
 describe("compose coroutines", () => {
   it("should process tasks sequentially via run", async () => {
@@ -141,7 +141,8 @@ describe("compose coroutines", () => {
   it("forwards cancellation to every runner stage", async () => {
     const seenSignals: AbortSignal[] = [];
     const first = {
-      run: async (value: number, signal?: AbortSignal) => {
+      run: async (value: number, control?: TaskRunControl) => {
+        const signal = control instanceof AbortSignal ? control : control?.signal;
         if (signal) seenSignals.push(signal);
         return value + 1;
       },
@@ -149,7 +150,8 @@ describe("compose coroutines", () => {
       dispose: async () => undefined,
     };
     const second = {
-      run: async (value: number, signal?: AbortSignal) => {
+      run: async (value: number, control?: TaskRunControl) => {
+        const signal = control instanceof AbortSignal ? control : control?.signal;
         if (signal) seenSignals.push(signal);
         return value * 2;
       },
@@ -210,5 +212,61 @@ describe("compose coroutines", () => {
     expect(lifecycle).toEqual(["first", "second"]);
   });
 
+
+  it("applies an input transfer list only to the first composed runner", async () => {
+    const controls: TaskRunControl[] = [];
+    const first = {
+      run: async (value: ArrayBuffer, control?: TaskRunControl) => {
+        controls.push(control);
+        return value;
+      },
+      close: async () => undefined,
+      dispose: async () => undefined,
+    };
+    const second = {
+      run: async (value: ArrayBuffer, control?: TaskRunControl) => {
+        controls.push(control);
+        return value.byteLength;
+      },
+      close: async () => undefined,
+      dispose: async () => undefined,
+    };
+
+    const controller = new AbortController();
+    const buffer = new ArrayBuffer(8);
+    const composed = compose(first, second);
+    await expectAsync(
+      composed.run(buffer, { signal: controller.signal, transfer: [buffer] }),
+    ).toBeResolvedTo(8);
+
+    expect((controls[0] as any).transfer).toEqual([buffer]);
+    expect((controls[0] as any).signal).toBe(controller.signal);
+    expect(controls[1]).toBe(controller.signal);
+    await composed.dispose();
+  });
+
+  it("keeps transfer ownership inside merged coroutine stages and returns only the final value", async () => {
+    const first = coroutine<ArrayBuffer, ArrayBuffer>((buffer, { transfer }) => {
+      new Uint8Array(buffer)[0] += 1;
+      return transfer(buffer, buffer);
+    });
+    const second = coroutine<ArrayBuffer, ArrayBuffer>((buffer, { transfer }) => {
+      new Uint8Array(buffer)[0] += 1;
+      return transfer(buffer, buffer);
+    });
+    const composed = compose(first, second);
+
+    const input = new ArrayBuffer(4);
+    new Uint8Array(input)[0] = 40;
+    const output = await composed.run(input, { transfer: [input] });
+
+    expect(input.byteLength).toBe(0);
+    expect(output.byteLength).toBe(4);
+    expect(new Uint8Array(output)[0]).toBe(42);
+
+    await composed.dispose();
+    await first.dispose();
+    await second.dispose();
+  });
 
 });

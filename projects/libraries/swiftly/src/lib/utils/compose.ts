@@ -1,5 +1,7 @@
 import { buildCoroutineWorkerRuntime, buildWorkerScript, createTaskRunner, serializeScript } from "../worker";
 import type { Coroutine, CoroutineScript, TaskRunner } from "../worker/types";
+import type { TaskRunControl } from "./transfer";
+import { normalizeTaskRunControl } from "../worker/control";
 
 function isCoroutineScript(value: unknown): value is CoroutineScript {
   return (
@@ -36,10 +38,14 @@ ${depsSection ? '  ' + depsSection.replace(/\n/g, '\n  ') + '\n' : ''}  return (
     .reduce((acc, body, i) => `${acc}${i > 0 ? '\n\n' : ''}${body}`, '');
 
   const composedMain = new Function(
-    `return async function(data) {
+    `return async function(data, utils) {
       let result = data;
       ${scripts
-        .map((_, i) => `result = await __stage${i}(result);`)
+        .map((_, i) =>
+          i === scripts.length - 1
+            ? `result = await __stage${i}(result, utils);`
+            : `result = await __stage${i}(result, utils);\n      if (result && result.__swiftlyTransferResult === true) result = result.value;`
+        )
         .reduce((acc, line, i) => `${acc}${i > 0 ? "\n      " : ""}${line}`, "")}
       return result;
     };`
@@ -102,15 +108,25 @@ export function compose<T = any, R = any>(
     });
   }
 
-  const run = async (data: T, signal?: AbortSignal): Promise<R> => {
+  const run = async (data: T, control?: TaskRunControl): Promise<R> => {
     let result: any = data;
+    const { signal, transfer } = normalizeTaskRunControl(control);
+    let transferPending = transfer.length > 0;
 
     if (workerRunner) {
-      result = await workerRunner.run(result, signal);
+      result = await workerRunner.run(
+        result,
+        transferPending ? { signal, transfer } : signal,
+      );
+      transferPending = false;
     }
 
     for (const runner of taskRunners) {
-      result = await runner.run(result, signal);
+      result = await runner.run(
+        result,
+        transferPending ? { signal, transfer } : signal,
+      );
+      transferPending = false;
     }
 
     return result;

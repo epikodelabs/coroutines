@@ -6,6 +6,26 @@ import type { CoroutineScript } from "./types";
  */
 const ASYNC_WORKER_BOOTSTRAP = `var __defProp=Object.defineProperty,__defProps=Object.defineProperties,__getOwnPropDescs=Object.getOwnPropertyDescriptors,__getOwnPropSymbols=Object.getOwnPropertySymbols,__hasOwnProp=Object.prototype.hasOwnProperty,__propIsEnum=Object.prototype.propertyIsEnumerable,__knownSymbol=(r,e)=>(e=Symbol[r])?e:Symbol.for("Symbol."+r),__defNormalProp=(r,e,o)=>e in r?__defProp(r,e,{enumerable:!0,configurable:!0,writable:!0,value:o}):r[e]=o,__spreadValues=(r,e)=>{for(var o in e||={})__hasOwnProp.call(e,o)&&__defNormalProp(r,o,e[o]);if(__getOwnPropSymbols)for(var o of __getOwnPropSymbols(e))__propIsEnum.call(e,o)&&__defNormalProp(r,o,e[o]);return r},__spreadProps=(r,e)=>__defProps(r,__getOwnPropDescs(e)),__async=(r,e,o)=>new Promise((t,n)=>{var a=r=>{try{s(o.next(r))}catch(e){n(e)}},p=r=>{try{s(o.throw(r))}catch(e){n(e)}},s=r=>r.done?t(r.value):Promise.resolve(r.value).then(a,p);s((o=o.apply(r,e)).next())}),__await=function(r,e){this[0]=r,this[1]=e},__asyncGenerator=(r,e,o)=>{var t=(r,e,n,a)=>{try{var p=o[r](e),s=(e=p.value)instanceof __await,l=p.done;Promise.resolve(s?e[0]:e).then(o=>s?t("return"===r?r:"next",e[1]?{done:o.done,value:o.value}:o,n,a):n({value:o,done:l})).catch(r=>t("throw",r,n,a))}catch(y){a(y)}},n=r=>a[r]=e=>new Promise((o,n)=>t(r,e,o,n)),a={};return o=o.apply(r,e),a[__knownSymbol("asyncIterator")] =()=>a,n("next"),n("throw"),n("return"),a};`;
 
+
+const TRANSFER_WORKER_BOOTSTRAP = `
+const __swiftlyWorkerUtils = Object.freeze({
+  transfer(value, ...transferables) {
+    const seen = new Set();
+    for (const item of transferables) {
+      if (seen.has(item)) {
+        throw new TypeError("transfer list contains the same transferable more than once");
+      }
+      seen.add(item);
+    }
+
+    return {
+      __swiftlyTransferResult: true,
+      value,
+      transfer: transferables,
+    };
+  },
+});`;
+
 /**
  * Serializes helper and task functions for worker-script injection.
  */
@@ -53,7 +73,7 @@ export function buildWorkerScript({
   functions: Function[];
   runtime: string;
 }): string {
-  const helperSections = [ASYNC_WORKER_BOOTSTRAP, ...(helpers || [])];
+  const helperSections = [ASYNC_WORKER_BOOTSTRAP, TRANSFER_WORKER_BOOTSTRAP, ...(helpers || [])];
   const dependencySection = functions.map(serializeFunction).join(";\n");
   const mainSection = `const __mainTask = ${serializeFunction(main)};`;
 

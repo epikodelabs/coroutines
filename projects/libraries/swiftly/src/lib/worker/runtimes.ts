@@ -19,8 +19,19 @@ onmessage = async (event) => {
   }
 
   try {
-    const result = await __mainTask(payload);
-    postMessage({ workerId, taskId, payload: result, type: 'response' });
+    const result = await __mainTask(payload, __swiftlyWorkerUtils);
+    if (
+      result &&
+      result.__swiftlyTransferResult === true &&
+      Array.isArray(result.transfer)
+    ) {
+      postMessage(
+        { workerId, taskId, payload: result.value, type: 'response' },
+        result.transfer,
+      );
+    } else {
+      postMessage({ workerId, taskId, payload: result, type: 'response' });
+    }
   } catch (error) {
     const message = __serializeWorkerError(error);
     postMessage({ workerId, taskId, error: message, type: 'error' });

@@ -2,11 +2,14 @@ import { createTaskRunner } from "../worker/runner";
 import { buildCoroutineWorkerRuntime } from "../worker/runtimes";
 import { buildWorkerScript } from "../worker/script";
 import type { Coroutine, CoroutineScript } from "../worker/types";
+import type { WorkerTaskResult, WorkerTaskUtils } from "../utils/transfer";
 
 /**
  * Task function executed inside a worker without actor utilities.
  */
-export type CoroutineTask<T = any, R = any> = (data: T) => Promise<R> | R;
+export type CoroutineTask<T = any, R = any> = (data: T, utils: WorkerTaskUtils) =>
+  | WorkerTaskResult<R>
+  | Promise<WorkerTaskResult<R>>;
 
 /**
  * Optional settings for plain one-way coroutine workers.

@@ -4,6 +4,8 @@ import { createDefaultMessageHandler } from "./messages";
 import type { TaskRunner } from "./types";
 import { generateTaskId } from "./utils";
 import { createAbortError } from "../utils/context";
+import type { TaskRunControl } from "../utils/transfer";
+import { normalizeTaskRunControl } from "./control";
 
 /**
  * Shared worker-script configuration for task runners.
@@ -20,6 +22,7 @@ type QueuedTask<T, R> = {
   resolve: (value: R) => void;
   reject: (error: Error) => void;
   signal?: AbortSignal;
+  transfer: Transferable[];
   abort?: () => void;
 };
 
@@ -56,7 +59,7 @@ export function createTaskRunner<T, R>({
   const runnerWorkerId = ++workerIdentifierCounter;
   const runnerTaskId = String(runnerWorkerId);
   const workerScript = generateWorkerScript(main, functions, config);
-  const blobUrl = acquireBlobUrl(workerScript);
+  let blobUrl: string | null = null;
 
   let worker: Worker | null = null;
   let workerMessageHandler: ((event: MessageEvent<WorkerProtocolMessage>) => void) | null = null;
@@ -68,13 +71,20 @@ export function createTaskRunner<T, R>({
   let resolveClose: (() => void) | null = null;
   let hasReleasedBlobUrl = false;
 
+  const getWorkerScriptUrl = (): string => {
+    if (blobUrl) return blobUrl;
+    blobUrl = acquireBlobUrl(workerScript);
+    return blobUrl;
+  };
+
   const releaseWorkerScript = () => {
-    if (hasReleasedBlobUrl) {
+    if (hasReleasedBlobUrl || !blobUrl) {
       return;
     }
 
     hasReleasedBlobUrl = true;
     releaseBlobUrl(workerScript);
+    blobUrl = null;
   };
 
   const rejectWorkerTasks = (workerId: number, error: Error) => {
@@ -107,7 +117,7 @@ export function createTaskRunner<T, R>({
       return worker;
     }
 
-    const nextWorker = new Worker(blobUrl, { type: "module" });
+    const nextWorker = new Worker(getWorkerScriptUrl(), { type: "module" });
     workerMessageHandler = createMessageHandler
       ? createMessageHandler(nextWorker, pendingMessages)
       : createDefaultMessageHandler(nextWorker, pendingMessages);
@@ -136,7 +146,12 @@ export function createTaskRunner<T, R>({
     return nextWorker;
   };
 
-  const submitTask = (targetWorker: Worker, data: T, signal?: AbortSignal): Promise<R> => {
+  const submitTask = (
+    targetWorker: Worker,
+    data: T,
+    signal?: AbortSignal,
+    transferables: Transferable[] = [],
+  ): Promise<R> => {
     if (signal?.aborted) {
       return Promise.reject(createAbortError(signal));
     }
@@ -181,7 +196,10 @@ export function createTaskRunner<T, R>({
       signal?.addEventListener("abort", onAbort, { once: true });
 
       try {
-        targetWorker.postMessage({ workerId: runnerWorkerId, taskId, payload: data, type: "task" });
+        targetWorker.postMessage(
+          { workerId: runnerWorkerId, taskId, payload: data, type: "task" },
+          transferables,
+        );
       } catch (error) {
         pendingMessages.delete(taskId);
         finishReject(toError(error));
@@ -240,7 +258,12 @@ export function createTaskRunner<T, R>({
 
     try {
       const activeWorker = getWorker();
-      const result = await submitTask(activeWorker, nextTask.value, nextTask.signal);
+      const result = await submitTask(
+        activeWorker,
+        nextTask.value,
+        nextTask.signal,
+        nextTask.transfer,
+      );
       nextTask.resolve(result);
     } catch (error) {
       nextTask.reject(toError(error));
@@ -251,7 +274,8 @@ export function createTaskRunner<T, R>({
     }
   };
 
-  const run = (value: T, signal?: AbortSignal): Promise<R> => {
+  const run = (value: T, control?: TaskRunControl): Promise<R> => {
+    const { signal, transfer } = normalizeTaskRunControl(control);
     if (lifecycle === "closing") {
       return Promise.reject(new Error(`${name} is closed`));
     }
@@ -263,7 +287,7 @@ export function createTaskRunner<T, R>({
     }
 
     return new Promise<R>((resolve, reject) => {
-      const task: QueuedTask<T, R> = { value, resolve, reject, signal };
+      const task: QueuedTask<T, R> = { value, resolve, reject, signal, transfer };
 
       if (signal) {
         task.abort = () => {

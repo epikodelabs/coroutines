@@ -2,6 +2,7 @@ import { createTaskPool } from "../worker/pool";
 import { buildCoroutineWorkerRuntime } from "../worker/runtimes";
 import { buildWorkerScript } from "../worker/script";
 import type { CoroutineScript } from "../worker/types";
+import type { TaskRunControl, WorkerTaskResult, WorkerTaskUtils } from "../utils/transfer";
 
 /**
  * Callable pooled compute handle returned by `compute()`.
@@ -15,7 +16,7 @@ export type ComputeOptions = {
 
 export interface ComputeRunner<T = any, R = any> {
   /** Submits input to the compute pool and resolves with the worker result. */
-  (params: T, signal?: AbortSignal): Promise<R>;
+  (params: T, control?: TaskRunControl): Promise<R>;
   /** Configured maximum number of workers. */
   readonly concurrency: number;
   /** Number of submissions currently waiting for a worker. */
@@ -47,16 +48,16 @@ export interface ComputeRunner<T = any, R = any> {
  * ```
  */
 export function compute<T = any, R = any>(
-  main: (data: T) => R | Promise<R>,
+  main: (data: T, utils: WorkerTaskUtils) => WorkerTaskResult<R> | Promise<WorkerTaskResult<R>>,
   ...functions: Function[]
 ): ComputeRunner<T, R>;
 export function compute<T = any, R = any>(
-  main: (data: T) => R | Promise<R>,
+  main: (data: T, utils: WorkerTaskUtils) => WorkerTaskResult<R> | Promise<WorkerTaskResult<R>>,
   options: ComputeOptions,
   ...functions: Function[]
 ): ComputeRunner<T, R>;
 export function compute<T = any, R = any>(
-  main: (data: T) => R | Promise<R>,
+  main: (data: T, utils: WorkerTaskUtils) => WorkerTaskResult<R> | Promise<WorkerTaskResult<R>>,
   optionsOrFunction?: ComputeOptions | Function,
   ...restFunctions: Function[]
 ): ComputeRunner<T, R> {
@@ -84,8 +85,8 @@ export function compute<T = any, R = any>(
       }),
   });
 
-  const run = (async (params: T, signal?: AbortSignal): Promise<R> => {
-    return pool.run(params, signal);
+  const run = (async (params: T, control?: TaskRunControl): Promise<R> => {
+    return pool.run(params, control);
   }) as ComputeRunner<T, R>;
 
   Object.defineProperties(run, {
@@ -124,8 +125,8 @@ export function computeScript<T = any, R = any>(
       }),
   });
 
-  const run = (async (params: T, signal?: AbortSignal): Promise<R> => {
-    return pool.run(params, signal);
+  const run = (async (params: T, control?: TaskRunControl): Promise<R> => {
+    return pool.run(params, control);
   }) as ComputeRunner<T, R>;
 
   Object.defineProperties(run, {
