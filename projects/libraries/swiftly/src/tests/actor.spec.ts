@@ -12,6 +12,7 @@ import {
   registerActorRequestHandler,
   select,
   send,
+  supervisor,
   withCancel,
 } from "../public-api";
 import {
@@ -1119,5 +1120,80 @@ idescribe("actor", () => {
 
     expect(await a.done).toEqual({ reason: "stopped" });
   });
+
+
+
+  it("cancels in-flight main-to-actor requests without stopping the actor", async () => {
+    async function behavior(msg: any, state: number) {
+      return typeof msg === "number" ? state + msg : state;
+    }
+
+    (globalThis as any).currentMainTask = behavior;
+    const a = actor(nextActorName(), behavior, 0);
+    const controller = new AbortController();
+
+    const pending = main.outbox.request(a, "slow", 1, controller.signal);
+    controller.abort(new ContextCancelledError("request cancelled"));
+
+    await expectAsync(pending).toBeRejectedWithError(ContextCancelledError, "request cancelled");
+    expect(a.running).toBe(true);
+
+    await main.outbox.stop(a);
+  });
+
+  it("supervisor restarts failed actors behind a stable handle", async () => {
+    async function behavior(_msg: any, state: number) {
+      return state;
+    }
+
+    (globalThis as any).currentMainTask = behavior;
+    const name = nextActorName();
+    const supervised = supervisor(
+      () => actor(name, behavior, 0),
+      { maxRestarts: 2 },
+    );
+
+    const first = supervised.current;
+    expect(first).toBeDefined();
+    expect(supervised.name).toBe(name);
+
+    (globalThis as any).lastMockWorker.emitError(new Error("generation failed"));
+    await pause(20);
+
+    expect(supervised.restarts).toBe(1);
+    expect(supervised.current).toBeDefined();
+    expect(supervised.current).not.toBe(first);
+    expect(supervised.running).toBe(true);
+
+    await main.outbox.stop(supervised);
+    expect((await supervised.done).reason).toBe("stopped");
+  });
+
+  it("supervisor stops after exhausting its restart budget", async () => {
+    async function behavior(_msg: any, state: number) {
+      return state;
+    }
+
+    (globalThis as any).currentMainTask = behavior;
+    const name = nextActorName();
+    const supervised = supervisor(
+      () => actor(name, behavior, 0),
+      { maxRestarts: 1 },
+    );
+
+    (globalThis as any).lastMockWorker.emitError(new Error("first failure"));
+    await pause(20);
+    expect(supervised.restarts).toBe(1);
+
+    (globalThis as any).lastMockWorker.emitError(new Error("terminal failure"));
+    const exit = await supervised.done;
+
+    expect(exit.reason).toBe("error");
+    if (exit.reason === "error") {
+      expect(exit.error.message).toBe("terminal failure");
+    }
+    expect(supervised.running).toBe(false);
+  });
+
 
 });

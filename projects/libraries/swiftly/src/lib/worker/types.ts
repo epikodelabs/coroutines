@@ -60,3 +60,25 @@ export interface Actor {
   /** Resolves exactly once when the actor terminates. */
   readonly done: Promise<ActorExit>;
 }
+
+
+/** Restart policy for a supervised actor. */
+export type SupervisorOptions = {
+  /** Maximum number of restarts after worker failure. Defaults to 3. */
+  readonly maxRestarts?: number;
+  /** Delay before each restart in milliseconds. Defaults to 0. */
+  readonly restartDelay?: number;
+};
+
+/**
+ * Stable lifecycle owner for an actor that may be recreated after worker failure.
+ *
+ * The supervisor itself is the addressable handle. Its `done` promise settles only
+ * when it is explicitly stopped or its restart budget is exhausted.
+ */
+export interface Supervisor extends Actor {
+  /** Number of actor generations restarted after failure. */
+  readonly restarts: number;
+  /** Current actor generation, when one is running. */
+  readonly current: Actor | undefined;
+}

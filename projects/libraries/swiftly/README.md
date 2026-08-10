@@ -94,3 +94,54 @@ Swiftly's main-thread timing operations use a shared timer worker. `sleep()`, `w
 ## Design rule
 
 Swiftly keeps the core deliberately small. A public abstraction belongs here only when it contributes semantics that cannot be expressed cleanly by composing existing primitives. Convenience wrappers should stay outside the core.
+
+
+## Actor supervision
+
+Long-lived actors can be owned by a supervisor when worker failure should be
+recoverable without changing the address used by callers.
+
+```ts
+const service = supervisor(
+  () => actor("service", behavior, initialState),
+  {
+    maxRestarts: 3,
+    restartDelay: 250,
+  },
+);
+
+main.outbox.send(service, "refresh", undefined);
+
+const exit = await service.done;
+```
+
+A supervisor is itself an `Actor` handle, so `main.outbox.send`, `request`, and
+`stop` use the stable supervisor identity rather than a particular worker
+generation. Normal actor stops are never restarted. Worker failures consume the
+restart budget; once it is exhausted, `done` resolves with the terminal error.
+
+Supervision deliberately restarts from the factory's initial state. State
+persistence/checkpointing is application policy and is not hidden inside the
+concurrency runtime.
+
+
+### Cancellable actor requests
+
+Main-to-actor requests accept an `AbortSignal`. Cancelling a request withdraws
+only that caller's pending response; it does not terminate the actor generation.
+
+```ts
+const controller = new AbortController();
+
+const result = main.outbox.request(
+  service,
+  "lookup",
+  query,
+  controller.signal,
+);
+
+controller.abort();
+```
+
+This composes actor request lifetimes with task groups and contexts without
+inventing a separate timeout/retry API.

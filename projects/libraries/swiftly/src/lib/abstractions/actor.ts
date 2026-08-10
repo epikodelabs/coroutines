@@ -3,6 +3,7 @@ import {
     channel,
     ChannelClosedError,
     ContextCancelledError,
+    createAbortError,
     otherwise,
     operation,
     receive,
@@ -17,8 +18,8 @@ import { acquireBlobUrl, releaseBlobUrl } from "../worker/blob";
 import type { WorkerProtocolMessage } from "../worker/messages";
 import { buildActorWorkerRuntime } from "../worker/runtimes";
 import { buildWorkerScript } from "../worker/script";
-import type { Actor, ActorExit } from "../worker/types";
-export type { Actor, ActorExit } from "../worker/types";
+import type { Actor, ActorExit, Supervisor, SupervisorOptions } from "../worker/types";
+export type { Actor, ActorExit, Supervisor, SupervisorOptions } from "../worker/types";
 
 /**
  * Concurrency utils injected into actor workers.
@@ -99,7 +100,7 @@ export interface Initiator {
     send<T = any>(to: Actor | string | string[], topic: string, payload: T, options?: Pick<ActorBusDispatchOptions, "from">): void;
 
     /** Sends a request to an actor and awaits the response. */
-    request<Q = any, D = any>(to: Actor | string, topic: string, payload: Q): Promise<D>;
+    request<Q = any, D = any>(to: Actor | string, topic: string, payload: Q, signal?: AbortSignal): Promise<D>;
 
     /** Stops the actor, terminates its worker, and releases resources. */
     stop(actor: Actor | string): Promise<void>;
@@ -968,6 +969,7 @@ const ACTOR_STOPPED_ERROR_MESSAGE = "Actor stopped";
 type PendingActorRequest<S> = {
   resolve: (value: S) => void;
   reject: (error: Error) => void;
+  cleanup?: () => void;
 };
 
 const toErrorMessage = (
@@ -1154,7 +1156,8 @@ function createActor<S = any, Q = any, D = any, FromMain = any>(
     }
 
     const error = typeof reason === "string" ? new Error(reason) : reason;
-    for (const { reject } of pendingRequests.values()) {
+    for (const { reject, cleanup } of pendingRequests.values()) {
+      cleanup?.();
       reject(error);
     }
 
@@ -1238,12 +1241,14 @@ function createActor<S = any, Q = any, D = any, FromMain = any>(
     const { type, payload, requestId } = msg;
 
     if (type === "response" && requestId && pendingRequests.has(requestId)) {
-      const { resolve } = pendingRequests.get(requestId)!;
+      const { resolve, cleanup } = pendingRequests.get(requestId)!;
       pendingRequests.delete(requestId);
+      cleanup?.();
       resolve(payload);
     } else if (type === "error" && requestId && pendingRequests.has(requestId)) {
-      const { reject } = pendingRequests.get(requestId)!;
+      const { reject, cleanup } = pendingRequests.get(requestId)!;
       pendingRequests.delete(requestId);
+      cleanup?.();
       reject(new Error(msg.error ?? "Actor request failed"));
     } else if (type === "request") {
       handleRequest(msg, actorRef, worker!);
@@ -1321,20 +1326,41 @@ function createActor<S = any, Q = any, D = any, FromMain = any>(
       });
     },
 
-    request(topic: string, msg: FromMain): Promise<S> {
+    request(topic: string, msg: FromMain, signal?: AbortSignal): Promise<S> {
       if (!worker || !running) {
         return Promise.reject(new Error("Actor stopped"));
       }
+      if (signal?.aborted) {
+        return Promise.reject(createAbortError(signal));
+      }
+
       const id = String(nextRequestId++);
       return new Promise((resolve, reject) => {
-        pendingRequests.set(id, { resolve, reject });
-        postToWorker(worker!, {
-          taskId: actorTaskId,
-          payload: msg,
-          requestId: id,
-          type: "request",
-          topic,
-        });
+        const onAbort = () => {
+          const pending = pendingRequests.get(id);
+          if (!pending) return;
+          pendingRequests.delete(id);
+          pending.cleanup?.();
+          reject(createAbortError(signal));
+        };
+        const cleanup = () => signal?.removeEventListener("abort", onAbort);
+
+        pendingRequests.set(id, { resolve, reject, cleanup });
+        signal?.addEventListener("abort", onAbort, { once: true });
+
+        try {
+          postToWorker(worker!, {
+            taskId: actorTaskId,
+            payload: msg,
+            requestId: id,
+            type: "request",
+            topic,
+          });
+        } catch (error) {
+          pendingRequests.delete(id);
+          cleanup();
+          reject(error instanceof Error ? error : new Error(String(error)));
+        }
       });
     },
   };
@@ -1354,7 +1380,7 @@ const actorBusRegistrationsByActor = new Map<Actor, ActorBusRegistration>();
 const actorBusDirectListeners = new Map<string, Set<ActorBusHandler>>();
 const actorBusListeners = new Set<ActorBusHandler>();
 
-const actorInternalsMap = new WeakMap<Actor, { stop(): Promise<void>; post(msg: any): void; request(topic: string, msg: any): Promise<any> }>();
+const actorInternalsMap = new WeakMap<Actor, { stop(): Promise<void>; post(msg: any): void; request(topic: string, msg: any, signal?: AbortSignal): Promise<any> }>();
 
 function resolveActorTarget(actorOrName: Actor | string): Actor | undefined {
   if (typeof actorOrName !== "string") {
@@ -1450,7 +1476,7 @@ function dispatchActorBusMessage<T = any>(
   const from =
     message.from ??
     (options?.fromActor
-      ? actorBusRegistrationsByActor.get(options.fromActor)?.name
+      ? actorBusRegistrationsByActor.get(options.fromActor)?.name ?? options.fromActor.name
       : undefined);
 
   const routedMessage =
@@ -1504,6 +1530,143 @@ const subscribeMainInbox: Initiator["inbox"]["subscribe"] = (handler) => {
   return () => actorBusListeners.delete(handler);
 };
 
+/**
+ * Supervises an actor factory behind one stable addressable handle.
+ *
+ * A failed actor generation is recreated until `maxRestarts` is exhausted.
+ * Normal stops are never restarted. The supervisor can be passed anywhere an
+ * `Actor` is accepted by `main.outbox`, so callers never retain a stale actor
+ * generation.
+ */
+export function supervisor(
+  factory: () => Actor,
+  options: SupervisorOptions = {},
+): Supervisor {
+  if (typeof factory !== "function") {
+    throw new TypeError("supervisor factory must be a function");
+  }
+
+  const maxRestarts = options.maxRestarts ?? 3;
+  const restartDelay = options.restartDelay ?? 0;
+  if (!Number.isInteger(maxRestarts) || maxRestarts < 0) {
+    throw new RangeError("supervisor maxRestarts must be a non-negative integer");
+  }
+  if (!Number.isFinite(restartDelay) || restartDelay < 0) {
+    throw new RangeError("supervisor restartDelay must be a non-negative finite number");
+  }
+
+  let current: Actor | undefined;
+  let restarts = 0;
+  let stopping = false;
+  let settled = false;
+  let resolveDone!: (exit: ActorExit) => void;
+  const done = new Promise<ActorExit>((resolve) => { resolveDone = resolve; });
+
+  const settle = (exit: ActorExit) => {
+    if (settled) return;
+    settled = true;
+    unregisterActorBusTarget(handle);
+    resolveDone(exit);
+  };
+
+  const bindCurrent = (next: Actor) => {
+    current = next;
+    // The generation registers itself during actor(); replace that public
+    // registration with the stable supervisor handle.
+    unregisterActorBusTarget(next);
+    registerActorBusTarget(next.name, handle);
+    void next.done.then(async (exit) => {
+      if (current !== next || settled) return;
+      current = undefined;
+
+      if (stopping || exit.reason === "stopped") {
+        settle({ reason: "stopped" });
+        return;
+      }
+
+      if (restarts >= maxRestarts) {
+        settle(exit);
+        return;
+      }
+
+      restarts += 1;
+      if (restartDelay > 0) {
+        try {
+          await sleep(restartDelay);
+        } catch (error) {
+          settle({ reason: "error", error: error instanceof Error ? error : new Error(String(error)) });
+          return;
+        }
+      }
+      if (stopping || settled) {
+        settle({ reason: "stopped" });
+        return;
+      }
+
+      try {
+        unregisterActorBusTarget(handle);
+        bindCurrent(factory());
+      } catch (error) {
+        settle({
+          reason: "error",
+          error: error instanceof Error ? error : new Error(String(error)),
+        });
+      }
+    });
+  };
+
+  const first = factory();
+
+  const handle: Supervisor = {
+    get name() {
+      return first.name;
+    },
+    get running() {
+      return current?.running ?? false;
+    },
+    get current() {
+      return current;
+    },
+    get restarts() {
+      return restarts;
+    },
+    done,
+  };
+
+  actorInternalsMap.set(handle, {
+    stop: async () => {
+      if (settled) return;
+      stopping = true;
+      const active = current;
+      if (active) {
+        await actorInternalsMap.get(active)?.stop();
+      } else {
+        settle({ reason: "stopped" });
+      }
+      await done;
+    },
+    post: (msg: any) => {
+      const active = current;
+      if (!active?.running) {
+        console.warn("Supervised actor is not running; message dropped");
+        return;
+      }
+      actorInternalsMap.get(active)?.post(msg);
+    },
+    request: (topic: string, msg: any, signal?: AbortSignal) => {
+      const active = current;
+      if (!active?.running) {
+        return Promise.reject(new Error("Supervised actor is not running"));
+      }
+      return actorInternalsMap.get(active)!.request(topic, msg, signal);
+    },
+  });
+
+  bindCurrent(first);
+  return handle;
+}
+
+
 export const main: Initiator = {
   outbox: {
     /** Broadcasts a topic payload to every named actor through the actor bus. */
@@ -1532,13 +1695,13 @@ export const main: Initiator = {
     },
 
     /** Sends a request to an actor and awaits the response. */
-    request<Q = any, D = any>(to: Actor | string, topic: string, payload: Q): Promise<D> {
+    request<Q = any, D = any>(to: Actor | string, topic: string, payload: Q, signal?: AbortSignal): Promise<D> {
       const target = resolveActorTarget(to);
       if (!target) {
         return Promise.reject(new Error(`Unknown actor target "${String(to)}"`));
       }
 
-      return actorInternalsMap.get(target)!.request(topic, payload);
+      return actorInternalsMap.get(target)!.request(topic, payload, signal);
     },
 
     /** Stops the actor, terminates its worker, and releases resources. */
