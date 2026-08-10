@@ -710,14 +710,26 @@ const __streamixChannel = (capacity = 0) => {
   };
 };
 
-const __streamixCreateContextFromState = (state) => {
+const __streamixContextDoneBySignal = new WeakMap();
+
+const __streamixGetContextDone = (signal) => {
+  const existing = __streamixContextDoneBySignal.get(signal);
+  if (existing) return existing;
+
   const done = new Promise((resolve) => {
-    if (state.controller.signal.aborted) {
+    if (signal.aborted) {
       resolve();
     } else {
-      state.controller.signal.addEventListener("abort", () => resolve(), { once: true });
+      signal.addEventListener("abort", () => resolve(), { once: true });
     }
   });
+
+  __streamixContextDoneBySignal.set(signal, done);
+  return done;
+};
+
+const __streamixCreateContextFromState = (state) => {
+  const done = __streamixGetContextDone(state.controller.signal);
 
   return {
     get signal() {

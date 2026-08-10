@@ -535,3 +535,20 @@ entered through the public `select()` fast path.
   can never satisfy itself.
 
 The same invariants are embedded in actor-worker channels.
+
+
+## Cancellation teardown invariants
+
+Cancellation state is shared rather than duplicated. Contexts created with
+`withValue()` reuse the same `signal` and `done` completion as the source
+context, so adding request-scoped values does not add another abort listener for
+every value layer.
+
+The shared timer worker also treats callback execution as cleanup-sensitive:
+worker release still occurs when an elapsed callback throws, and one failing
+timer failure callback cannot prevent the remaining pending timers from being
+notified.
+
+Stress coverage exercises repeated select cancellation, context-value chaining,
+and mass timer cancellation to verify that cancellation leaves no channel
+waiters or timer workers behind.

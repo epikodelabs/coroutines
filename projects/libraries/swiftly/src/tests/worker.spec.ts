@@ -1008,6 +1008,87 @@ idescribe("worker helpers", () => {
       expect(MockWorker.instances[0].terminated).toBeTrue();
     });
 
+
+    it("mass cancellation releases the shared timer worker exactly after the last timer", () => {
+      const timers = Array.from({ length: 200 }, () =>
+        scheduleWorkerTimer(10000, () => fail("cancelled timer elapsed")),
+      );
+
+      expect(MockWorker.instances.length).toBe(1);
+      const timerWorker = MockWorker.instances[0];
+
+      for (let index = 0; index < timers.length - 1; index++) {
+        expect(timers[index].cancel()).toBeTrue();
+        expect(timerWorker.terminated).toBeFalse();
+      }
+
+      expect(timers[timers.length - 1].cancel()).toBeTrue();
+      expect(timerWorker.terminated).toBeTrue();
+
+      for (const timer of timers) {
+        expect(timer.cancel()).toBeFalse();
+      }
+    });
+
+    it("notifies every pending timer even when one failure callback throws", () => {
+      const notified: string[] = [];
+
+      scheduleWorkerTimer(
+        1000,
+        () => fail("timer should fail"),
+        () => {
+          notified.push("first");
+          throw new Error("failure callback exploded");
+        },
+      );
+      scheduleWorkerTimer(
+        1000,
+        () => fail("timer should fail"),
+        () => {
+          notified.push("second");
+        },
+      );
+      scheduleWorkerTimer(
+        1000,
+        () => fail("timer should fail"),
+        () => {
+          notified.push("third");
+        },
+      );
+
+      const timerWorker = MockWorker.instances[0] as any;
+
+      expect(() =>
+        timerWorker.onerror({
+          error: new Error("timer worker failed"),
+          message: "timer worker failed",
+        }),
+      ).toThrowError("failure callback exploded");
+
+      expect(notified).toEqual(["first", "second", "third"]);
+      expect(timerWorker.terminated).toBeTrue();
+    });
+
+    it("releases an idle timer worker even when the elapsed callback throws", () => {
+      scheduleWorkerTimer(
+        1,
+        () => {
+          throw new Error("elapsed callback exploded");
+        },
+      );
+
+      const timerWorker = MockWorker.instances[0] as any;
+      const setMessage = timerWorker.sentMessages[0] as any;
+
+      expect(() =>
+        timerWorker.onmessage({
+          data: { type: "elapsed", id: setMessage.id },
+        }),
+      ).toThrowError("elapsed callback exploded");
+
+      expect(timerWorker.terminated).toBeTrue();
+    });
+
     it("ignores stale timer worker errors after the worker has been released", () => {
       const timer = scheduleWorkerTimer(1000, () => {});
       const oldWorker = MockWorker.instances[0] as any;

@@ -321,6 +321,26 @@ describe("context", () => {
     expect(root.value("key")).toBeUndefined();
   });
 
+
+  it("withValue shares cancellation completion without accumulating done listeners", async () => {
+    const [ctx, cancel] = withCancel();
+    let current = ctx;
+
+    for (let index = 0; index < 500; index++) {
+      const next = current.withValue(index, index);
+      expect(next.signal).toBe(ctx.signal);
+      expect(next.done).toBe(ctx.done);
+      current = next;
+    }
+
+    expect(current.value(0)).toBe(0);
+    expect(current.value(499)).toBe(499);
+
+    cancel(new ContextCancelledError("done once"));
+    await expectAsync(current.done).toBeResolved();
+    expect(current.reason).toEqual(jasmine.any(ContextCancelledError));
+  });
+
   it("createAbortError returns the Error reason unchanged", () => {
     const err = new Error("boom");
     const ctrl = new AbortController();
@@ -1064,6 +1084,48 @@ describe("operation selection", () => {
     }
 
     ch.close();
+  });
+
+
+
+  it("mass select cancellation leaves no channel registrations or active operations behind", async () => {
+    for (let index = 0; index < 200; index++) {
+      const ch = channel<number>();
+      const [ctx, cancel] = withCancel();
+      let operationAborted = false;
+
+      const pending = select([
+        receive(ch, "receive"),
+        send(ch, index, "send"),
+        operation(
+          (signal) =>
+            new Promise<number>((resolve) => {
+              signal.addEventListener(
+                "abort",
+                () => {
+                  operationAborted = true;
+                  resolve(-1);
+                },
+                { once: true },
+              );
+            }),
+          "operation",
+        ),
+      ], ctx);
+
+      await Promise.resolve();
+      cancel(new ContextCancelledError(`cancel-${index}`));
+
+      await expectAsync(pending).toBeRejectedWithError(
+        ContextCancelledError,
+        `cancel-${index}`,
+      );
+      await Promise.resolve();
+
+      expect(operationAborted).toBeTrue();
+      expect(ch.tryReceive()).toBeUndefined();
+      expect(ch.trySend(index + 1)).toBeFalse();
+    }
   });
 
 

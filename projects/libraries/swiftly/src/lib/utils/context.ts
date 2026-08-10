@@ -40,6 +40,24 @@ type ContextState = {
   parent?: Context;
 };
 
+const contextDoneBySignal = new WeakMap<AbortSignal, Promise<void>>();
+
+const getContextDone = (signal: AbortSignal): Promise<void> => {
+  const existing = contextDoneBySignal.get(signal);
+  if (existing) return existing;
+
+  const done = new Promise<void>((resolve) => {
+    if (signal.aborted) {
+      resolve();
+    } else {
+      signal.addEventListener("abort", () => resolve(), { once: true });
+    }
+  });
+
+  contextDoneBySignal.set(signal, done);
+  return done;
+};
+
 /**
  * Creates an abort error from an `AbortSignal`'s reason.
  *
@@ -53,13 +71,7 @@ export const createAbortError = (signal?: AbortSignal): Error => {
 };
 
 const createContextFromState = (state: ContextState): Context => {
-  const done = new Promise<void>((resolve) => {
-    if (state.controller.signal.aborted) {
-      resolve();
-    } else {
-      state.controller.signal.addEventListener("abort", () => resolve(), { once: true });
-    }
-  });
+  const done = getContextDone(state.controller.signal);
 
   return {
     get signal() {

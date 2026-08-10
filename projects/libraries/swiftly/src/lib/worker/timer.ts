@@ -56,8 +56,17 @@ const failPendingTimers = (error: Error): void => {
   worker = undefined;
   releaseBlobUrl(TIMER_WORKER_SCRIPT);
 
+  let callbackError: unknown;
   for (const timer of timers) {
-    timer.failed(error);
+    try {
+      timer.failed(error);
+    } catch (reason) {
+      callbackError ??= reason;
+    }
+  }
+
+  if (callbackError !== undefined) {
+    throw callbackError;
   }
 };
 
@@ -86,8 +95,11 @@ const ensureTimerWorker = (): Worker => {
     if (!timer) return;
 
     pending.delete(data.id);
-    timer.elapsed();
-    releaseWorkerIfIdle();
+    try {
+      timer.elapsed();
+    } finally {
+      releaseWorkerIfIdle();
+    }
   };
 
   createdWorker.onerror = (event) => {
