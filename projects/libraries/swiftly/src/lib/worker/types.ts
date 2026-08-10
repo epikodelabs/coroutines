@@ -19,7 +19,15 @@ export interface CoroutineScript<T = any, R = any> {
 export interface TaskRunner<T = any, R = any> {
   /** Submits one value for worker-side processing. */
   run: (data: T, signal?: AbortSignal) => Promise<R>;
-  /** Terminates the underlying worker resources. */
+  /**
+   * Stops accepting new work, drains already-admitted work, then releases resources.
+   * Repeated calls share the same lifecycle completion.
+   */
+  close: () => Promise<void>;
+  /**
+   * Immediately terminates resources and rejects queued/active work.
+   * Use `close()` when admitted work should be allowed to finish.
+   */
   dispose: () => Promise<void>;
 }
 

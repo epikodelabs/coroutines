@@ -22,7 +22,9 @@ export interface ComputeRunner<T = any, R = any> {
   readonly queued: number;
   /** Number of workers currently checked out by submissions. */
   readonly active: number;
-  /** Terminates all workers in the pool and rejects queued work. */
+  /** Stops accepting submissions, drains admitted work, then releases the pool. */
+  close: () => Promise<void>;
+  /** Immediately terminates all workers and rejects queued/active work. */
   dispose: () => Promise<void>;
 }
 
@@ -91,6 +93,7 @@ export function compute<T = any, R = any>(
     queued: { enumerable: true, get: () => pool.queued },
     active: { enumerable: true, get: () => pool.active },
   });
+  run.close = () => pool.close();
   run.dispose = () => pool.dispose();
   return run;
 }
@@ -130,6 +133,7 @@ export function computeScript<T = any, R = any>(
     queued: { enumerable: true, get: () => pool.queued },
     active: { enumerable: true, get: () => pool.active },
   });
+  run.close = () => pool.close();
   run.dispose = () => pool.dispose();
   return run;
 }

@@ -73,7 +73,11 @@ export function createTaskPool<T, R>({
   const blobUrl = acquireBlobUrl(workerScript);
 
   let createdWorkersCount = 0;
-  let isFinalizing = false;
+  let isAccepting = true;
+  let isDisposed = false;
+  let admittedRuns = 0;
+  let closePromise: Promise<void> | null = null;
+  let resolveClose: (() => void) | null = null;
   let nextWorkerId = 0;
   let hasReleasedBlobUrl = false;
 
@@ -129,6 +133,30 @@ export function createTaskPool<T, R>({
 
   let satisfyWaitingQueue: () => void;
 
+  const finalizeGracefulClose = (): void => {
+    if (isAccepting || isDisposed || admittedRuns > 0) {
+      return;
+    }
+
+    isDisposed = true;
+
+    const workersToTerminate = [...new Set(activeWorkers.values())];
+    activeWorkers.clear();
+    idleWorkers.length = 0;
+
+    for (const worker of workersToTerminate) {
+      detachWorker(worker);
+      worker.terminate();
+    }
+
+    workerMessageHandlers.clear();
+    workerErrorHandlers.clear();
+    createdWorkersCount = 0;
+    releaseWorkerScript();
+    resolveClose?.();
+    resolveClose = null;
+  };
+
   const retireWorker = (worker: Worker, error?: Error) => {
     const workerId = getWorkerId(worker);
     if (workerId === undefined || !activeWorkers.has(workerId)) {
@@ -145,8 +173,9 @@ export function createTaskPool<T, R>({
       rejectWorkerTasks(workerId, error);
     }
 
-    if (!isFinalizing) {
+    if (!isDisposed) {
       satisfyWaitingQueue();
+      finalizeGracefulClose();
     }
   };
 
@@ -174,7 +203,7 @@ export function createTaskPool<T, R>({
   };
 
   satisfyWaitingQueue = () => {
-    while (!isFinalizing && waitingQueue.length > 0 && createdWorkersCount < maxWorkers) {
+    while (!isDisposed && waitingQueue.length > 0 && createdWorkersCount < maxWorkers) {
       const waiter = waitingQueue.shift()!;
       if (waiter.signal?.aborted) {
         waiter.reject(createAbortError(waiter.signal));
@@ -196,8 +225,8 @@ export function createTaskPool<T, R>({
     if (signal?.aborted) {
       throw createAbortError(signal);
     }
-    if (isFinalizing) {
-      throw new Error(`${name} is finalizing`);
+    if (isDisposed) {
+      throw new Error(`${name} is disposed`);
     }
 
     if (idleWorkers.length > 0) {
@@ -240,7 +269,7 @@ export function createTaskPool<T, R>({
       return;
     }
 
-    if (isFinalizing) {
+    if (isDisposed) {
       retireWorker(worker);
       return;
     }
@@ -303,30 +332,60 @@ export function createTaskPool<T, R>({
   };
 
   const run = async (value: T, signal?: AbortSignal): Promise<R> => {
-    const worker = await checkoutWorker(signal);
+    if (!isAccepting || isDisposed) {
+      throw new Error(`${name} is closed`);
+    }
+
+    admittedRuns += 1;
     try {
-      return await submitTask(worker, value, signal);
+      const worker = await checkoutWorker(signal);
+      try {
+        return await submitTask(worker, value, signal);
+      } finally {
+        checkinWorker(worker);
+      }
     } finally {
-      checkinWorker(worker);
+      admittedRuns = Math.max(0, admittedRuns - 1);
+      finalizeGracefulClose();
     }
   };
 
+  const close = (): Promise<void> => {
+    if (isDisposed) {
+      return Promise.resolve();
+    }
+
+    if (closePromise) {
+      return closePromise;
+    }
+
+    isAccepting = false;
+    closePromise = new Promise<void>((resolve) => {
+      resolveClose = resolve;
+    });
+
+    satisfyWaitingQueue();
+    finalizeGracefulClose();
+    return closePromise;
+  };
+
   const dispose = async () => {
-    if (isFinalizing) {
+    if (isDisposed) {
       return;
     }
 
-    isFinalizing = true;
+    isAccepting = false;
+    isDisposed = true;
 
     pendingMessages.forEach(({ reject }) => {
-      reject(new Error(`${name} finalized before the worker task completed`));
+      reject(new Error(`${name} disposed before the worker task completed`));
     });
     pendingMessages.clear();
 
     while (waitingQueue.length > 0) {
       const waiter = waitingQueue.shift()!;
       if (waiter.signal && waiter.abort) waiter.signal.removeEventListener("abort", waiter.abort);
-      waiter.reject(new Error(`${name} finalized before a worker became available`));
+      waiter.reject(new Error(`${name} disposed before a worker became available`));
     }
 
     const workersToTerminate = [...new Set(activeWorkers.values())];
@@ -342,6 +401,9 @@ export function createTaskPool<T, R>({
     workerErrorHandlers.clear();
     createdWorkersCount = 0;
     releaseWorkerScript();
+
+    resolveClose?.();
+    resolveClose = null;
   };
 
   return {
@@ -355,6 +417,7 @@ export function createTaskPool<T, R>({
       return Math.max(0, createdWorkersCount - idleWorkers.length);
     },
     run,
+    close,
     dispose,
   };
 }

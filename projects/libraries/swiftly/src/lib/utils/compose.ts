@@ -116,6 +116,30 @@ export function compose<T = any, R = any>(
     return result;
   };
 
+  const close = async (): Promise<void> => {
+    const errors: Error[] = [];
+
+    if (workerRunner) {
+      try {
+        await workerRunner.close();
+      } catch (e) {
+        errors.push(e instanceof Error ? e : new Error(String(e)));
+      }
+    }
+
+    for (const runner of taskRunners) {
+      try {
+        await runner.close();
+      } catch (e) {
+        errors.push(e instanceof Error ? e : new Error(String(e)));
+      }
+    }
+
+    if (errors.length > 0) {
+      throw errors[0];
+    }
+  };
+
   const dispose = async (): Promise<void> => {
     const errors: Error[] = [];
 
@@ -141,7 +165,8 @@ export function compose<T = any, R = any>(
   };
 
   return {
-    run: run,
-    dispose: dispose,
+    run,
+    close,
+    dispose,
   } as Coroutine<T, R>;
 }

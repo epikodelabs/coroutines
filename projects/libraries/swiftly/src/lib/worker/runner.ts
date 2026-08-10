@@ -62,7 +62,10 @@ export function createTaskRunner<T, R>({
   let workerMessageHandler: ((event: MessageEvent<WorkerProtocolMessage>) => void) | null = null;
   let workerErrorHandler: ((event: ErrorEvent) => void) | null = null;
   let isProcessing = false;
-  let isFinalizing = false;
+  let isAccepting = true;
+  let isDisposed = false;
+  let closePromise: Promise<void> | null = null;
+  let resolveClose: (() => void) | null = null;
   let hasReleasedBlobUrl = false;
 
   const releaseWorkerScript = () => {
@@ -181,8 +184,28 @@ export function createTaskRunner<T, R>({
     });
   };
 
+  const finalizeGracefulClose = (): void => {
+    if (isAccepting || isDisposed || isProcessing || queuedTasks.length > 0 || pendingMessages.size > 0) {
+      return;
+    }
+
+    isDisposed = true;
+
+    if (worker) {
+      detachWorker(worker);
+      worker.terminate();
+      worker = null;
+    }
+
+    workerMessageHandler = null;
+    workerErrorHandler = null;
+    releaseWorkerScript();
+    resolveClose?.();
+    resolveClose = null;
+  };
+
   const drainQueue = async (): Promise<void> => {
-    if (isProcessing || isFinalizing) {
+    if (isProcessing || isDisposed) {
       return;
     }
 
@@ -193,6 +216,7 @@ export function createTaskRunner<T, R>({
       nextTask = queuedTasks.shift();
     }
     if (!nextTask) {
+      finalizeGracefulClose();
       return;
     }
 
@@ -211,15 +235,14 @@ export function createTaskRunner<T, R>({
       nextTask.reject(toError(error));
     } finally {
       isProcessing = false;
-      if (!isFinalizing) {
-        void drainQueue();
-      }
+      void drainQueue();
+      finalizeGracefulClose();
     }
   };
 
   const run = (value: T, signal?: AbortSignal): Promise<R> => {
-    if (isFinalizing) {
-      return Promise.reject(new Error(`${name} finalized before a worker became available`));
+    if (!isAccepting || isDisposed) {
+      return Promise.reject(new Error(`${name} is closed`));
     }
     if (signal?.aborted) {
       return Promise.reject(createAbortError(signal));
@@ -244,21 +267,41 @@ export function createTaskRunner<T, R>({
     });
   };
 
+  const close = (): Promise<void> => {
+    if (isDisposed) {
+      return Promise.resolve();
+    }
+
+    if (closePromise) {
+      return closePromise;
+    }
+
+    isAccepting = false;
+    closePromise = new Promise<void>((resolve) => {
+      resolveClose = resolve;
+    });
+
+    void drainQueue();
+    finalizeGracefulClose();
+    return closePromise;
+  };
+
   const dispose = async () => {
-    if (isFinalizing) {
+    if (isDisposed) {
       return;
     }
 
-    isFinalizing = true;
+    isAccepting = false;
+    isDisposed = true;
 
     while (queuedTasks.length > 0) {
       const task = queuedTasks.shift()!;
       if (task.signal && task.abort) task.signal.removeEventListener("abort", task.abort);
-      task.reject(new Error(`${name} finalized before a worker became available`));
+      task.reject(new Error(`${name} disposed before a worker became available`));
     }
 
     pendingMessages.forEach(({ reject }) => {
-      reject(new Error(`${name} finalized before the worker task completed`));
+      reject(new Error(`${name} disposed before the worker task completed`));
     });
     pendingMessages.clear();
 
@@ -272,10 +315,14 @@ export function createTaskRunner<T, R>({
     workerErrorHandler = null;
     isProcessing = false;
     releaseWorkerScript();
+
+    resolveClose?.();
+    resolveClose = null;
   };
 
   return {
-    dispose: dispose,
-    run: run,
+    close,
+    dispose,
+    run,
   };
 }

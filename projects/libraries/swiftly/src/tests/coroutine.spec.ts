@@ -453,4 +453,44 @@ idescribe('coroutine', () => {
     );
   });
 
+
+  it("close drains admitted coroutine work and rejects new submissions", async () => {
+    const mainTask = async (x: number) => {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      return x * 2;
+    };
+    (globalThis as any).currentMainTask = mainTask;
+
+    const co = coroutine(mainTask);
+    const first = co.run(2);
+    const second = co.run(3);
+
+    const closing = co.close();
+
+    await expectAsync(co.run(4)).toBeRejectedWithError(/closed/);
+    expect(await first).toBe(4);
+    expect(await second).toBe(6);
+    await expectAsync(closing).toBeResolved();
+    await expectAsync(co.close()).toBeResolved();
+  });
+
+  it("dispose remains immediate and rejects queued coroutine work", async () => {
+    const mainTask = async (x: number) => {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      return x;
+    };
+    (globalThis as any).currentMainTask = mainTask;
+
+    const co = coroutine(mainTask);
+    const active = co.run(1);
+    const queued = co.run(2);
+
+    await co.dispose();
+
+    await expectAsync(active).toBeRejected();
+    await expectAsync(queued).toBeRejectedWithError(/disposed/);
+    await expectAsync(co.close()).toBeResolved();
+  });
+
+
 });

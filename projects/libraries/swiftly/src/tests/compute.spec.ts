@@ -196,4 +196,48 @@ idescribe("compute", () => {
   });
 
 
+
+  it("close drains admitted compute work including queued submissions", async () => {
+    const run = compute<number, number>(
+      async (x: number) => {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        return x * 3;
+      },
+      { concurrency: 1, maxQueued: 4 },
+    );
+
+    const first = run(1);
+    const second = run(2);
+    const third = run(3);
+    const closing = run.close();
+
+    await expectAsync(run(4)).toBeRejectedWithError(/closed/);
+    expect(await first).toBe(3);
+    expect(await second).toBe(6);
+    expect(await third).toBe(9);
+    await expectAsync(closing).toBeResolved();
+    expect(run.active).toBe(0);
+    expect(run.queued).toBe(0);
+  });
+
+  it("dispose rejects active and waiting compute submissions immediately", async () => {
+    const run = compute<number, number>(
+      async (x: number) => {
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        return x;
+      },
+      { concurrency: 1, maxQueued: 2 },
+    );
+
+    const active = run(1);
+    const queued = run(2);
+
+    await run.dispose();
+
+    await expectAsync(active).toBeRejected();
+    await expectAsync(queued).toBeRejected();
+    await expectAsync(run.close()).toBeResolved();
+  });
+
+
 });

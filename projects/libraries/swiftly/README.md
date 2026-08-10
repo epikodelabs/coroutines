@@ -215,3 +215,34 @@ for (let i = 0; i < 4; i++) {
 The composition remains explicit: channel capacity bounds data in flight, group
 concurrency bounds owned operations, and compute pool settings bound worker and
 queue pressure.
+
+
+## Graceful lifecycle
+
+Worker-backed task runners distinguish graceful closure from immediate teardown.
+
+```ts
+const worker = compute(expensiveWork, {
+  concurrency: 4,
+  maxQueued: 16,
+});
+
+// Already-admitted work is allowed to finish.
+await worker.close();
+
+// New submissions are rejected after close begins.
+```
+
+`close()` means **stop accepting, drain, release**. It is idempotent and is the
+normal lifecycle boundary when submitted work must not be lost.
+
+`dispose()` means **terminate now**. Active and queued work is rejected and
+worker resources are released immediately.
+
+The same contract is shared by `coroutine()`, `compute()`, `computeScript()`,
+and `compose()`. `compose().close()` attempts to close every owned stage even if
+one stage reports an error, mirroring its immediate-disposal cleanup behavior.
+
+This distinction is intentionally part of `TaskRunner` rather than separate
+helpers: graceful ownership and forced teardown are different concurrency
+semantics.

@@ -10,7 +10,7 @@
     "watch": "ng build app1 --watch --configuration development",
     "test": "ng test app1",
     "test:app": "ng test app1",
-    "test:lib": "ng test swiftly"
+    "test:lib": "testify"
   },
   "private": true,
   "packageManager": "npm@10.9.8",
@@ -32,6 +32,6 @@
     "ng-packagr": "^22.0.0",
     "prettier": "^3.8.1",
     "typescript": "~6.0.2",
-    "vitest": "^4.0.8"
+    "@types/jasmine": "^5.1.0"
   }
 }

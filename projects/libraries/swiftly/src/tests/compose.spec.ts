@@ -145,6 +145,7 @@ describe("compose coroutines", () => {
         if (signal) seenSignals.push(signal);
         return value + 1;
       },
+      close: async () => undefined,
       dispose: async () => undefined,
     };
     const second = {
@@ -152,6 +153,7 @@ describe("compose coroutines", () => {
         if (signal) seenSignals.push(signal);
         return value * 2;
       },
+      close: async () => undefined,
       dispose: async () => undefined,
     };
 
@@ -162,5 +164,51 @@ describe("compose coroutines", () => {
     expect(seenSignals).toEqual([controller.signal, controller.signal]);
     await composed.dispose();
   });
+
+
+  it("close drains and closes every composed runner", async () => {
+    const lifecycle: string[] = [];
+    const first = {
+      run: async (value: number) => value + 1,
+      close: async () => { lifecycle.push("close:first"); },
+      dispose: async () => { lifecycle.push("dispose:first"); },
+    };
+    const second = {
+      run: async (value: number) => value * 2,
+      close: async () => { lifecycle.push("close:second"); },
+      dispose: async () => { lifecycle.push("dispose:second"); },
+    };
+
+    const composed = compose(first, second);
+    expect(await composed.run(2)).toBe(6);
+
+    await composed.close();
+    expect(lifecycle).toEqual(["close:first", "close:second"]);
+  });
+
+  it("close attempts every composed runner even when one close fails", async () => {
+    const lifecycle: string[] = [];
+    const composed = compose(
+      {
+        run: async (value: number) => value,
+        close: async () => {
+          lifecycle.push("first");
+          throw new Error("close failed");
+        },
+        dispose: async () => undefined,
+      },
+      {
+        run: async (value: number) => value,
+        close: async () => {
+          lifecycle.push("second");
+        },
+        dispose: async () => undefined,
+      },
+    );
+
+    await expectAsync(composed.close()).toBeRejectedWithError("close failed");
+    expect(lifecycle).toEqual(["first", "second"]);
+  });
+
 
 });

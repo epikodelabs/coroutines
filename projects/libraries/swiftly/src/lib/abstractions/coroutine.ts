@@ -39,6 +39,7 @@ function createCoroutineImpl<T, R>(
 
   return {
     run: runner.run,
+    close: runner.close,
     dispose: runner.dispose,
     helpers,
     main,
