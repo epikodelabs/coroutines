@@ -306,9 +306,20 @@ export async function select<T = any>(cases: SelectCase<T>[], ctx: Context = bac
       ctx.signal.addEventListener("abort", onContextAbort, { once: true });
       cleanupFns.push(() => ctx.signal.removeEventListener("abort", onContextAbort));
 
-      // Register/start contenders in randomized order. Operations only settle in
-      // microtasks, giving every contender a chance to register before a winner
-      // is observed.
+      type StartedOperation = {
+        index: number;
+        item: SelectOperationCase<T>;
+        promise: Promise<T>;
+      };
+
+      const operationStarts: Array<{
+        index: number;
+        item: SelectOperationCase<T>;
+        controller: AbortController;
+      }> = [];
+
+      // Phase 1: register every channel contender and allocate every operation
+      // controller before any operation result is allowed to settle selection.
       for (const index of randomOrder) {
         if (settled) break;
 
@@ -316,30 +327,7 @@ export async function select<T = any>(cases: SelectCase<T>[], ctx: Context = bac
         if (item.op === "operation") {
           const controller = new AbortController();
           operationControllers.set(index, controller);
-
-          Promise.resolve().then(async () => {
-            // Selection may be cancelled before this microtask gets a chance to
-            // start. In that case, do not launch work merely to hand it an
-            // already-aborted signal.
-            if (settled) return;
-
-            try {
-              const value = await item.run(controller.signal);
-              settle({
-                index,
-                case: item,
-                op: item.op,
-                name: item.name,
-                value,
-                ok: true,
-              });
-            } catch (error) {
-              rejectSelection(
-                error instanceof Error ? error : new Error(error ? String(error) : "select operation failed"),
-                index
-              );
-            }
-          });
+          operationStarts.push({ index, item, controller });
           continue;
         }
 
@@ -360,6 +348,54 @@ export async function select<T = any>(cases: SelectCase<T>[], ctx: Context = bac
             ? internals.registerSelectReceive(registration, meta)
             : internals.registerSelectSend(item.value, registration, meta);
         cleanupFns.push(unregister);
+      }
+
+      if (settled) return;
+
+      // Phase 2: invoke every operation before observing any completion. This
+      // guarantees that a synchronous failure in one contender still has real
+      // started siblings to cancel.
+      const startedOperations: StartedOperation[] = operationStarts.map(
+        ({ index, item, controller }) => {
+          try {
+            return {
+              index,
+              item,
+              promise: Promise.resolve(item.run(controller.signal)),
+            };
+          } catch (error) {
+            return {
+              index,
+              item,
+              promise: Promise.reject(error),
+            };
+          }
+        }
+      );
+
+      // Phase 3: observe operation completion/failure only after all contenders
+      // have started.
+      for (const { index, item, promise } of startedOperations) {
+        void promise.then(
+          (value) => {
+            settle({
+              index,
+              case: item,
+              op: item.op,
+              name: item.name,
+              value,
+              ok: true,
+            });
+          },
+          (error) => {
+            rejectSelection(
+              error instanceof Error
+                ? error
+                : new Error(error ? String(error) : "select operation failed"),
+              index
+            );
+          }
+        );
       }
     });
   } finally {

@@ -752,7 +752,15 @@ const __streamixWithTimeout = (parent, ms) => {
 
 const __streamixWithDeadline = (parent, deadline) => {
   const time = typeof deadline === "number" ? deadline : deadline.getTime();
-  return __streamixWithTimeout(parent, Math.max(0, time - Date.now()));
+  const remaining = time - Date.now();
+
+  if (remaining <= 0) {
+    const [ctx, cancel] = __streamixWithCancel(parent);
+    cancel(new __streamixContextCancelledError("context deadline exceeded"));
+    return [ctx, cancel];
+  }
+
+  return __streamixWithTimeout(parent, remaining);
 };
 
 const __streamixSleep = (ms, signal) => {
@@ -888,6 +896,8 @@ const __streamixSelect = async (cases, ctx = __streamixBackground()) => {
       ctx.signal.addEventListener("abort", onContextAbort, { once: true });
       cleanupFns.push(() => ctx.signal.removeEventListener("abort", onContextAbort));
 
+      const operationStarts = [];
+
       for (const index of randomOrder) {
         if (settled) break;
 
@@ -895,27 +905,7 @@ const __streamixSelect = async (cases, ctx = __streamixBackground()) => {
         if (item.op === "operation") {
           const controller = new AbortController();
           operationControllers.set(index, controller);
-
-          Promise.resolve().then(async () => {
-            if (settled) return;
-
-            try {
-              const value = await item.run(controller.signal);
-              settle({
-                index,
-                case: item,
-                op: item.op,
-                name: item.name,
-                value,
-                ok: true,
-              });
-            } catch (error) {
-              rejectSelection(
-                error instanceof Error ? error : new Error(error ? String(error) : "select operation failed"),
-                index
-              );
-            }
-          });
+          operationStarts.push({ index, item, controller });
           continue;
         }
 
@@ -932,6 +922,45 @@ const __streamixSelect = async (cases, ctx = __streamixBackground()) => {
             : internals.registerSelectSend(item.value, registration, meta);
 
         cleanupFns.push(unregister);
+      }
+
+      if (settled) return;
+
+      const startedOperations = operationStarts.map(({ index, item, controller }) => {
+        try {
+          return {
+            index,
+            item,
+            promise: Promise.resolve(item.run(controller.signal)),
+          };
+        } catch (error) {
+          return {
+            index,
+            item,
+            promise: Promise.reject(error),
+          };
+        }
+      });
+
+      for (const { index, item, promise } of startedOperations) {
+        promise.then(
+          (value) => {
+            settle({
+              index,
+              case: item,
+              op: item.op,
+              name: item.name,
+              value,
+              ok: true,
+            });
+          },
+          (error) => {
+            rejectSelection(
+              error instanceof Error ? error : new Error(error ? String(error) : "select operation failed"),
+              index
+            );
+          }
+        );
       }
     });
   } finally {

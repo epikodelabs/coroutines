@@ -146,5 +146,13 @@ export function withTimeout(parent: Context, ms: number): [Context, Cancel] {
  */
 export function withDeadline(parent: Context, deadline: Date | number): [Context, Cancel] {
   const time = typeof deadline === "number" ? deadline : deadline.getTime();
-  return withTimeout(parent, Math.max(0, time - Date.now()));
+  const remaining = time - Date.now();
+
+  if (remaining <= 0) {
+    const [ctx, cancel] = withCancel(parent);
+    cancel(new ContextCancelledError("context deadline exceeded"));
+    return [ctx, cancel];
+  }
+
+  return withTimeout(parent, remaining);
 }
