@@ -8,6 +8,7 @@ import {
     receive,
     select,
     send,
+    sleep,
     withCancel,
     withDeadline,
     withTimeout,
@@ -16,7 +17,8 @@ import { acquireBlobUrl, releaseBlobUrl } from "../worker/blob";
 import type { WorkerProtocolMessage } from "../worker/messages";
 import { buildActorWorkerRuntime } from "../worker/runtimes";
 import { buildWorkerScript } from "../worker/script";
-import type { Actor } from "../worker/types";
+import type { Actor, ActorExit } from "../worker/types";
+export type { Actor, ActorExit } from "../worker/types";
 
 /**
  * Concurrency utils injected into actor workers.
@@ -35,6 +37,7 @@ import type { Actor } from "../worker/types";
  * - `select(cases, ctx?)`: race channel and async operations fairly
  * - `background()`: root cancellation context
  * - `withCancel/withTimeout/withDeadline(...)`: derive cancellable contexts
+ * - `sleep(ms, signal?)`: suspend on the actor worker event loop
  * - `ChannelClosedError` / `ContextCancelledError`: worker-side error classes
  */
 export type WorkerConcurrency = {
@@ -48,6 +51,7 @@ export type WorkerConcurrency = {
   withCancel: typeof withCancel;
   withTimeout: typeof withTimeout;
   withDeadline: typeof withDeadline;
+  sleep: typeof sleep;
   ChannelClosedError: typeof ChannelClosedError;
   ContextCancelledError: typeof ContextCancelledError;
 };
@@ -751,6 +755,31 @@ const __streamixWithDeadline = (parent, deadline) => {
   return __streamixWithTimeout(parent, Math.max(0, time - Date.now()));
 };
 
+const __streamixSleep = (ms, signal) => {
+  if (!Number.isFinite(ms) || ms < 0) {
+    return Promise.reject(new RangeError("timer duration must be a finite non-negative number"));
+  }
+  if (signal?.aborted) {
+    return Promise.reject(__streamixCreateAbortError(signal));
+  }
+
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      cleanup();
+      resolve();
+    }, ms);
+
+    const abort = () => {
+      clearTimeout(timer);
+      cleanup();
+      reject(__streamixCreateAbortError(signal));
+    };
+
+    const cleanup = () => signal?.removeEventListener("abort", abort);
+    signal?.addEventListener("abort", abort, { once: true });
+  });
+};
+
 const __streamixRecv = (ch, name) => ({ op: "receive", channel: ch, name });
 const __streamixSend = (ch, value, name) => ({ op: "send", channel: ch, value, name });
 const __streamixOtherwise = (name = "default") => ({ op: "default", name });
@@ -924,6 +953,7 @@ const __streamixConcurrency = Object.freeze({
   withCancel: __streamixWithCancel,
   withTimeout: __streamixWithTimeout,
   withDeadline: __streamixWithDeadline,
+  sleep: __streamixSleep,
   ChannelClosedError: __streamixChannelClosedError,
   ContextCancelledError: __streamixContextCancelledError,
 });
@@ -1087,6 +1117,21 @@ function createActor<S = any, Q = any, D = any, FromMain = any>(
   let finishShutdown: (() => void) | null = null;
   let shouldReleaseBlobUrl = false;
   let hasReleasedBlobUrl = false;
+  let requestedExit: ActorExit = { reason: "stopped" };
+  let hasSettledDone = false;
+  let resolveDone!: (exit: ActorExit) => void;
+  const done = new Promise<ActorExit>((resolve) => {
+    resolveDone = resolve;
+  });
+
+  const settleDone = () => {
+    if (hasSettledDone) {
+      return;
+    }
+
+    hasSettledDone = true;
+    resolveDone(requestedExit);
+  };
 
   worker = new Worker(blobUrl, { type: "module" });
   (worker as any).__id = actorWorkerId;
@@ -1103,13 +1148,14 @@ function createActor<S = any, Q = any, D = any, FromMain = any>(
     releaseBlobUrl(workerScript);
   };
 
-  const rejectPendingRequests = (message = ACTOR_STOPPED_ERROR_MESSAGE) => {
+  const rejectPendingRequests = (reason: string | Error = ACTOR_STOPPED_ERROR_MESSAGE) => {
     if (pendingRequests.size === 0) {
       return;
     }
 
+    const error = typeof reason === "string" ? new Error(reason) : reason;
     for (const { reject } of pendingRequests.values()) {
-      reject(new Error(message));
+      reject(error);
     }
 
     pendingRequests.clear();
@@ -1125,8 +1171,11 @@ function createActor<S = any, Q = any, D = any, FromMain = any>(
     });
   };
 
-  const shutdown = (releaseBlobUrlOnExit: boolean) => {
+  const shutdown = (releaseBlobUrlOnExit: boolean, exit: ActorExit = { reason: "stopped" }) => {
     shouldReleaseBlobUrl ||= releaseBlobUrlOnExit;
+    if (!shutdown$) {
+      requestedExit = exit;
+    }
 
     if (shutdown$) {
       releaseWorkerScript();
@@ -1140,6 +1189,7 @@ function createActor<S = any, Q = any, D = any, FromMain = any>(
     const activeWorker = worker;
     if (!activeWorker) {
       releaseWorkerScript();
+      settleDone();
       return Promise.resolve();
     }
 
@@ -1160,6 +1210,7 @@ function createActor<S = any, Q = any, D = any, FromMain = any>(
           worker = null;
         }
         releaseWorkerScript();
+        settleDone();
         resolve();
       };
 
@@ -1216,11 +1267,24 @@ function createActor<S = any, Q = any, D = any, FromMain = any>(
     }
   };
 
-  const handleError = () => {
-    // Generic error handler, specific errors are handled within the message handler
+  const handleError = (event: ErrorEvent) => {
+    if (!running) {
+      return;
+    }
+
+    const error =
+      event.error instanceof Error
+        ? event.error
+        : new Error(event.message || "Actor worker failed");
+
+    running = false;
+    rejectPendingRequests(error);
+    unregisterActorBusTarget(actorRef);
+    void shutdown(true, { reason: "error", error });
   };
 
   worker.addEventListener("message", handleMessage);
+  worker.addEventListener("error", handleError);
 
   postToWorker(worker, {
     taskId: actorTaskId,
@@ -1234,6 +1298,8 @@ function createActor<S = any, Q = any, D = any, FromMain = any>(
     get running() {
       return running;
     },
+
+    done,
   };
 
   actorRef = actor;

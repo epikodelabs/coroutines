@@ -77,4 +77,3 @@ export function coroutine<T, R>(
 }
 
 export type { CoroutineScript } from "../worker/types";
-

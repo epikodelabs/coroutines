@@ -40,4 +40,3 @@ export function iit(name: string, fn: jasmine.ImplementationCallback) {
 
 // Export environment flags too
 export { isBrowser, isNode };
-

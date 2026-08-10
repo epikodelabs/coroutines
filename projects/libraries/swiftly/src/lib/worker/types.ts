@@ -31,6 +31,13 @@ export interface TaskRunner<T = any, R = any> {
 export interface Coroutine<T = any, R = T> extends TaskRunner<T, R> {}
 
 /**
+ * Terminal state of a long-lived actor.
+ */
+export type ActorExit =
+  | { readonly reason: "stopped" }
+  | { readonly reason: "error"; readonly error: Error };
+
+/**
  * Long-lived stateful worker with bidirectional messaging.
  *
  * `Actor` is an opaque handle to a persistent behavior loop running in a
@@ -49,4 +56,7 @@ export interface Actor {
 
   /** `true` while the behavior loop is running. */
   readonly running: boolean;
+
+  /** Resolves exactly once when the actor terminates. */
+  readonly done: Promise<ActorExit>;
 }

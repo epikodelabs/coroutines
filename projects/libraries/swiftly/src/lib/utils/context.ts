@@ -1,3 +1,5 @@
+import { scheduleWorkerTimer } from "../worker/timer";
+
 /**
  * Thrown when a context is cancelled or times out.
  */
@@ -126,8 +128,12 @@ export function withCancel(parent: Context = background()): [Context, Cancel] {
  */
 export function withTimeout(parent: Context, ms: number): [Context, Cancel] {
   const [ctx, cancel] = withCancel(parent);
-  const timer = setTimeout(() => cancel(new ContextCancelledError(`context timeout after ${ms}ms`)), ms);
-  ctx.done.finally(() => clearTimeout(timer));
+  const timer = scheduleWorkerTimer(
+    ms,
+    () => cancel(new ContextCancelledError(`context timeout after ${ms}ms`)),
+    (error) => cancel(error),
+  );
+  ctx.done.finally(() => timer.cancel());
   return [ctx, cancel];
 }
 

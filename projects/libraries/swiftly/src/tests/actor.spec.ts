@@ -71,6 +71,12 @@ idescribe("actor", () => {
 
       constructor(_url: string, _options?: any) {
         this.workerId = Math.floor(Math.random() * 100000);
+        (globalThis as any).lastMockWorker = this;
+      }
+
+      emitError(error: Error) {
+        const event = { error, message: error.message } as ErrorEvent;
+        this.listeners["error"]?.forEach(fn => fn(event));
       }
 
       private createWorkerUtils(message: { workerId: number; taskId: string }) {
@@ -242,6 +248,7 @@ idescribe("actor", () => {
     console.error = _originalError;
     console.warn = _originalWarn;
     delete (globalThis as any).currentMainTask;
+    delete (globalThis as any).lastMockWorker;
   });
 
   beforeEach(() => {
@@ -1062,4 +1069,55 @@ idescribe("actor", () => {
     unregister();
     await main.outbox.stop(a);
   });
+  it("should expose normal actor termination through done", async () => {
+    async function behavior(_msg: any, state: number) {
+      return state;
+    }
+
+    (globalThis as any).currentMainTask = behavior;
+
+    const a = actor(nextActorName(), behavior, 0);
+    const done = a.done;
+
+    await main.outbox.stop(a);
+
+    expect(await done).toEqual({ reason: "stopped" });
+    expect(a.running).toBe(false);
+  });
+
+  it("should surface worker failure through done and stop the actor", async () => {
+    async function behavior(_msg: any, state: number) {
+      return state;
+    }
+
+    (globalThis as any).currentMainTask = behavior;
+
+    const a = actor(nextActorName(), behavior, 0);
+    const failure = new Error("worker crashed");
+    const worker = (globalThis as any).lastMockWorker;
+
+    worker.emitError(failure);
+
+    const exit = await a.done;
+    expect(exit.reason).toBe("error");
+    if (exit.reason === "error") {
+      expect(exit.error).toBe(failure);
+    }
+    expect(a.running).toBe(false);
+  });
+
+  it("should settle actor done only once when stop is repeated", async () => {
+    async function behavior(_msg: any, state: number) {
+      return state;
+    }
+
+    (globalThis as any).currentMainTask = behavior;
+
+    const a = actor(nextActorName(), behavior, 0);
+
+    await Promise.all([main.outbox.stop(a), main.outbox.stop(a)]);
+
+    expect(await a.done).toEqual({ reason: "stopped" });
+  });
+
 });
