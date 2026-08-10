@@ -7,6 +7,7 @@ import { generateTaskId } from "./utils";
 import { createAbortError } from "../utils/context";
 import type { TaskRunControl } from "../utils/transfer";
 import { normalizeTaskRunControl } from "./control";
+import { takeNextScheduled } from "./scheduler";
 
 export type PoolOptions = {
   name: string;
@@ -25,6 +26,7 @@ type WaitingWorker = {
   signal?: AbortSignal;
   priority: number;
   sequence: number;
+  bypasses: number;
   abort?: () => void;
 };
 
@@ -239,23 +241,8 @@ export function createTaskPool<T, R>({
     return worker;
   };
 
-  const takeNextWaiter = (): WaitingWorker | undefined => {
-    if (waitingQueue.length === 0) return undefined;
-
-    let bestIndex = 0;
-    for (let index = 1; index < waitingQueue.length; index++) {
-      const candidate = waitingQueue[index];
-      const best = waitingQueue[bestIndex];
-      if (
-        candidate.priority > best.priority ||
-        (candidate.priority === best.priority && candidate.sequence < best.sequence)
-      ) {
-        bestIndex = index;
-      }
-    }
-
-    return waitingQueue.splice(bestIndex, 1)[0];
-  };
+  const takeNextWaiter = (): WaitingWorker | undefined =>
+    takeNextScheduled(waitingQueue);
 
   satisfyWaitingQueue = () => {
     while (lifecycle !== "finalizing" && !isFinalized && waitingQueue.length > 0 && createdWorkersCount < maxWorkers) {
@@ -327,6 +314,7 @@ export function createTaskPool<T, R>({
         signal,
         priority,
         sequence: nextWaiterSequence++,
+        bypasses: 0,
       };
       if (signal) {
         waiter.abort = () => {

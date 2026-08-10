@@ -396,3 +396,21 @@ when the actor behavior loop is ready to receive it.
 Supervisor `capacity` remains a separate policy: it bounds traffic waiting
 between actor generations during restart. Actor `mailboxCapacity` bounds traffic
 inside the currently running generation.
+
+
+## Priority fairness
+
+Task priority is preferential rather than absolute. Higher-priority queued work
+runs first under ordinary load, and equal priorities remain FIFO. A queued task
+that has been bypassed 32 times is promoted for one dispatch, so a continuous
+stream of urgent submissions cannot starve older work indefinitely.
+
+```ts
+worker.run(backgroundJob, { priority: -10 });
+worker.run(normalJob);
+worker.run(urgentJob, { priority: 20 });
+```
+
+Priority never preempts JavaScript that is already running. Fairness applies
+only at worker-admission boundaries and is shared by dedicated coroutines and
+compute pools. The rule is deterministic and has no timer dependency.

@@ -6,6 +6,7 @@ import { generateTaskId } from "./utils";
 import { createAbortError } from "../utils/context";
 import type { TaskRunControl } from "../utils/transfer";
 import { normalizeTaskRunControl } from "./control";
+import { takeNextScheduled } from "./scheduler";
 
 /**
  * Shared worker-script configuration for task runners.
@@ -25,6 +26,7 @@ type QueuedTask<T, R> = {
   transfer: Transferable[];
   priority: number;
   sequence: number;
+  bypasses: number;
   abort?: () => void;
 };
 
@@ -236,23 +238,8 @@ export function createTaskRunner<T, R>({
     resolveClose = null;
   };
 
-  const takeNextTask = (): QueuedTask<T, R> | undefined => {
-    if (queuedTasks.length === 0) return undefined;
-
-    let bestIndex = 0;
-    for (let index = 1; index < queuedTasks.length; index++) {
-      const candidate = queuedTasks[index];
-      const best = queuedTasks[bestIndex];
-      if (
-        candidate.priority > best.priority ||
-        (candidate.priority === best.priority && candidate.sequence < best.sequence)
-      ) {
-        bestIndex = index;
-      }
-    }
-
-    return queuedTasks.splice(bestIndex, 1)[0];
-  };
+  const takeNextTask = (): QueuedTask<T, R> | undefined =>
+    takeNextScheduled(queuedTasks);
 
   const drainQueue = async (): Promise<void> => {
     if (isProcessing || lifecycle === "finalizing" || isFinalized) {
@@ -316,6 +303,7 @@ export function createTaskRunner<T, R>({
         transfer,
         priority,
         sequence: nextSequence++,
+        bypasses: 0,
       };
 
       if (signal) {

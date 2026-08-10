@@ -373,6 +373,53 @@ idescribe("worker helpers", () => {
       await runner.dispose();
     });
 
+
+    it("prevents starvation of low-priority runner work under sustained priority pressure", async () => {
+      const runner = createTaskRunner<number, number>({
+        name: "fair-runner",
+        main: (value: number) => value,
+        functions: [],
+        generateWorkerScript: () => "runner-worker-script",
+      });
+
+      const active = runner.run(0);
+      await flush();
+      const worker = MockWorker.instances[0];
+
+      const low = runner.run(-1, { priority: -1000 });
+      const high = Array.from({ length: 40 }, (_, index) =>
+        runner.run(index + 1, { priority: 1000 })
+      );
+
+      worker.dispatch({ ...worker.sentMessages[0], type: "response", payload: 0 });
+      await active;
+
+      for (let index = 1; index <= 32; index++) {
+        await flush();
+        expect(worker.sentMessages[index].payload).toBe(index);
+        worker.dispatch({
+          ...worker.sentMessages[index],
+          type: "response",
+          payload: index,
+        });
+        await high[index - 1];
+      }
+
+      await flush();
+      expect(worker.sentMessages[33].payload).toBe(-1);
+      worker.dispatch({
+        ...worker.sentMessages[33],
+        type: "response",
+        payload: -1,
+      });
+      await expectAsync(low).toBeResolvedTo(-1);
+
+      await runner.dispose();
+      for (const pending of high.slice(32)) {
+        await expectAsync(pending).toBeRejected();
+      }
+    });
+
     it("removes cancelled priority work without disturbing remaining order", async () => {
       const runner = createTaskRunner<number, number>({
         name: "priority-cancel-runner",
@@ -489,6 +536,55 @@ idescribe("worker helpers", () => {
       await expectAsync(low).toBeResolvedTo(2);
 
       await pool.dispose();
+    });
+
+
+    it("prevents starvation of low-priority pool waiters under sustained priority pressure", async () => {
+      const pool = createTaskPool<number, number>({
+        name: "fair-pool",
+        concurrency: 1,
+        maxQueued: 64,
+        main: (value: number) => value,
+        functions: [],
+        generateWorkerScript: () => "worker-script",
+      });
+
+      const active = pool.run(0);
+      await flush();
+      const worker = MockWorker.instances[0];
+
+      const low = pool.run(-1, { priority: -1000 });
+      const high = Array.from({ length: 40 }, (_, index) =>
+        pool.run(index + 1, { priority: 1000 })
+      );
+
+      worker.dispatch({ ...worker.sentMessages[0], type: "response", payload: 0 });
+      await active;
+
+      for (let index = 1; index <= 32; index++) {
+        await flush();
+        expect(worker.sentMessages[index].payload).toBe(index);
+        worker.dispatch({
+          ...worker.sentMessages[index],
+          type: "response",
+          payload: index,
+        });
+        await high[index - 1];
+      }
+
+      await flush();
+      expect(worker.sentMessages[33].payload).toBe(-1);
+      worker.dispatch({
+        ...worker.sentMessages[33],
+        type: "response",
+        payload: -1,
+      });
+      await expectAsync(low).toBeResolvedTo(-1);
+
+      await pool.dispose();
+      for (const pending of high.slice(32)) {
+        await expectAsync(pending).toBeRejected();
+      }
     });
 
     it("reuses a busy worker for queued runs when max workers is reached", async () => {

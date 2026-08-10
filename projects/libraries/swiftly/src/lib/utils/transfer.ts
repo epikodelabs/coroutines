@@ -8,8 +8,9 @@ export type TaskRunOptions = {
   signal?: AbortSignal;
   transfer?: readonly Transferable[];
   /**
-   * Scheduling priority for work that has not started yet. Higher values run
-   * first; equal priorities preserve submission order. Defaults to `0`.
+   * Scheduling priority for work that has not started yet. Higher values are
+   * preferred and equal priorities preserve submission order. To prevent
+   * starvation, a waiting task is promoted after 32 bypasses. Defaults to `0`.
    * Running work is never preempted.
    */
   priority?: number;
