@@ -159,9 +159,9 @@ export function compose<T = any, R = any>(
     return closePromise;
   };
 
-  const settleLifecycle = (error?: Error): void => {
+  const settleLifecycle = (outcome: "resolve" | "reject", error?: Error): void => {
     lifecycle = "finalized";
-    if (error) rejectClose?.(error);
+    if (outcome === "reject" && error) rejectClose?.(error);
     else resolveClose?.();
     resolveClose = null;
     rejectClose = null;
@@ -178,9 +178,10 @@ export function compose<T = any, R = any>(
 
     gracefulCloseStarted = true;
     void closeOwnedRunners().then(
-      () => settleLifecycle(),
+      () => settleLifecycle("resolve"),
       (error) =>
         settleLifecycle(
+          "reject",
           error instanceof Error ? error : new Error(String(error)),
         ),
     );
@@ -256,12 +257,12 @@ export function compose<T = any, R = any>(
 
     disposePromise = disposeOwnedRunners().then(
       () => {
-        settleLifecycle();
+        settleLifecycle("resolve");
       },
       (error) => {
         const normalized =
           error instanceof Error ? error : new Error(String(error));
-        settleLifecycle(normalized);
+        settleLifecycle("resolve");
         throw normalized;
       },
     );
