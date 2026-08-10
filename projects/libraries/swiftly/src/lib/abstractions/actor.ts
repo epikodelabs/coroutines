@@ -1004,6 +1004,7 @@ const __streamixConcurrency = Object.freeze({
 
 const ACTOR_TERMINATION_TIMEOUT_MS = 100;
 const ACTOR_STOPPED_ERROR_MESSAGE = "Actor stopped";
+let actorGenerationCounter = 0;
 
 type PendingActorRequest<S> = {
   resolve: (value: S) => void;
@@ -1017,11 +1018,22 @@ const toErrorMessage = (
 ): string => (error instanceof Error ? error.message : error ? String(error) : fallback);
 
 function postActorResponse(
+  sourceActor: Actor,
   worker: Worker,
   message: Pick<WorkerProtocolMessage, "workerId" | "taskId" | "requestId"> &
     ({ type: "response"; payload: unknown } | { type: "error"; error: string })
-) {
-  worker.postMessage(message);
+): boolean {
+  if (!sourceActor.running) {
+    return false;
+  }
+
+  try {
+    worker.postMessage(message);
+    return true;
+  } catch (error) {
+    console.warn("Actor request response transport failed:", error);
+    return false;
+  }
 }
 
 function handleRequest<Q>(
@@ -1033,7 +1045,7 @@ function handleRequest<Q>(
   const targets = normalizeActorBusTargets(message.to);
 
   if (targets.length !== 1) {
-    postActorResponse(worker, {
+    postActorResponse(sourceActor, worker, {
       workerId,
       taskId,
       requestId,
@@ -1047,7 +1059,7 @@ function handleRequest<Q>(
   const handler = actorRequestHandlers.get(targetName);
 
   if (!handler) {
-    postActorResponse(worker, {
+    postActorResponse(sourceActor, worker, {
       workerId,
       taskId,
       requestId,
@@ -1058,7 +1070,7 @@ function handleRequest<Q>(
   }
 
   if (!topic) {
-    postActorResponse(worker, {
+    postActorResponse(sourceActor, worker, {
       workerId,
       taskId,
       requestId,
@@ -1076,7 +1088,7 @@ function handleRequest<Q>(
     });
     Promise.resolve(result)
       .then((resolved) => {
-        postActorResponse(worker, {
+        postActorResponse(sourceActor, worker, {
           workerId,
           taskId,
           requestId,
@@ -1085,7 +1097,7 @@ function handleRequest<Q>(
         });
       })
       .catch((err) => {
-        postActorResponse(worker, {
+        postActorResponse(sourceActor, worker, {
           workerId,
           taskId,
           requestId,
@@ -1094,7 +1106,7 @@ function handleRequest<Q>(
         });
       });
   } catch (err) {
-    postActorResponse(worker, {
+    postActorResponse(sourceActor, worker, {
       workerId,
       taskId,
       requestId,
@@ -1178,8 +1190,8 @@ function createActor<S = any, Q = any, D = any, FromMain = any>(
   });
 
   const blobUrl = acquireBlobUrl(workerScript);
-  const actorWorkerId = 1;
-  const actorTaskId = String(actorWorkerId);
+  const actorWorkerId = ++actorGenerationCounter;
+  const actorTaskId = `actor:${actorWorkerId}`;
 
   let worker: Worker | null = null;
   let running = false;
@@ -1315,6 +1327,14 @@ function createActor<S = any, Q = any, D = any, FromMain = any>(
 
   const handleMessage = (event: MessageEvent<WorkerProtocolMessage>) => {
     const msg = event.data;
+
+    if (
+      msg.workerId !== actorWorkerId ||
+      msg.taskId !== actorTaskId
+    ) {
+      return;
+    }
+
     const { type, payload, requestId } = msg;
 
     if (type === "response" && requestId && pendingRequests.has(requestId)) {
@@ -1334,10 +1354,12 @@ function createActor<S = any, Q = any, D = any, FromMain = any>(
       unregisterActorBusTarget(actorRef);
       void shutdown(true, { reason: "error", error });
     } else if (type === "overflow") {
+      if (!running) return;
       dropped += 1;
       console.warn(`Actor "${name}" mailbox capacity exceeded; message dropped`);
     } else if (type === "request") {
-      handleRequest(msg, actorRef, worker!);
+      if (!running || !worker) return;
+      handleRequest(msg, actorRef, worker);
     } else if (type === "notify") {
       if (!running) {
         return;

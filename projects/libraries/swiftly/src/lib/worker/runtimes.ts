@@ -56,6 +56,14 @@ const __serializeWorkerError = (error) => {
 const __pendingWorkerRequests = new Map();
 let __requestCounter = 0;
 
+const __rejectPendingWorkerRequests = (error) => {
+  const pending = [...__pendingWorkerRequests.values()];
+  __pendingWorkerRequests.clear();
+  for (const request of pending) {
+    request.reject(error);
+  }
+};
+
 const __postToMain = (message) => {
   postMessage(message);
 };
@@ -66,6 +74,10 @@ const __createRequestId = (taskId) => {
 };
 
 const __requestMain = (workerId, taskId, to, topic, payload) => {
+  if (__actorStopping || !__actorRunning) {
+    return Promise.reject(new Error("Actor stopped"));
+  }
+
   return new Promise((resolve, reject) => {
     const requestId = __createRequestId(taskId);
     __pendingWorkerRequests.set(requestId, { resolve, reject });
@@ -142,6 +154,7 @@ const __enqueueActorMessage = (value, requestId) => {
 
 let __actorState = undefined;
 let __actorRunning = false;
+let __actorStopping = false;
 let __actorId = null;
 let __workerId = null;
 
@@ -169,6 +182,10 @@ const __runBehaviorLoop = async (workerId, taskId) => {
         __postToMain({ workerId, taskId, type: "response", requestId: replyId, payload: result });
       }
     } catch (error) {
+      if (__actorStopping) {
+        break;
+      }
+
       const message = __serializeWorkerError(error);
       if (replyId) {
         __postToMain({ workerId, taskId, type: "error", requestId: replyId, error: message });
@@ -177,6 +194,7 @@ const __runBehaviorLoop = async (workerId, taskId) => {
       // An unhandled behavior exception terminates this actor generation.
       // Supervision can then make the restart decision at the ownership boundary.
       __actorRunning = false;
+      __rejectPendingWorkerRequests(new Error(message));
       __postToMain({ workerId, taskId, type: "error", error: message });
       break;
     }
@@ -189,6 +207,13 @@ const __runBehaviorLoop = async (workerId, taskId) => {
 
 onmessage = async (event) => {
   const { workerId, taskId, payload, type, requestId, error, topic } = event.data;
+
+  if (
+    type !== "init" &&
+    (__workerId !== workerId || __actorId !== taskId)
+  ) {
+    return;
+  }
 
   if (type === "notify") {
     if (__actorRunning) {
@@ -226,16 +251,23 @@ onmessage = async (event) => {
   }
 
   if (type === "init") {
+    if (__actorId !== null || __workerId !== null) {
+      return;
+    }
+
     __workerId = workerId;
     __actorId = taskId;
     __actorState = payload;
+    __actorStopping = false;
     __actorRunning = true;
     __runBehaviorLoop(workerId, taskId);
     return;
   }
 
   if (type === "stop") {
+    __actorStopping = true;
     __actorRunning = false;
+    __rejectPendingWorkerRequests(new Error("Actor stopped"));
     __actorMailbox.close();
     __workerInbox.close();
     return;

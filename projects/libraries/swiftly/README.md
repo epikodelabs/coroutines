@@ -504,3 +504,18 @@ Dedicated runners and compute pools are regression-tested for the same lifecycle
 pressure: worker failure during graceful close must continue draining admitted
 queued work, while `dispose()` may escalate an in-progress close and settle the
 close promise without stranding callers.
+
+
+## Actor generation isolation
+
+Every actor generation now carries a unique internal protocol identity. Main and
+worker sides both validate that identity before accepting protocol envelopes, so
+a late or malformed response from another generation cannot settle a current
+request even if its request id happens to match.
+
+Shutdown is also an admission boundary for worker-side requests. Once stopping
+begins, outstanding `utils.outbox.request(...)` calls are rejected and new ones
+are refused. Async main-thread handlers that finish after the source generation
+has stopped do not write responses back into the dead worker.
+
+These are internal guarantees; they do not add public actor API.

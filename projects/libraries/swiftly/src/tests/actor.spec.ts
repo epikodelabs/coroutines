@@ -61,11 +61,13 @@ idescribe("actor", () => {
       onmessage: ((ev: any) => void) | null = null;
       listeners: Record<string, ((ev: any) => void)[]> = {};
       terminated = false;
+      readonly sentMessages: any[] = [];
       private workerInbox = channel<any>();
       private busInbox = channel<any>();
       private mailboxCapacity: number | undefined;
       private actorState: any = undefined;
       private actorRunning = false;
+      private actorStopping = false;
       private workerId = 1;
       private taskId = "";
       private pendingWorkerRequests = new Map<string, { resolve: (value: any) => void; reject: (error: Error) => void }>();
@@ -81,6 +83,20 @@ idescribe("actor", () => {
         this.listeners["error"]?.forEach(fn => fn(event));
       }
 
+      emitMessage(message: any) {
+        const event = { data: message } as any;
+        this.onmessage?.(event);
+        this.listeners["message"]?.forEach(fn => fn(event));
+      }
+
+      get protocolIdentity() {
+        return { workerId: this.workerId, taskId: this.taskId };
+      }
+
+      get pendingWorkerRequestCount() {
+        return this.pendingWorkerRequests.size;
+      }
+
       private createWorkerUtils(message: { workerId: number; taskId: string }) {
         const post = (payload: any) => {
           const event = {
@@ -91,6 +107,10 @@ idescribe("actor", () => {
         };
         const outbox = {
           request: (to: string | string[], topic: string, requestPayload: any) => {
+            if (this.actorStopping || !this.actorRunning) {
+              return Promise.reject(new Error("Actor stopped"));
+            }
+
             return new Promise((resolve, reject) => {
               this.requestCounter += 1;
               const requestId = message.taskId + ":request:" + this.requestCounter;
@@ -169,6 +189,10 @@ idescribe("actor", () => {
               this.listeners["message"]?.forEach(fn => fn(event));
             }
           } catch (err: any) {
+            if (this.actorStopping) {
+              break;
+            }
+
             if (requestId) {
               const requestError = {
                 data: { workerId: this.workerId, taskId: this.taskId, requestId, type: "error", error: err.message }
@@ -194,6 +218,7 @@ idescribe("actor", () => {
       }
 
       postMessage(msg: any) {
+        this.sentMessages.push(msg);
         const injectedError = (globalThis as any).actorPostMessageError;
         if (typeof injectedError === "function") {
           const error = injectedError(msg);
@@ -206,16 +231,23 @@ idescribe("actor", () => {
           if (this.terminated) return;
 
           if (msg.type === "init") {
+            this.workerId = msg.workerId;
             this.taskId = msg.taskId;
             this.actorState = msg.payload;
             this.mailboxCapacity = msg.mailboxCapacity;
             if (this.mailboxCapacity !== undefined) {
               this.workerInbox = channel<any>(this.mailboxCapacity);
             }
+            this.actorStopping = false;
             this.actorRunning = true;
             this.runBehaviorLoop(msg);
           } else if (msg.type === "stop") {
+            this.actorStopping = true;
             this.actorRunning = false;
+            for (const pending of this.pendingWorkerRequests.values()) {
+              pending.reject(new Error("Actor stopped"));
+            }
+            this.pendingWorkerRequests.clear();
             this.workerInbox.close();
             this.busInbox.close();
           } else if (msg.type === "notify") {
@@ -1367,6 +1399,155 @@ idescribe("actor", () => {
     expect(a.running).toBe(true);
 
     await main.outbox.stop(a);
+  });
+
+
+  it("ignores a response correlated to the right request but the wrong actor generation", async () => {
+    async function behavior(msg: number, state: number) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      return state + msg;
+    }
+
+    (globalThis as any).currentMainTask = behavior;
+    const a = actor(nextActorName(), behavior, 0);
+    const worker = (globalThis as any).lastMockWorker;
+
+    const pending = main.outbox.request<number, number>(a, "add", 5);
+    let settled = false;
+    pending.finally(() => {
+      settled = true;
+    });
+
+    const requestMessage = worker.sentMessages.find((message: any) => message.type === "request");
+    expect(requestMessage).toBeDefined();
+
+    worker.emitMessage({
+      ...requestMessage,
+      workerId: requestMessage.workerId + 1000,
+      type: "response",
+      payload: 999,
+    });
+
+    await pause(5);
+    expect(settled).toBeFalse();
+
+    await expectAsync(pending).toBeResolvedTo(5);
+    await main.outbox.stop(a);
+  });
+
+  it("uses a unique protocol identity for every actor generation", async () => {
+    async function behavior(_msg: any, state: number) {
+      return state;
+    }
+
+    (globalThis as any).currentMainTask = behavior;
+
+    const first = actor(nextActorName(), behavior, 0);
+    const firstIdentity = {
+      ...(globalThis as any).lastMockWorker.protocolIdentity,
+    };
+
+    const second = actor(nextActorName(), behavior, 0);
+    const secondIdentity = {
+      ...(globalThis as any).lastMockWorker.protocolIdentity,
+    };
+
+    expect(secondIdentity.workerId).not.toBe(firstIdentity.workerId);
+    expect(secondIdentity.taskId).not.toBe(firstIdentity.taskId);
+
+    await main.outbox.stop(first);
+    await main.outbox.stop(second);
+  });
+
+  it("does not write an async worker request response into a generation that stopped meanwhile", async () => {
+    let resolveHandler!: (value: string) => void;
+    const handlerResult = new Promise<string>((resolve) => {
+      resolveHandler = resolve;
+    });
+    const handler = jasmine.createSpy("lateHandler").and.returnValue(handlerResult);
+
+    async function behavior(msg: any, state: number, utils: any) {
+      if (msg.kind === "actor-bus" && msg.topic === "lookup") {
+        await utils.outbox.request("main", "lookup", msg.payload);
+      }
+      return state;
+    }
+
+    (globalThis as any).currentMainTask = behavior;
+    const a = actor(nextActorName(), behavior, 0);
+    const worker = (globalThis as any).lastMockWorker;
+    const unregister = registerActorRequestHandler("main", handler);
+
+    main.outbox.send(a, "lookup", "value");
+    await pause(10);
+
+    expect(handler).toHaveBeenCalled();
+    expect(worker.pendingWorkerRequestCount).toBe(1);
+
+    await main.outbox.stop(a);
+    expect(worker.pendingWorkerRequestCount).toBe(0);
+
+    const sentAtStop = worker.sentMessages.length;
+    resolveHandler("late result");
+    await pause(5);
+
+    expect(worker.sentMessages.length).toBe(sentAtStop);
+
+    unregister();
+  });
+
+  it("settles an in-flight main request exactly once when stop races a late response", async () => {
+    async function behavior(msg: number, state: number) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      return state + msg;
+    }
+
+    (globalThis as any).currentMainTask = behavior;
+    const a = actor(nextActorName(), behavior, 0);
+
+    let settlements = 0;
+    const pending = main.outbox.request<number, number>(a, "add", 1);
+    pending.then(
+      () => settlements += 1,
+      () => settlements += 1,
+    );
+
+    await pause(5);
+    const stopping = main.outbox.stop(a);
+
+    await expectAsync(pending).toBeRejectedWithError("Actor stopped");
+    await stopping;
+    await pause(30);
+
+    expect(settlements).toBe(1);
+    expect((await a.done).reason).toBe("stopped");
+  });
+
+
+  it("does not admit new worker-to-main requests after actor shutdown begins", async () => {
+    const handler = jasmine.createSpy("shutdownHandler").and.returnValue("unexpected");
+
+    async function behavior(msg: any, state: number, utils: any) {
+      if (msg.kind === "actor-bus" && msg.topic === "late-request") {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        await utils.outbox.request("main", "late", msg.payload);
+      }
+      return state;
+    }
+
+    (globalThis as any).currentMainTask = behavior;
+    const unregister = registerActorRequestHandler("main", handler);
+    const a = actor(nextActorName(), behavior, 0);
+
+    main.outbox.send(a, "late-request", "value");
+    await pause(5);
+    await main.outbox.stop(a);
+    await pause(25);
+
+    expect(handler).not.toHaveBeenCalled();
+    expect((await a.done).reason).toBe("stopped");
+
+    unregister();
   });
 
   it("validates supervisor restart-window capacity", () => {
