@@ -4,6 +4,7 @@ import {
     ChannelClosedError,
     ContextCancelledError,
     otherwise,
+    operation,
     receive,
     select,
     send,
@@ -30,7 +31,8 @@ import type { Actor } from "../worker/types";
  * - `channel(capacity?)`: create a worker-local async channel
  * - `receive(ch, name?)` / `send(ch, value, name?)`: build `select(...)` cases
  * - `otherwise(name?)`: default `select(...)` branch
- * - `select(cases, ctx?)`: race channel operations fairly
+ * - `operation(run, name?)`: cancellable async `select(...)` contender
+ * - `select(cases, ctx?)`: race channel and async operations fairly
  * - `background()`: root cancellation context
  * - `withCancel/withTimeout/withDeadline(...)`: derive cancellable contexts
  * - `ChannelClosedError` / `ContextCancelledError`: worker-side error classes
@@ -40,6 +42,7 @@ export type WorkerConcurrency = {
   receive: typeof receive;
   send: typeof send;
   otherwise: typeof otherwise;
+  operation: typeof operation;
   select: typeof select;
   background: typeof background;
   withCancel: typeof withCancel;
@@ -751,6 +754,7 @@ const __streamixWithDeadline = (parent, deadline) => {
 const __streamixRecv = (ch, name) => ({ op: "receive", channel: ch, name });
 const __streamixSend = (ch, value, name) => ({ op: "send", channel: ch, value, name });
 const __streamixOtherwise = (name = "default") => ({ op: "default", name });
+const __streamixOperation = (run, name) => ({ op: "operation", run, name });
 
 const __streamixShuffledIndices = (length) => {
   const indices = Array.from({ length }, (_, i) => i);
@@ -763,14 +767,18 @@ const __streamixShuffledIndices = (length) => {
 
 const __streamixSelect = async (cases, ctx = __streamixBackground()) => {
   if (ctx.signal.aborted) throw __streamixCreateAbortError(ctx.signal);
+  if (cases.length === 0) {
+    throw new RangeError("select requires at least one case");
+  }
 
   const defaultIndex = cases.findIndex((item) => item.op === "default");
   const channelIndices = cases
-    .map((_, i) => i)
-    .filter((i) => cases[i].op !== "default");
-  const randomOrder = __streamixShuffledIndices(channelIndices.length).map((j) => channelIndices[j]);
+    .map((item, i) => ({ item, i }))
+    .filter(({ item }) => item.op === "receive" || item.op === "send")
+    .map(({ i }) => i);
+  const randomChannelOrder = __streamixShuffledIndices(channelIndices.length).map((j) => channelIndices[j]);
 
-  for (const index of randomOrder) {
+  for (const index of randomChannelOrder) {
     const item = cases[index];
     if (item.op === "receive") {
       const result = item.channel.tryReceive();
@@ -792,38 +800,60 @@ const __streamixSelect = async (cases, ctx = __streamixBackground()) => {
     return { index: defaultIndex, case: item, op: item.op, name: item.name, ok: true };
   }
 
-  const selectId = Symbol("streamix.select");
+  const contenders = cases
+    .map((item, i) => ({ item, i }))
+    .filter(({ item }) => item.op !== "default");
+  const randomOrder = __streamixShuffledIndices(contenders.length).map((j) => contenders[j].i);
+  const selectId = Symbol("swiftly.select");
   let settled = false;
+  let winnerIndex = -1;
   const cleanupFns = [];
+  const operationControllers = new Map();
+
+  const abortLosingOperations = (reason) => {
+    for (const [index, controller] of operationControllers) {
+      if (index !== winnerIndex && !controller.signal.aborted) {
+        controller.abort(reason);
+      }
+    }
+  };
 
   try {
     return await new Promise((resolve, reject) => {
+      const settle = (result) => {
+        if (settled) return false;
+        settled = true;
+        winnerIndex = result.index;
+        abortLosingOperations(new __streamixContextCancelledError("select case lost"));
+        resolve(result);
+        return true;
+      };
+
+      const rejectSelection = (error, index = -1) => {
+        if (settled) return false;
+        settled = true;
+        winnerIndex = index;
+        abortLosingOperations(error);
+        reject(error);
+        return true;
+      };
+
       const registration = {
         id: selectId,
         isSettled: () => settled,
-        settle: (outcome) => {
-          if (settled) return false;
-          settled = true;
-          resolve({
-            index: outcome.index,
-            case: outcome.caseRef,
-            op: outcome.op,
-            name: outcome.name,
-            value: outcome.value,
-            ok: outcome.ok,
-          });
-          return true;
-        },
-        reject: (error) => {
-          if (settled) return false;
-          settled = true;
-          reject(error);
-          return true;
-        },
+        settle: (outcome) => settle({
+          index: outcome.index,
+          case: outcome.caseRef,
+          op: outcome.op,
+          name: outcome.name,
+          value: outcome.value,
+          ok: outcome.ok,
+        }),
+        reject: (error) => rejectSelection(error),
       };
 
       const onContextAbort = () => {
-        registration.reject(__streamixCreateAbortError(ctx.signal));
+        rejectSelection(__streamixCreateAbortError(ctx.signal));
       };
 
       ctx.signal.addEventListener("abort", onContextAbort, { once: true });
@@ -833,11 +863,36 @@ const __streamixSelect = async (cases, ctx = __streamixBackground()) => {
         if (settled) break;
 
         const item = cases[index];
-        if (item.op === "default") continue;
+        if (item.op === "operation") {
+          const controller = new AbortController();
+          operationControllers.set(index, controller);
+
+          Promise.resolve().then(async () => {
+            if (settled) return;
+
+            try {
+              const value = await item.run(controller.signal);
+              settle({
+                index,
+                case: item,
+                op: item.op,
+                name: item.name,
+                value,
+                ok: true,
+              });
+            } catch (error) {
+              rejectSelection(
+                error instanceof Error ? error : new Error(error ? String(error) : "select operation failed"),
+                index
+              );
+            }
+          });
+          continue;
+        }
 
         const internals = item.channel[__streamixChannelInternals];
         if (!internals) {
-          registration.reject(new __streamixContextCancelledError("channel does not support select"));
+          rejectSelection(new __streamixContextCancelledError("channel does not support select"));
           break;
         }
 
@@ -854,6 +909,7 @@ const __streamixSelect = async (cases, ctx = __streamixBackground()) => {
     while (cleanupFns.length > 0) {
       cleanupFns.pop()();
     }
+    abortLosingOperations(new __streamixContextCancelledError("select completed"));
   }
 };
 
@@ -862,6 +918,7 @@ const __streamixConcurrency = Object.freeze({
   receive: __streamixRecv,
   send: __streamixSend,
   otherwise: __streamixOtherwise,
+  operation: __streamixOperation,
   select: __streamixSelect,
   background: __streamixBackground,
   withCancel: __streamixWithCancel,
@@ -870,6 +927,7 @@ const __streamixConcurrency = Object.freeze({
   ChannelClosedError: __streamixChannelClosedError,
   ContextCancelledError: __streamixContextCancelledError,
 });
+
 `;
 
 

@@ -6,6 +6,7 @@ import {
   ContextCancelledError,
   createAbortError,
   otherwise,
+  operation,
   receive,
   select,
   send,
@@ -656,5 +657,161 @@ describe("selection", () => {
 
     unregisterReceive();
     unregisterSend();
+  });
+});
+
+
+describe("operation selection", () => {
+  it("operation builds a cancellable operation case", () => {
+    const run = (signal: AbortSignal) => signal.aborted;
+    const c = operation(run, "work");
+
+    expect(c.op).toBe("operation");
+    expect(c.run).toBe(run);
+    expect(c.name).toBe("work");
+  });
+
+  it("select resolves with the first completed operation", async () => {
+    const result = await select([
+      operation(async () => {
+        await new Promise(r => setTimeout(r, 20));
+        return "slow";
+      }, "slow"),
+      operation(async () => {
+        await new Promise(r => setTimeout(r, 1));
+        return "fast";
+      }, "fast"),
+    ]);
+
+    expect(result.op).toBe("operation");
+    expect(result.name).toBe("fast");
+    expect(result.value).toBe("fast");
+  });
+
+  it("select aborts losing operations", async () => {
+    let loserAborted = false;
+
+    const result = await select([
+      operation(async (signal) => {
+        await new Promise<void>((resolve) => {
+          signal.addEventListener("abort", () => {
+            loserAborted = true;
+            resolve();
+          }, { once: true });
+        });
+        return "loser";
+      }, "loser"),
+      operation(() => "winner", "winner"),
+    ]);
+
+    await Promise.resolve();
+    expect(result.name).toBe("winner");
+    expect(loserAborted).toBeTrue();
+  });
+
+  it("select can coordinate an operation with a channel receive", async () => {
+    const ch = channel<string>();
+    setTimeout(() => ch.send("message"), 1);
+
+    let operationAborted = false;
+    const result = await select([
+      receive(ch, "message"),
+      operation(async (signal) => {
+        await new Promise<void>((resolve) => {
+          signal.addEventListener("abort", () => {
+            operationAborted = true;
+            resolve();
+          }, { once: true });
+        });
+        return "timeout";
+      }, "operation"),
+    ]);
+
+    await Promise.resolve();
+    expect(result.name).toBe("message");
+    expect(result.value).toBe("message");
+    expect(operationAborted).toBeTrue();
+  });
+
+  it("default selection does not start operations", async () => {
+    let started = false;
+
+    const result = await select([
+      operation(() => {
+        started = true;
+        return "work";
+      }, "work"),
+      otherwise("default"),
+    ]);
+
+    expect(result.name).toBe("default");
+    expect(started).toBeFalse();
+  });
+
+  it("context cancellation aborts active operations", async () => {
+    const [ctx, cancel] = withCancel();
+    let aborted = false;
+
+    const pending = select([
+      operation(async (signal) => {
+        await new Promise<void>((resolve) => {
+          signal.addEventListener("abort", () => {
+            aborted = true;
+            resolve();
+          }, { once: true });
+        });
+        return "never";
+      }),
+    ], ctx);
+
+    await Promise.resolve();
+    cancel(new ContextCancelledError("stop selection"));
+
+    await expectAsync(pending).toBeRejectedWithError(/stop selection/);
+    expect(aborted).toBeTrue();
+  });
+
+  it("context cancellation before operation start does not launch work", async () => {
+    const [ctx, cancel] = withCancel();
+    let started = false;
+
+    const pending = select([
+      operation(() => {
+        started = true;
+        return "work";
+      }),
+    ], ctx);
+
+    cancel(new ContextCancelledError("stop before start"));
+
+    await expectAsync(pending).toBeRejectedWithError(/stop before start/);
+    await Promise.resolve();
+    expect(started).toBeFalse();
+  });
+
+  it("operation failure rejects selection and aborts siblings", async () => {
+    let siblingAborted = false;
+
+    const pending = select([
+      operation(async (signal) => {
+        await new Promise<void>((resolve) => {
+          signal.addEventListener("abort", () => {
+            siblingAborted = true;
+            resolve();
+          }, { once: true });
+        });
+        return "sibling";
+      }),
+      operation(() => {
+        throw new Error("boom");
+      }),
+    ]);
+
+    await expectAsync(pending).toBeRejectedWithError(/boom/);
+    expect(siblingAborted).toBeTrue();
+  });
+
+  it("select rejects an empty case list", async () => {
+    await expectAsync(select([])).toBeRejectedWithError(/at least one case/);
   });
 });

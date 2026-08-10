@@ -7,6 +7,7 @@ import {
   isActorBusMessage,
   main,
   otherwise,
+  operation,
   receive,
   registerActorRequestHandler,
   select,
@@ -118,6 +119,7 @@ idescribe("actor", () => {
             receive,
             send,
             otherwise,
+  operation,
             select,
             background,
             withCancel,
@@ -380,6 +382,48 @@ idescribe("actor", () => {
 
     await main.outbox.stop(a);
     expect(a.running).toBe(false);
+  });
+
+  it("should race cancellable operations inside behavior actor", async () => {
+    async function behavior(msg: any, state: number, utils: any) {
+      if (msg.kind !== "actor-bus" || msg.topic !== "run") return state;
+
+      const { operation, select } = utils.concurrency;
+      let loserAborted = false;
+
+      const result = await select([
+        operation(async (signal: AbortSignal) => {
+          await new Promise<void>((resolve) => {
+            signal.addEventListener("abort", () => {
+              loserAborted = true;
+              resolve();
+            }, { once: true });
+          });
+          return "loser";
+        }, "loser"),
+        operation(() => "winner", "winner"),
+      ]);
+
+      await Promise.resolve();
+      utils.outbox.send("main", "selected", {
+        name: result.name,
+        loserAborted,
+      });
+      return state;
+    }
+
+    (globalThis as any).currentMainTask = behavior;
+
+    const a = actor(nextActorName(), behavior, 0);
+    const selected$ = waitForMainMessage(
+      (message) => message.to === "main" && message.topic === "selected"
+    );
+
+    main.outbox.send(a, "run", undefined);
+    const selected = await selected$;
+
+    expect(selected.payload).toEqual({ name: "winner", loserAborted: true });
+    await main.outbox.stop(a);
   });
 
   it("should use concurrency utils inside behavior actor", async () => {
