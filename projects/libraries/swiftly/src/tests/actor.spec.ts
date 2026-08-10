@@ -91,7 +91,10 @@ idescribe("actor", () => {
       }
 
       get protocolIdentity() {
-        return { workerId: this.workerId, taskId: this.taskId };
+        const init = this.sentMessages.find((message: any) => message?.type === "init");
+        return init
+          ? { workerId: init.workerId, taskId: init.taskId }
+          : { workerId: this.workerId, taskId: this.taskId };
       }
 
       get pendingWorkerRequestCount() {
@@ -1500,13 +1503,17 @@ idescribe("actor", () => {
     (globalThis as any).currentMainTask = behavior;
 
     const first = actor(nextActorName(), behavior, 0);
+    const firstWorker = (globalThis as any).lastMockWorker;
+    await Promise.resolve();
     const firstIdentity = {
-      ...(globalThis as any).lastMockWorker.protocolIdentity,
+      ...firstWorker.protocolIdentity,
     };
 
     const second = actor(nextActorName(), behavior, 0);
+    const secondWorker = (globalThis as any).lastMockWorker;
+    await Promise.resolve();
     const secondIdentity = {
-      ...(globalThis as any).lastMockWorker.protocolIdentity,
+      ...secondWorker.protocolIdentity,
     };
 
     expect(secondIdentity.workerId).not.toBe(firstIdentity.workerId);
