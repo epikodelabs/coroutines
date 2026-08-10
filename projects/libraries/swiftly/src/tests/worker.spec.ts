@@ -333,6 +333,75 @@ idescribe("worker helpers", () => {
       await runner.dispose();
     });
 
+
+
+    it("schedules queued runner work by priority while preserving FIFO ties", async () => {
+      const runner = createTaskRunner<number, number>({
+        name: "priority-runner",
+        main: (value: number) => value,
+        functions: [],
+        generateWorkerScript: () => "runner-worker-script",
+      });
+
+      const active = runner.run(1);
+      await flush();
+      const worker = MockWorker.instances[0];
+
+      const low = runner.run(2, { priority: -1 });
+      const highA = runner.run(3, { priority: 10 });
+      const highB = runner.run(4, { priority: 10 });
+
+      const firstMessage = worker.sentMessages[0];
+      worker.dispatch({ ...firstMessage, type: "response", payload: 1 });
+      await expectAsync(active).toBeResolvedTo(1);
+      await flush();
+
+      expect(worker.sentMessages[1].payload).toBe(3);
+      worker.dispatch({ ...worker.sentMessages[1], type: "response", payload: 3 });
+      await expectAsync(highA).toBeResolvedTo(3);
+      await flush();
+
+      expect(worker.sentMessages[2].payload).toBe(4);
+      worker.dispatch({ ...worker.sentMessages[2], type: "response", payload: 4 });
+      await expectAsync(highB).toBeResolvedTo(4);
+      await flush();
+
+      expect(worker.sentMessages[3].payload).toBe(2);
+      worker.dispatch({ ...worker.sentMessages[3], type: "response", payload: 2 });
+      await expectAsync(low).toBeResolvedTo(2);
+
+      await runner.dispose();
+    });
+
+    it("removes cancelled priority work without disturbing remaining order", async () => {
+      const runner = createTaskRunner<number, number>({
+        name: "priority-cancel-runner",
+        main: (value: number) => value,
+        functions: [],
+        generateWorkerScript: () => "runner-worker-script",
+      });
+
+      const active = runner.run(1);
+      await flush();
+      const worker = MockWorker.instances[0];
+      const controller = new AbortController();
+
+      const cancelled = runner.run(2, { signal: controller.signal, priority: 100 });
+      const next = runner.run(3, { priority: 10 });
+      controller.abort(new Error("cancel priority item"));
+
+      await expectAsync(cancelled).toBeRejectedWithError("cancel priority item");
+      worker.dispatch({ ...worker.sentMessages[0], type: "response", payload: 1 });
+      await expectAsync(active).toBeResolvedTo(1);
+      await flush();
+
+      expect(worker.sentMessages[1].payload).toBe(3);
+      worker.dispatch({ ...worker.sentMessages[1], type: "response", payload: 3 });
+      await expectAsync(next).toBeResolvedTo(3);
+
+      await runner.dispose();
+    });
+
     it("removes cancelled work while it is still queued", async () => {
       const runner = createTaskRunner<number, number>({
         name: "queued-cancellation-runner",
@@ -359,7 +428,69 @@ idescribe("worker helpers", () => {
     });
   });
 
+
+
+    it("rejects non-finite scheduling priorities", async () => {
+      const runner = createTaskRunner<number, number>({
+        name: "priority-validation-runner",
+        main: (value: number) => value,
+        functions: [],
+        generateWorkerScript: () => "runner-worker-script",
+      });
+
+      expect(() => runner.run(1, { priority: Number.POSITIVE_INFINITY }))
+        .toThrowError(/priority must be a finite number/);
+      await runner.dispose();
+    });
+
   describe("createTaskPool", () => {
+
+
+    it("schedules saturated pool waiters by priority and preserves FIFO ties", async () => {
+      Object.defineProperty(navigator, "hardwareConcurrency", {
+        value: 1,
+        configurable: true,
+      });
+
+      const pool = createTaskPool<number, number>({
+        name: "priority-pool",
+        concurrency: 1,
+        maxQueued: 4,
+        main: (value: number) => value,
+        functions: [],
+        generateWorkerScript: () => "worker-script",
+      });
+
+      const active = pool.run(1);
+      await flush();
+      const worker = MockWorker.instances[0];
+
+      const low = pool.run(2, { priority: -1 });
+      const highA = pool.run(3, { priority: 5 });
+      const highB = pool.run(4, { priority: 5 });
+      await flush();
+
+      worker.dispatch({ ...worker.sentMessages[0], type: "response", payload: 1 });
+      await expectAsync(active).toBeResolvedTo(1);
+      await flush();
+
+      expect(worker.sentMessages[1].payload).toBe(3);
+      worker.dispatch({ ...worker.sentMessages[1], type: "response", payload: 3 });
+      await expectAsync(highA).toBeResolvedTo(3);
+      await flush();
+
+      expect(worker.sentMessages[2].payload).toBe(4);
+      worker.dispatch({ ...worker.sentMessages[2], type: "response", payload: 4 });
+      await expectAsync(highB).toBeResolvedTo(4);
+      await flush();
+
+      expect(worker.sentMessages[3].payload).toBe(2);
+      worker.dispatch({ ...worker.sentMessages[3], type: "response", payload: 2 });
+      await expectAsync(low).toBeResolvedTo(2);
+
+      await pool.dispose();
+    });
+
     it("reuses a busy worker for queued runs when max workers is reached", async () => {
       Object.defineProperty(navigator, "hardwareConcurrency", {
         value: 1,

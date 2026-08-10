@@ -23,6 +23,8 @@ type WaitingWorker = {
   resolve: (worker: Worker) => void;
   reject: (error: Error) => void;
   signal?: AbortSignal;
+  priority: number;
+  sequence: number;
   abort?: () => void;
 };
 
@@ -83,6 +85,7 @@ export function createTaskPool<T, R>({
   let resolveClose: (() => void) | null = null;
   let nextWorkerId = 0;
   let hasReleasedBlobUrl = false;
+  let nextWaiterSequence = 0;
 
   const getWorkerScriptUrl = (): string => {
     if (blobUrl) return blobUrl;
@@ -236,9 +239,27 @@ export function createTaskPool<T, R>({
     return worker;
   };
 
+  const takeNextWaiter = (): WaitingWorker | undefined => {
+    if (waitingQueue.length === 0) return undefined;
+
+    let bestIndex = 0;
+    for (let index = 1; index < waitingQueue.length; index++) {
+      const candidate = waitingQueue[index];
+      const best = waitingQueue[bestIndex];
+      if (
+        candidate.priority > best.priority ||
+        (candidate.priority === best.priority && candidate.sequence < best.sequence)
+      ) {
+        bestIndex = index;
+      }
+    }
+
+    return waitingQueue.splice(bestIndex, 1)[0];
+  };
+
   satisfyWaitingQueue = () => {
     while (lifecycle !== "finalizing" && !isFinalized && waitingQueue.length > 0 && createdWorkersCount < maxWorkers) {
-      const waiter = waitingQueue.shift()!;
+      const waiter = takeNextWaiter()!;
       if (waiter.signal?.aborted) {
         waiter.reject(createAbortError(waiter.signal));
         continue;
@@ -262,7 +283,7 @@ export function createTaskPool<T, R>({
     }
   };
 
-  const checkoutWorker = async (signal?: AbortSignal): Promise<Worker> => {
+  const checkoutWorker = async (signal?: AbortSignal, priority = 0): Promise<Worker> => {
     if (signal?.aborted) {
       throw createAbortError(signal);
     }
@@ -300,7 +321,13 @@ export function createTaskPool<T, R>({
     }
 
     return new Promise((resolve, reject) => {
-      const waiter: WaitingWorker = { resolve, reject, signal };
+      const waiter: WaitingWorker = {
+        resolve,
+        reject,
+        signal,
+        priority,
+        sequence: nextWaiterSequence++,
+      };
       if (signal) {
         waiter.abort = () => {
           const index = waitingQueue.indexOf(waiter);
@@ -327,7 +354,7 @@ export function createTaskPool<T, R>({
     }
 
     if (waitingQueue.length > 0) {
-      const waiter = waitingQueue.shift()!;
+      const waiter = takeNextWaiter()!;
       if (waiter.signal && waiter.abort) {
         waiter.signal.removeEventListener("abort", waiter.abort);
       }
@@ -392,7 +419,7 @@ export function createTaskPool<T, R>({
   };
 
   const run = async (value: T, control?: TaskRunControl): Promise<R> => {
-    const { signal, transfer } = normalizeTaskRunControl(control);
+    const { signal, transfer, priority } = normalizeTaskRunControl(control);
 
     if (lifecycle !== "open") {
       throw createRunClosedError();
@@ -400,7 +427,7 @@ export function createTaskPool<T, R>({
 
     admittedRuns += 1;
     try {
-      const worker = await checkoutWorker(signal);
+      const worker = await checkoutWorker(signal, priority);
       try {
         return await submitTask(worker, value, signal, transfer);
       } finally {

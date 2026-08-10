@@ -110,13 +110,17 @@ export function compose<T = any, R = any>(
 
   const run = async (data: T, control?: TaskRunControl): Promise<R> => {
     let result: any = data;
-    const { signal, transfer } = normalizeTaskRunControl(control);
+    const { signal, transfer, priority } = normalizeTaskRunControl(control);
     let transferPending = transfer.length > 0;
 
     if (workerRunner) {
       result = await workerRunner.run(
         result,
-        transferPending ? { signal, transfer } : signal,
+        transferPending
+          ? { signal, transfer, priority }
+          : priority !== 0
+            ? { signal, priority }
+            : signal,
       );
       transferPending = false;
     }
@@ -124,7 +128,11 @@ export function compose<T = any, R = any>(
     for (const runner of taskRunners) {
       result = await runner.run(
         result,
-        transferPending ? { signal, transfer } : signal,
+        transferPending
+          ? { signal, transfer, priority }
+          : priority !== 0
+            ? { signal, priority }
+            : signal,
       );
       transferPending = false;
     }

@@ -331,3 +331,34 @@ it is never reused for later stages after ownership has moved. Transfer between
 stages inside one merged coroutine worker does not cross a worker boundary, so
 intermediate transfer wrappers are unwrapped locally and only a final-stage
 transfer is posted back to the caller.
+
+
+## Priority scheduling
+
+Worker submissions can carry a scheduling priority through the existing run control:
+
+```ts
+const low = work.run(backgroundJob, { priority: -10 });
+const urgent = work.run(userVisibleJob, { priority: 20 });
+```
+
+Higher numeric priorities are selected first **only while work is still waiting**.
+Swiftly never preempts a running JavaScript task. Equal priorities preserve strict
+submission order, so the default `priority: 0` remains FIFO-compatible.
+
+The same rule applies to dedicated coroutine queues, saturated compute-pool
+admission, and composed runners. Cancellation removes queued work without
+reordering the remaining submissions, and graceful `close()` drains admitted
+work using the same scheduler policy.
+
+Priority is deliberately a property of task admission rather than a separate
+scheduler abstraction. The runtime therefore gains scheduling semantics without
+adding another public concurrency object.
+
+## Shared memory
+
+Swiftly does not wrap `SharedArrayBuffer` or `Atomics`. Those platform primitives
+already express shared-memory ownership and atomic coordination directly and can
+be passed as ordinary task data. Swiftly adds abstractions only where it owns
+additional semantics such as scheduling, cancellation, worker lifetime, or
+transfer ownership.

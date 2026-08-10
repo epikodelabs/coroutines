@@ -23,6 +23,8 @@ type QueuedTask<T, R> = {
   reject: (error: Error) => void;
   signal?: AbortSignal;
   transfer: Transferable[];
+  priority: number;
+  sequence: number;
   abort?: () => void;
 };
 
@@ -70,6 +72,7 @@ export function createTaskRunner<T, R>({
   let closePromise: Promise<void> | null = null;
   let resolveClose: (() => void) | null = null;
   let hasReleasedBlobUrl = false;
+  let nextSequence = 0;
 
   const getWorkerScriptUrl = (): string => {
     if (blobUrl) return blobUrl;
@@ -233,16 +236,34 @@ export function createTaskRunner<T, R>({
     resolveClose = null;
   };
 
+  const takeNextTask = (): QueuedTask<T, R> | undefined => {
+    if (queuedTasks.length === 0) return undefined;
+
+    let bestIndex = 0;
+    for (let index = 1; index < queuedTasks.length; index++) {
+      const candidate = queuedTasks[index];
+      const best = queuedTasks[bestIndex];
+      if (
+        candidate.priority > best.priority ||
+        (candidate.priority === best.priority && candidate.sequence < best.sequence)
+      ) {
+        bestIndex = index;
+      }
+    }
+
+    return queuedTasks.splice(bestIndex, 1)[0];
+  };
+
   const drainQueue = async (): Promise<void> => {
     if (isProcessing || lifecycle === "finalizing" || isFinalized) {
       return;
     }
 
-    let nextTask = queuedTasks.shift();
+    let nextTask = takeNextTask();
     while (nextTask?.signal?.aborted) {
-      nextTask.signal.removeEventListener("abort", nextTask.abort!);
+      if (nextTask.abort) nextTask.signal.removeEventListener("abort", nextTask.abort);
       nextTask.reject(createAbortError(nextTask.signal));
-      nextTask = queuedTasks.shift();
+      nextTask = takeNextTask();
     }
     if (!nextTask) {
       finalizeGracefulClose();
@@ -275,7 +296,7 @@ export function createTaskRunner<T, R>({
   };
 
   const run = (value: T, control?: TaskRunControl): Promise<R> => {
-    const { signal, transfer } = normalizeTaskRunControl(control);
+    const { signal, transfer, priority } = normalizeTaskRunControl(control);
     if (lifecycle === "closing") {
       return Promise.reject(new Error(`${name} is closed`));
     }
@@ -287,7 +308,15 @@ export function createTaskRunner<T, R>({
     }
 
     return new Promise<R>((resolve, reject) => {
-      const task: QueuedTask<T, R> = { value, resolve, reject, signal, transfer };
+      const task: QueuedTask<T, R> = {
+        value,
+        resolve,
+        reject,
+        signal,
+        transfer,
+        priority,
+        sequence: nextSequence++,
+      };
 
       if (signal) {
         task.abort = () => {
