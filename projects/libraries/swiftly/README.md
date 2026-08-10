@@ -414,3 +414,44 @@ worker.run(urgentJob, { priority: 20 });
 Priority never preempts JavaScript that is already running. Fairness applies
 only at worker-admission boundaries and is shared by dedicated coroutines and
 compute pools. The rule is deterministic and has no timer dependency.
+
+
+## Structured completion reports
+
+`group()` keeps fail-fast cancellation, but it can now expose the terminal state
+of every owned child without forcing callers back to `Promise.allSettled()`:
+
+```ts
+const work = group();
+
+work.spawn(loadProfile);
+work.spawn(loadPermissions);
+work.spawn(loadPreferences);
+
+const report = await work.settle();
+
+for (const outcome of report.outcomes) {
+  if (outcome.status === "fulfilled") {
+    use(outcome.value);
+  } else if (outcome.status === "rejected") {
+    reportFailure(outcome.error);
+  } else {
+    reportCancellation(outcome.reason);
+  }
+}
+```
+
+Outcomes are ordered by `spawn()` order rather than completion order.
+`rejected` identifies the child that caused group failure; work that terminates
+after the group was already cancelled is reported as `cancelled`.
+
+`settle()` never throws. Its `error` field is the same group-level reason that
+`wait()` throws. Both methods close the group to new children and share one
+stable completion report.
+
+This keeps two distinct completion modes on one ownership primitive:
+
+- `wait()` — enforce structured success/failure.
+- `settle()` — inspect the full structured outcome.
+
+No separate task-collection or `allSettled` abstraction is introduced.

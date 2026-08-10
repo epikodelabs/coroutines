@@ -122,4 +122,100 @@ describe("task group", () => {
       "group concurrency must be a positive integer",
     );
   });
+
+  it("settle reports child outcomes in spawn order without throwing", async () => {
+    const work = group();
+
+    work.spawn(async () => {
+      await pause(5);
+      return "first";
+    });
+    work.spawn(async () => {
+      await pause(1);
+      return "second";
+    });
+
+    const report = await work.settle();
+
+    expect(report.error).toBeUndefined();
+    expect(report.outcomes).toEqual([
+      { status: "fulfilled", value: "first" },
+      { status: "fulfilled", value: "second" },
+    ]);
+    expect(work.running).toBe(0);
+    expect(work.accepting).toBeFalse();
+  });
+
+  it("settle distinguishes the failing child from siblings cancelled by the group", async () => {
+    const work = group();
+
+    work.spawn(
+      (signal) =>
+        new Promise<void>((_resolve, reject) => {
+          signal.addEventListener(
+            "abort",
+            () => reject(signal.reason),
+            { once: true },
+          );
+        }),
+    );
+    work.spawn(async () => {
+      await pause(1);
+      throw new Error("primary failure");
+    });
+
+    const report = await work.settle();
+
+    expect(report.error?.message).toBe("primary failure");
+    expect(report.outcomes[0].status).toBe("cancelled");
+    expect(report.outcomes[1]).toEqual(
+      jasmine.objectContaining({
+        status: "rejected",
+        error: jasmine.objectContaining({ message: "primary failure" }),
+      }),
+    );
+  });
+
+  it("settle reports parent cancellation without turning it into a child failure", async () => {
+    const parent = new AbortController();
+    const work = group({ signal: parent.signal });
+
+    work.spawn(
+      (signal) =>
+        new Promise<void>((_resolve, reject) => {
+          signal.addEventListener(
+            "abort",
+            () => reject(signal.reason),
+            { once: true },
+          );
+        }),
+    );
+
+    parent.abort(new ContextCancelledError("parent stopped"));
+    const report = await work.settle();
+
+    expect(report.error?.message).toBe("parent stopped");
+    expect(report.outcomes).toEqual([
+      jasmine.objectContaining({
+        status: "cancelled",
+        reason: jasmine.objectContaining({ message: "parent stopped" }),
+      }),
+    ]);
+  });
+
+  it("wait and settle share one stable completion report", async () => {
+    const work = group();
+    work.spawn(async () => 42);
+
+    const first = await work.settle();
+    await expectAsync(work.wait()).toBeResolved();
+    const second = await work.settle();
+
+    expect(second).toBe(first);
+    expect(second.outcomes).toEqual([
+      { status: "fulfilled", value: 42 },
+    ]);
+  });
+
+
 });

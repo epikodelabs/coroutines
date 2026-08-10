@@ -17,12 +17,29 @@ export type GroupOptions = {
   signal?: AbortSignal;
 };
 
+/** Terminal outcome of one child, ordered by spawn order in a group report. */
+export type GroupOutcome<T = unknown> =
+  | { readonly status: "fulfilled"; readonly value: T }
+  | { readonly status: "rejected"; readonly error: Error }
+  | { readonly status: "cancelled"; readonly reason: Error };
+
+/**
+ * Non-throwing structured completion report.
+ *
+ * `error` is the group-level reason that `wait()` would throw: the first child
+ * failure, explicit cancellation, or parent cancellation.
+ */
+export interface GroupReport {
+  readonly outcomes: readonly GroupOutcome[];
+  readonly error?: Error;
+}
+
 /**
  * Structured owner for a dynamic set of concurrent operations.
  *
  * A group has fail-fast semantics: the first child failure aborts all siblings.
- * `wait()` closes the group to new children, waits for every started child to
- * settle, and then rethrows the first failure/cancellation reason.
+ * `wait()` and `settle()` both close the group to new children and wait until
+ * every started child has settled.
  */
 export interface TaskGroup {
   /** Signal shared by all children and aborted when the group is cancelled. */
@@ -39,15 +56,20 @@ export interface TaskGroup {
   cancel(reason?: unknown): void;
 
   /**
-   * Closes the group to new work and waits until every started child settles.
-   * Rejects with the first child failure or cancellation reason.
+   * Closes the group and waits until every started child settles.
+   * Rejects with the group-level failure/cancellation reason.
    */
   wait(): Promise<void>;
+
+  /**
+   * Closes the group and waits until every started child settles without
+   * throwing. Outcomes are returned in spawn order.
+   */
+  settle(): Promise<GroupReport>;
 }
 
 type GroupWaiter = {
-  resolve: () => void;
-  reject: (error: Error) => void;
+  resolve: (report: GroupReport) => void;
 };
 
 const normalizeError = (reason: unknown): Error => {
@@ -60,8 +82,8 @@ const normalizeError = (reason: unknown): Error => {
  * Creates a structured task group.
  *
  * This is intentionally different from `Promise.all()`: the group owns child
- * lifetime, propagates cancellation, cancels siblings on failure, and can bound
- * execution without changing the operations themselves.
+ * lifetime, propagates cancellation, cancels siblings on failure, can bound
+ * execution, and can report the terminal state of every owned child.
  */
 export function group(options: GroupOptions = {}): TaskGroup {
   const { concurrency, signal: parentSignal } = options;
@@ -73,21 +95,32 @@ export function group(options: GroupOptions = {}): TaskGroup {
   const controller = new AbortController();
   const gate: Semaphore | undefined = concurrency === undefined ? undefined : semaphore(concurrency);
   const waiters: GroupWaiter[] = [];
+  const outcomes: GroupOutcome[] = [];
 
   let running = 0;
   let accepting = true;
   let firstError: Error | undefined;
+  let finalReport: GroupReport | undefined;
+
+  const groupError = (): Error | undefined =>
+    firstError ??
+    (controller.signal.aborted ? createAbortError(controller.signal) : undefined);
+
+  const createReport = (): GroupReport => {
+    if (finalReport) return finalReport;
+    finalReport = Object.freeze({
+      outcomes: Object.freeze([...outcomes]),
+      error: groupError(),
+    });
+    return finalReport;
+  };
 
   const settleWaiters = (): void => {
     if (running !== 0 || waiters.length === 0) return;
 
+    const report = createReport();
     const settled = waiters.splice(0, waiters.length);
-    const error = firstError ?? (controller.signal.aborted ? createAbortError(controller.signal) : undefined);
-
-    for (const waiter of settled) {
-      if (error) waiter.reject(error);
-      else waiter.resolve();
-    }
+    for (const waiter of settled) waiter.resolve(report);
   };
 
   const cancel = (reason: unknown = new ContextCancelledError("task group cancelled")): void => {
@@ -127,6 +160,9 @@ export function group(options: GroupOptions = {}): TaskGroup {
       return Promise.reject(createAbortError(controller.signal));
     }
 
+    const outcomeIndex = outcomes.length;
+    // Reserve the slot so completion order can never affect report ordering.
+    outcomes.push(undefined as unknown as GroupOutcome);
     running += 1;
 
     const child = (async () => {
@@ -134,15 +170,26 @@ export function group(options: GroupOptions = {}): TaskGroup {
       try {
         if (gate) release = await gate.acquire(controller.signal);
         if (controller.signal.aborted) throw createAbortError(controller.signal);
-        return await operation(controller.signal);
+
+        const value = await operation(controller.signal);
+        outcomes[outcomeIndex] = { status: "fulfilled", value };
+        return value;
       } catch (reason) {
         const error = normalizeError(reason);
-        if (!firstError && !controller.signal.aborted) {
+        const alreadyCancelled = controller.signal.aborted;
+
+        if (!firstError && !alreadyCancelled) {
           firstError = error;
+          outcomes[outcomeIndex] = { status: "rejected", error };
           controller.abort(error);
-        } else if (!firstError && controller.signal.aborted) {
-          firstError = normalizeError(controller.signal.reason ?? error);
+        } else {
+          const cancellationReason = normalizeError(controller.signal.reason ?? error);
+          outcomes[outcomeIndex] = {
+            status: "cancelled",
+            reason: cancellationReason,
+          };
         }
+
         throw error;
       } finally {
         release?.();
@@ -150,26 +197,28 @@ export function group(options: GroupOptions = {}): TaskGroup {
       }
     })();
 
-    // The group owns child failures even when callers choose to observe only wait().
-    // Attaching a rejection observer avoids process-level unhandled-rejection noise
-    // without changing the promise returned to the caller.
+    // The group owns child failures even when callers choose to observe only
+    // wait()/settle(). The returned promise still preserves the child result.
     void child.catch(() => undefined);
     return child;
   };
 
-  const wait = (): Promise<void> => {
+  const settle = (): Promise<GroupReport> => {
     accepting = false;
 
     if (running === 0) {
       detachParent();
-      if (firstError) return Promise.reject(firstError);
-      if (controller.signal.aborted) return Promise.reject(createAbortError(controller.signal));
-      return Promise.resolve();
+      return Promise.resolve(createReport());
     }
 
-    return new Promise<void>((resolve, reject) => {
-      waiters.push({ resolve, reject });
+    return new Promise<GroupReport>((resolve) => {
+      waiters.push({ resolve });
     });
+  };
+
+  const wait = async (): Promise<void> => {
+    const report = await settle();
+    if (report.error) throw report.error;
   };
 
   return {
@@ -185,5 +234,6 @@ export function group(options: GroupOptions = {}): TaskGroup {
     spawn,
     cancel,
     wait,
+    settle,
   };
 }
