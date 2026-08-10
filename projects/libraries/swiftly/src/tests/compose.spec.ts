@@ -269,4 +269,99 @@ describe("compose coroutines", () => {
     await second.dispose();
   });
 
+
+  it("close drains the entire admitted pipeline before closing any stage", async () => {
+    const lifecycle: string[] = [];
+    let releaseFirst!: () => void;
+    const firstGate = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+
+    const first = {
+      run: async (value: number) => {
+        lifecycle.push("run:first");
+        await firstGate;
+        return value + 1;
+      },
+      close: async () => {
+        lifecycle.push("close:first");
+      },
+      dispose: async () => {
+        lifecycle.push("dispose:first");
+      },
+    };
+    const second = {
+      run: async (value: number) => {
+        lifecycle.push("run:second");
+        return value * 2;
+      },
+      close: async () => {
+        lifecycle.push("close:second");
+      },
+      dispose: async () => {
+        lifecycle.push("dispose:second");
+      },
+    };
+
+    const composed = compose(first, second);
+    const admitted = composed.run(2);
+    await Promise.resolve();
+
+    const closing = composed.close();
+
+    await expectAsync(composed.run(3)).toBeRejectedWithError("compose is closed");
+    expect(lifecycle).toEqual(["run:first"]);
+
+    releaseFirst();
+
+    await expectAsync(admitted).toBeResolvedTo(6);
+    await expectAsync(closing).toBeResolved();
+    expect(lifecycle).toEqual([
+      "run:first",
+      "run:second",
+      "close:first",
+      "close:second",
+    ]);
+  });
+
+  it("dispose settles a concurrent graceful close and rejects unfinished pipeline work", async () => {
+    let rejectActive!: (error: Error) => void;
+    const lifecycle: string[] = [];
+
+    const first = {
+      run: () =>
+        new Promise<number>((_resolve, reject) => {
+          rejectActive = reject;
+        }),
+      close: async () => {
+        lifecycle.push("close:first");
+      },
+      dispose: async () => {
+        lifecycle.push("dispose:first");
+        rejectActive(new Error("disposed active pipeline"));
+      },
+    };
+    const second = {
+      run: async (value: number) => value,
+      close: async () => {
+        lifecycle.push("close:second");
+      },
+      dispose: async () => {
+        lifecycle.push("dispose:second");
+      },
+    };
+
+    const composed = compose(first, second);
+    const active = composed.run(1);
+    active.catch(() => undefined);
+
+    const closing = composed.close();
+    await composed.dispose();
+
+    await expectAsync(active).toBeRejectedWithError("disposed active pipeline");
+    await expectAsync(closing).toBeResolved();
+    expect(lifecycle).toEqual(["dispose:first", "dispose:second"]);
+  });
+
+
 });

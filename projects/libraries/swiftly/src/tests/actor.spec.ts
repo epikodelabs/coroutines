@@ -194,6 +194,11 @@ idescribe("actor", () => {
       }
 
       postMessage(msg: any) {
+        const injectedError = (globalThis as any).actorPostMessageError;
+        if (injectedError) {
+          throw injectedError;
+        }
+
         setTimeout(() => {
           if (this.terminated) return;
 
@@ -293,10 +298,12 @@ idescribe("actor", () => {
     console.warn = _originalWarn;
     delete (globalThis as any).currentMainTask;
     delete (globalThis as any).lastMockWorker;
+    delete (globalThis as any).actorPostMessageError;
   });
 
   beforeEach(() => {
     (globalThis as any).currentMainTask = undefined;
+    delete (globalThis as any).actorPostMessageError;
     actorCounter = 0;
     main.inbox.clear();
   });
@@ -307,6 +314,95 @@ idescribe("actor", () => {
     );
   });
 
+
+
+  it("cleans up actor construction when the init transport fails synchronously", () => {
+    async function behavior(_msg: any, state: number) {
+      return state;
+    }
+
+    (globalThis as any).currentMainTask = behavior;
+    (globalThis as any).actorPostMessageError = new Error("init transport failed");
+
+    expect(() =>
+      actor(nextActorName(), behavior, 0)
+    ).toThrowError("init transport failed");
+
+    expect((globalThis as any).lastMockWorker.terminated).toBeTrue();
+  });
+
+  it("marks an actor failed when a request cannot be posted to its worker", async () => {
+    async function behavior(_msg: any, state: number) {
+      return state;
+    }
+
+    (globalThis as any).currentMainTask = behavior;
+    const a = actor(nextActorName(), behavior, 0);
+
+    (globalThis as any).actorPostMessageError = new Error("request transport failed");
+    const pending = main.outbox.request(a, "state", undefined);
+
+    await expectAsync(pending).toBeRejectedWithError("request transport failed");
+    const exit = await a.done;
+    expect(exit.reason).toBe("error");
+    if (exit.reason === "error") {
+      expect(exit.error.message).toBe("request transport failed");
+    }
+    expect(a.running).toBeFalse();
+  });
+
+  it("continues one-way bus delivery when one recipient transport fails", async () => {
+    const received: string[] = [];
+
+    async function behavior(msg: any, state: number, utils: any) {
+      if (msg.kind === "actor-bus") {
+        utils.outbox.send("main", "seen", msg.payload);
+      }
+      return state;
+    }
+
+    (globalThis as any).currentMainTask = behavior;
+    const first = actor(nextActorName(), behavior, 0);
+    const firstWorker = (globalThis as any).lastMockWorker;
+    const second = actor(nextActorName(), behavior, 0);
+
+    const originalPost = firstWorker.postMessage.bind(firstWorker);
+    firstWorker.postMessage = (msg: any) => {
+      if (msg.type === "notify") throw new Error("first recipient failed");
+      return originalPost(msg);
+    };
+
+    const seen$ = waitForMainMessage(
+      (message) => message.to === "main" && message.topic === "seen" && message.payload === "broadcast",
+    );
+
+    main.outbox.publish("work", "broadcast");
+    const seen = await seen$;
+
+    expect(seen.payload).toBe("broadcast");
+    await main.outbox.stop(second);
+  });
+
+  it("preserves stable name routing across supervisor restart construction", async () => {
+    async function behavior(msg: any, state: number) {
+      return msg === "state" ? state : state;
+    }
+
+    (globalThis as any).currentMainTask = behavior;
+    const name = nextActorName();
+    const supervised = supervisor(
+      () => actor(name, behavior, 7),
+      { maxRestarts: 1 },
+    );
+
+    (globalThis as any).lastMockWorker.emitError(new Error("restart generation"));
+    await pause(25);
+
+    expect(supervised.running).toBeTrue();
+    expect(await main.outbox.request(name, "state", "state")).toBe(7);
+
+    await main.outbox.stop(name);
+  });
 
   it("should validate bounded actor mailbox capacity", () => {
     async function behavior(_msg: any, state: number) {

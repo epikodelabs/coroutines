@@ -108,84 +108,165 @@ export function compose<T = any, R = any>(
     });
   }
 
-  const run = async (data: T, control?: TaskRunControl): Promise<R> => {
-    let result: any = data;
-    const { signal, transfer, priority } = normalizeTaskRunControl(control);
-    let transferPending = transfer.length > 0;
+  let lifecycle: "open" | "closing" | "finalizing" | "finalized" = "open";
+  let activeRuns = 0;
+  let gracefulCloseStarted = false;
+  let closePromise: Promise<void> | null = null;
+  let resolveClose: (() => void) | null = null;
+  let rejectClose: ((error: Error) => void) | null = null;
+  let disposePromise: Promise<void> | null = null;
 
-    if (workerRunner) {
-      result = await workerRunner.run(
-        result,
-        transferPending
-          ? { signal, transfer, priority }
-          : priority !== 0
-            ? { signal, priority }
-            : signal,
-      );
-      transferPending = false;
-    }
+  const ownedRunners = (): TaskRunner<any, any>[] => [
+    ...(workerRunner ? [workerRunner] : []),
+    ...taskRunners,
+  ];
 
-    for (const runner of taskRunners) {
-      result = await runner.run(
-        result,
-        transferPending
-          ? { signal, transfer, priority }
-          : priority !== 0
-            ? { signal, priority }
-            : signal,
-      );
-      transferPending = false;
-    }
-
-    return result;
-  };
-
-  const close = async (): Promise<void> => {
+  const closeOwnedRunners = async (): Promise<void> => {
     const errors: Error[] = [];
 
-    if (workerRunner) {
-      try {
-        await workerRunner.close();
-      } catch (e) {
-        errors.push(e instanceof Error ? e : new Error(String(e)));
-      }
-    }
-
-    for (const runner of taskRunners) {
+    for (const runner of ownedRunners()) {
       try {
         await runner.close();
-      } catch (e) {
-        errors.push(e instanceof Error ? e : new Error(String(e)));
+      } catch (error) {
+        errors.push(error instanceof Error ? error : new Error(String(error)));
       }
     }
 
-    if (errors.length > 0) {
-      throw errors[0];
+    if (errors.length > 0) throw errors[0];
+  };
+
+  const disposeOwnedRunners = async (): Promise<void> => {
+    const errors: Error[] = [];
+
+    for (const runner of ownedRunners()) {
+      try {
+        await runner.dispose();
+      } catch (error) {
+        errors.push(error instanceof Error ? error : new Error(String(error)));
+      }
+    }
+
+    if (errors.length > 0) throw errors[0];
+  };
+
+  const ensureClosePromise = (): Promise<void> => {
+    if (closePromise) return closePromise;
+
+    closePromise = new Promise<void>((resolve, reject) => {
+      resolveClose = resolve;
+      rejectClose = reject;
+    });
+    return closePromise;
+  };
+
+  const settleLifecycle = (error?: Error): void => {
+    lifecycle = "finalized";
+    if (error) rejectClose?.(error);
+    else resolveClose?.();
+    resolveClose = null;
+    rejectClose = null;
+  };
+
+  const maybeStartGracefulClose = (): void => {
+    if (
+      lifecycle !== "closing" ||
+      activeRuns !== 0 ||
+      gracefulCloseStarted
+    ) {
+      return;
+    }
+
+    gracefulCloseStarted = true;
+    void closeOwnedRunners().then(
+      () => settleLifecycle(),
+      (error) =>
+        settleLifecycle(
+          error instanceof Error ? error : new Error(String(error)),
+        ),
+    );
+  };
+
+  const run = async (data: T, control?: TaskRunControl): Promise<R> => {
+    if (lifecycle !== "open") {
+      throw new Error("compose is closed");
+    }
+
+    activeRuns += 1;
+    try {
+      let result: any = data;
+      const { signal, transfer, priority } = normalizeTaskRunControl(control);
+      let transferPending = transfer.length > 0;
+
+      if (workerRunner) {
+        result = await workerRunner.run(
+          result,
+          transferPending
+            ? { signal, transfer, priority }
+            : priority !== 0
+              ? { signal, priority }
+              : signal,
+        );
+        transferPending = false;
+      }
+
+      for (const runner of taskRunners) {
+        result = await runner.run(
+          result,
+          transferPending
+            ? { signal, transfer, priority }
+            : priority !== 0
+              ? { signal, priority }
+              : signal,
+        );
+        transferPending = false;
+      }
+
+      return result;
+    } finally {
+      activeRuns = Math.max(0, activeRuns - 1);
+      maybeStartGracefulClose();
     }
   };
 
-  const dispose = async (): Promise<void> => {
-    const errors: Error[] = [];
-
-    if (workerRunner) {
-      try {
-        await workerRunner.dispose();
-      } catch (e) {
-        errors.push(e instanceof Error ? e : new Error(String(e)));
-      }
+  const close = (): Promise<void> => {
+    if (lifecycle === "finalized") {
+      return closePromise ?? Promise.resolve();
+    }
+    if (lifecycle === "finalizing") {
+      return ensureClosePromise();
     }
 
-    for (const runner of taskRunners) {
-      try {
-        await runner.dispose();
-      } catch (e) {
-        errors.push(e instanceof Error ? e : new Error(String(e)));
-      }
+    if (lifecycle === "open") {
+      lifecycle = "closing";
     }
 
-    if (errors.length > 0) {
-      throw errors[0];
+    const pendingClose = ensureClosePromise();
+    maybeStartGracefulClose();
+    return pendingClose;
+  };
+
+  const dispose = (): Promise<void> => {
+    if (disposePromise) return disposePromise;
+    if (lifecycle === "finalized") {
+      return Promise.resolve();
     }
+
+    lifecycle = "finalizing";
+    ensureClosePromise();
+
+    disposePromise = disposeOwnedRunners().then(
+      () => {
+        settleLifecycle();
+      },
+      (error) => {
+        const normalized =
+          error instanceof Error ? error : new Error(String(error));
+        settleLifecycle(normalized);
+        throw normalized;
+      },
+    );
+
+    return disposePromise;
   };
 
   return {

@@ -188,7 +188,8 @@ export interface ActorBus {
     <T = any>(name: string, handler: ActorBusHandler<T>): () => void;
   };
   /**
-   * Clears all actor registrations and listeners from the integrated bus.
+   * Clears bus listeners and main-thread request handlers.
+   * Live actor registrations remain intact.
    */
   clear: () => void;
 }
@@ -1205,7 +1206,13 @@ function createActor<S = any, Q = any, D = any, FromMain = any>(
     resolveDone(requestedExit);
   };
 
-  worker = new Worker(blobUrl, { type: "module" });
+  try {
+    worker = new Worker(blobUrl, { type: "module" });
+  } catch (error) {
+    releaseBlobUrl(workerScript);
+    throw error;
+  }
+
   (worker as any).__id = actorWorkerId;
   running = true;
 
@@ -1256,7 +1263,7 @@ function createActor<S = any, Q = any, D = any, FromMain = any>(
     }
 
     running = false;
-    rejectPendingRequests();
+    rejectPendingRequests(exit.reason === "error" ? exit.error : ACTOR_STOPPED_ERROR_MESSAGE);
     unregisterActorBusTarget(actorRef);
 
     const activeWorker = worker;
@@ -1367,16 +1374,6 @@ function createActor<S = any, Q = any, D = any, FromMain = any>(
     void shutdown(true, { reason: "error", error });
   };
 
-  worker.addEventListener("message", handleMessage);
-  worker.addEventListener("error", handleError);
-
-  postToWorker(worker, {
-    taskId: actorTaskId,
-    payload: initialState,
-    mailboxCapacity: capacity,
-    type: "init",
-  });
-
   const actor: Actor = {
     name,
 
@@ -1396,6 +1393,28 @@ function createActor<S = any, Q = any, D = any, FromMain = any>(
   };
 
   actorRef = actor;
+
+  worker.addEventListener("message", handleMessage);
+  worker.addEventListener("error", handleError);
+
+  try {
+    postToWorker(worker, {
+      taskId: actorTaskId,
+      payload: initialState,
+      mailboxCapacity: capacity,
+      type: "init",
+    });
+  } catch (error) {
+    worker.removeEventListener("message", handleMessage);
+    worker.removeEventListener("error", handleError);
+    worker.terminate();
+    worker = null;
+    running = false;
+    hasReleasedBlobUrl = true;
+    releaseBlobUrl(workerScript);
+    throw error;
+  }
+
   registerActorBusTarget(name, actorRef);
 
   const internals = {
@@ -1407,11 +1426,18 @@ function createActor<S = any, Q = any, D = any, FromMain = any>(
         console.warn("Actor is not running; message dropped");
         return;
       }
-      postToWorker(worker, {
-        taskId: actorTaskId,
-        payload: msg,
-        type: "notify",
-      });
+
+      try {
+        postToWorker(worker, {
+          taskId: actorTaskId,
+          payload: msg,
+          type: "notify",
+        });
+      } catch (reason) {
+        const error = reason instanceof Error ? reason : new Error(String(reason));
+        void shutdown(true, { reason: "error", error });
+        throw error;
+      }
     },
 
     request(topic: string, msg: FromMain, signal?: AbortSignal): Promise<S> {
@@ -1444,10 +1470,12 @@ function createActor<S = any, Q = any, D = any, FromMain = any>(
             type: "request",
             topic,
           });
-        } catch (error) {
+        } catch (reason) {
           pendingRequests.delete(id);
           cleanup();
-          reject(error instanceof Error ? error : new Error(String(error)));
+          const error = reason instanceof Error ? reason : new Error(String(reason));
+          reject(error);
+          void shutdown(true, { reason: "error", error });
         }
       });
     },
@@ -1498,7 +1526,11 @@ const warnAsyncActorBusFailure = (scope: string, error: unknown) => {
 };
 
 function deliverActorBusMessage(actor: Actor, message: ActorBusMessage) {
-  actorInternalsMap.get(actor)?.post(message);
+  try {
+    actorInternalsMap.get(actor)?.post(message);
+  } catch (error) {
+    warnAsyncActorBusFailure("Actor bus delivery", error);
+  }
 }
 
 function notifyActorBusSubscribers(message: ActorBusMessage) {
@@ -1749,12 +1781,26 @@ export function supervisor(
 
       if (stopping || settled) return;
 
+      // The stable supervisor owns the public name between generations.
+      // `actor(name, ...)` also registers during construction, so temporarily
+      // release that registration while the replacement is created. The
+      // factory is synchronous, making this hand-off atomic with respect to
+      // ordinary main-thread message dispatch.
+      unregisterActorBusTarget(handle);
+
       try {
         const next = factory();
         bindCurrent(next);
         return;
       } catch (error) {
         lastError = error instanceof Error ? error : new Error(String(error));
+
+        if (!stopping && !settled) {
+          // A failed construction must not make the supervisor disappear from
+          // name-based routing while another restart attempt is still allowed.
+          unregisterActorBusTarget(first.name);
+          registerActorBusTarget(first.name, handle);
+        }
       }
     }
   };

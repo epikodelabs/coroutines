@@ -469,3 +469,17 @@ Swiftly treats cancellation cleanup as part of the concurrency contract:
 
 These rules do not add new primitives; they tighten the lifecycle guarantees of
 the existing model.
+
+
+## Pipeline lifecycle ownership
+
+`compose()` is itself a graceful-lifecycle boundary. Once `close()` begins it
+rejects new pipeline runs, but a run already admitted is allowed to traverse
+**every** composed stage before any owned runner is closed.
+
+This matters when a pipeline is between stages: closing stage 2 while an admitted
+run is still finishing stage 1 would violate the same drain guarantee provided
+by `coroutine()` and `compute()`.
+
+`dispose()` remains immediate and can override a concurrent graceful close;
+the close promise is settled by that teardown rather than being left pending.
