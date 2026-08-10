@@ -3,6 +3,7 @@ import type { PendingTaskMap, WorkerProtocolMessage } from "./messages";
 import { createDefaultMessageHandler } from "./messages";
 import type { TaskRunner } from "./types";
 import { generateTaskId } from "./utils";
+import { createAbortError } from "../utils/context";
 
 /**
  * Shared worker-script configuration for task runners.
@@ -18,6 +19,8 @@ type QueuedTask<T, R> = {
   value: T;
   resolve: (value: R) => void;
   reject: (error: Error) => void;
+  signal?: AbortSignal;
+  abort?: () => void;
 };
 
 type TaskRunnerOptions = {
@@ -125,15 +128,55 @@ export function createTaskRunner<T, R>({
     return nextWorker;
   };
 
-  const submitTask = (worker: Worker, data: T): Promise<R> => {
+  const submitTask = (targetWorker: Worker, data: T, signal?: AbortSignal): Promise<R> => {
+    if (signal?.aborted) {
+      return Promise.reject(createAbortError(signal));
+    }
+
     const taskId = generateTaskId() || runnerTaskId;
     return new Promise<R>((resolve, reject) => {
-      pendingMessages.set(taskId, { workerId: runnerWorkerId, resolve, reject });
+      let settled = false;
+
+      const cleanupAbort = () => signal?.removeEventListener("abort", onAbort);
+      const finishResolve = (value: R) => {
+        if (settled) return;
+        settled = true;
+        cleanupAbort();
+        resolve(value);
+      };
+      const finishReject = (error: Error) => {
+        if (settled) return;
+        settled = true;
+        cleanupAbort();
+        reject(error);
+      };
+      const onAbort = () => {
+        if (settled) return;
+        pendingMessages.delete(taskId);
+
+        if (worker === targetWorker) {
+          detachWorker(targetWorker);
+          targetWorker.terminate();
+          worker = null;
+          workerMessageHandler = null;
+          workerErrorHandler = null;
+        }
+
+        finishReject(createAbortError(signal));
+      };
+
+      pendingMessages.set(taskId, {
+        workerId: runnerWorkerId,
+        resolve: finishResolve,
+        reject: finishReject,
+      });
+      signal?.addEventListener("abort", onAbort, { once: true });
+
       try {
-        worker.postMessage({ workerId: runnerWorkerId, taskId, payload: data, type: "task" });
+        targetWorker.postMessage({ workerId: runnerWorkerId, taskId, payload: data, type: "task" });
       } catch (error) {
         pendingMessages.delete(taskId);
-        reject(toError(error));
+        finishReject(toError(error));
       }
     });
   };
@@ -143,16 +186,26 @@ export function createTaskRunner<T, R>({
       return;
     }
 
-    const nextTask = queuedTasks.shift();
+    let nextTask = queuedTasks.shift();
+    while (nextTask?.signal?.aborted) {
+      nextTask.signal.removeEventListener("abort", nextTask.abort!);
+      nextTask.reject(createAbortError(nextTask.signal));
+      nextTask = queuedTasks.shift();
+    }
     if (!nextTask) {
       return;
+    }
+
+    if (nextTask.signal && nextTask.abort) {
+      nextTask.signal.removeEventListener("abort", nextTask.abort);
+      nextTask.abort = undefined;
     }
 
     isProcessing = true;
 
     try {
       const activeWorker = getWorker();
-      const result = await submitTask(activeWorker, nextTask.value);
+      const result = await submitTask(activeWorker, nextTask.value, nextTask.signal);
       nextTask.resolve(result);
     } catch (error) {
       nextTask.reject(toError(error));
@@ -164,13 +217,29 @@ export function createTaskRunner<T, R>({
     }
   };
 
-  const run = (value: T): Promise<R> => {
+  const run = (value: T, signal?: AbortSignal): Promise<R> => {
     if (isFinalizing) {
       return Promise.reject(new Error(`${name} finalized before a worker became available`));
     }
+    if (signal?.aborted) {
+      return Promise.reject(createAbortError(signal));
+    }
 
     return new Promise<R>((resolve, reject) => {
-      queuedTasks.push({ value, resolve, reject });
+      const task: QueuedTask<T, R> = { value, resolve, reject, signal };
+
+      if (signal) {
+        task.abort = () => {
+          const index = queuedTasks.indexOf(task);
+          if (index < 0) return;
+          queuedTasks.splice(index, 1);
+          signal.removeEventListener("abort", task.abort!);
+          reject(createAbortError(signal));
+        };
+        signal.addEventListener("abort", task.abort, { once: true });
+      }
+
+      queuedTasks.push(task);
       void drainQueue();
     });
   };
@@ -183,9 +252,9 @@ export function createTaskRunner<T, R>({
     isFinalizing = true;
 
     while (queuedTasks.length > 0) {
-      queuedTasks.shift()!.reject(
-        new Error(`${name} finalized before a worker became available`)
-      );
+      const task = queuedTasks.shift()!;
+      if (task.signal && task.abort) task.signal.removeEventListener("abort", task.abort);
+      task.reject(new Error(`${name} finalized before a worker became available`));
     }
 
     pendingMessages.forEach(({ reject }) => {

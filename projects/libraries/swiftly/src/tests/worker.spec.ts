@@ -207,6 +207,60 @@ idescribe("worker helpers", () => {
       await expectAsync(queuedRun).toBeResolvedTo(20);
       await runner.dispose();
     });
+
+    it("cancels an active task, terminates its worker, and continues queued work", async () => {
+      const runner = createTaskRunner<number, number>({
+        name: "cancellable-runner",
+        main: (value: number) => value,
+        functions: [],
+        generateWorkerScript: () => "runner-worker-script",
+      });
+
+      const controller = new AbortController();
+      const cancelled = runner.run(1, controller.signal);
+      const queued = runner.run(2);
+      await flush();
+
+      const firstWorker = MockWorker.instances[0];
+      controller.abort(new Error("cancel active"));
+
+      await expectAsync(cancelled).toBeRejectedWithError("cancel active");
+      await flush();
+      expect(firstWorker.terminated).toBeTrue();
+      expect(MockWorker.instances.length).toBe(2);
+
+      const replacement = MockWorker.instances[1];
+      const message = replacement.sentMessages[0];
+      replacement.dispatch({ ...message, type: "response", payload: 22 });
+      await expectAsync(queued).toBeResolvedTo(22);
+
+      await runner.dispose();
+    });
+
+    it("removes cancelled work while it is still queued", async () => {
+      const runner = createTaskRunner<number, number>({
+        name: "queued-cancellation-runner",
+        main: (value: number) => value,
+        functions: [],
+        generateWorkerScript: () => "runner-worker-script",
+      });
+
+      const active = runner.run(1);
+      await flush();
+      const controller = new AbortController();
+      const queued = runner.run(2, controller.signal);
+      controller.abort(new Error("cancel queued"));
+
+      await expectAsync(queued).toBeRejectedWithError("cancel queued");
+
+      const worker = MockWorker.instances[0];
+      const message = worker.sentMessages[0];
+      worker.dispatch({ ...message, type: "response", payload: 11 });
+      await expectAsync(active).toBeResolvedTo(11);
+      expect(worker.sentMessages.length).toBe(1);
+
+      await runner.dispose();
+    });
   });
 
   describe("createTaskPool", () => {
@@ -396,6 +450,40 @@ idescribe("worker helpers", () => {
       expect(createMessageHandler).toHaveBeenCalled();
 
       await pool.dispose();
+      await pool.dispose();
+    });
+
+    it("cancels active pooled work without poisoning queued submissions", async () => {
+      Object.defineProperty(navigator, "hardwareConcurrency", {
+        value: 1,
+        configurable: true,
+      });
+
+      const pool = createTaskPool<number, number>({
+        name: "cancellable-pool",
+        main: (value: number) => value,
+        functions: [],
+        generateWorkerScript: () => "worker-script",
+      });
+
+      const controller = new AbortController();
+      const cancelled = pool.run(1, controller.signal);
+      await flush();
+      const queued = pool.run(2);
+      const failedWorker = MockWorker.instances[0];
+
+      controller.abort(new Error("cancel pooled task"));
+      await expectAsync(cancelled).toBeRejectedWithError("cancel pooled task");
+      await flush();
+
+      expect(failedWorker.terminated).toBeTrue();
+      expect(MockWorker.instances.length).toBe(2);
+
+      const replacement = MockWorker.instances[1];
+      const message = replacement.sentMessages[0];
+      replacement.dispatch({ ...message, type: "response", payload: 200 });
+      await expectAsync(queued).toBeResolvedTo(200);
+
       await pool.dispose();
     });
   });

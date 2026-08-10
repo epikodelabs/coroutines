@@ -137,4 +137,30 @@ describe("compose coroutines", () => {
     await expectAsync(composed.dispose()).toBeRejectedWithError("boom");
     expect(finalized).toEqual(["c1", "c2"]);
   });
+
+  it("forwards cancellation to every runner stage", async () => {
+    const seenSignals: AbortSignal[] = [];
+    const first = {
+      run: async (value: number, signal?: AbortSignal) => {
+        if (signal) seenSignals.push(signal);
+        return value + 1;
+      },
+      dispose: async () => undefined,
+    };
+    const second = {
+      run: async (value: number, signal?: AbortSignal) => {
+        if (signal) seenSignals.push(signal);
+        return value * 2;
+      },
+      dispose: async () => undefined,
+    };
+
+    const controller = new AbortController();
+    const composed = compose(first, second);
+    await expectAsync(composed.run(3, controller.signal)).toBeResolvedTo(8);
+
+    expect(seenSignals).toEqual([controller.signal, controller.signal]);
+    await composed.dispose();
+  });
+
 });

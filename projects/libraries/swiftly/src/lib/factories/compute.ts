@@ -8,7 +8,7 @@ import type { CoroutineScript } from "../worker/types";
  */
 export interface ComputeRunner<T = any, R = any> {
   /** Submits input to the compute pool and resolves with the worker result. */
-  (params: T): Promise<R>;
+  (params: T, signal?: AbortSignal): Promise<R>;
   /** Terminates all workers in the pool and rejects queued work. */
   dispose: () => Promise<void>;
 }
@@ -48,8 +48,8 @@ export function compute<T = any, R = any>(
       }),
   });
 
-  const run = async (params: T): Promise<R> => {
-    return pool.run(params);
+  const run = async (params: T, signal?: AbortSignal): Promise<R> => {
+    return pool.run(params, signal);
   };
 
   run.dispose = () => pool.dispose();
@@ -79,8 +79,8 @@ export function computeScript<T = any, R = any>(
       }),
   });
 
-  const run = async (params: T): Promise<R> => {
-    return pool.run(params);
+  const run = async (params: T, signal?: AbortSignal): Promise<R> => {
+    return pool.run(params, signal);
   };
 
   run.dispose = () => pool.dispose();

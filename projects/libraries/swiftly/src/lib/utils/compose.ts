@@ -102,15 +102,15 @@ export function compose<T = any, R = any>(
     });
   }
 
-  const run = async (data: T): Promise<R> => {
+  const run = async (data: T, signal?: AbortSignal): Promise<R> => {
     let result: any = data;
 
     if (workerRunner) {
-      result = await workerRunner.run(result);
+      result = await workerRunner.run(result, signal);
     }
 
     for (const runner of taskRunners) {
-      result = await runner.run(result);
+      result = await runner.run(result, signal);
     }
 
     return result;

@@ -18,7 +18,7 @@ export interface CoroutineScript<T = any, R = any> {
  */
 export interface TaskRunner<T = any, R = any> {
   /** Submits one value for worker-side processing. */
-  run: (data: T) => Promise<R>;
+  run: (data: T, signal?: AbortSignal) => Promise<R>;
   /** Terminates the underlying worker resources. */
   dispose: () => Promise<void>;
 }

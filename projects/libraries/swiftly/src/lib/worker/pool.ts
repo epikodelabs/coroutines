@@ -4,6 +4,7 @@ import { createDefaultMessageHandler } from "./messages";
 import type { WorkerScriptConfig } from "./runner";
 import type { TaskRunner } from "./types";
 import { generateTaskId } from "./utils";
+import { createAbortError } from "../utils/context";
 
 type PoolOptions = {
   name: string;
@@ -17,6 +18,8 @@ type PoolOptions = {
 type WaitingWorker = {
   resolve: (worker: Worker) => void;
   reject: (error: Error) => void;
+  signal?: AbortSignal;
+  abort?: () => void;
 };
 
 const toError = (error: unknown, fallback: string): Error =>
@@ -151,6 +154,13 @@ export function createTaskPool<T, R>({
   satisfyWaitingQueue = () => {
     while (!isFinalizing && waitingQueue.length > 0 && createdWorkersCount < maxWorkers) {
       const waiter = waitingQueue.shift()!;
+      if (waiter.signal?.aborted) {
+        waiter.reject(createAbortError(waiter.signal));
+        continue;
+      }
+      if (waiter.signal && waiter.abort) {
+        waiter.signal.removeEventListener("abort", waiter.abort);
+      }
       createdWorkersCount++;
       void createWorker().then(waiter.resolve, (error) => {
         createdWorkersCount--;
@@ -160,7 +170,10 @@ export function createTaskPool<T, R>({
     }
   };
 
-  const checkoutWorker = async (): Promise<Worker> => {
+  const checkoutWorker = async (signal?: AbortSignal): Promise<Worker> => {
+    if (signal?.aborted) {
+      throw createAbortError(signal);
+    }
     if (isFinalizing) {
       throw new Error(`${name} is finalizing`);
     }
@@ -179,7 +192,20 @@ export function createTaskPool<T, R>({
       }
     }
 
-    return new Promise((resolve, reject) => waitingQueue.push({ resolve, reject }));
+    return new Promise((resolve, reject) => {
+      const waiter: WaitingWorker = { resolve, reject, signal };
+      if (signal) {
+        waiter.abort = () => {
+          const index = waitingQueue.indexOf(waiter);
+          if (index < 0) return;
+          waitingQueue.splice(index, 1);
+          signal.removeEventListener("abort", waiter.abort!);
+          reject(createAbortError(signal));
+        };
+        signal.addEventListener("abort", waiter.abort, { once: true });
+      }
+      waitingQueue.push(waiter);
+    });
   };
 
   const checkinWorker = (worker: Worker): void => {
@@ -194,14 +220,22 @@ export function createTaskPool<T, R>({
     }
 
     if (waitingQueue.length > 0) {
-      waitingQueue.shift()!.resolve(worker);
+      const waiter = waitingQueue.shift()!;
+      if (waiter.signal && waiter.abort) {
+        waiter.signal.removeEventListener("abort", waiter.abort);
+      }
+      waiter.resolve(worker);
       return;
     }
 
     idleWorkers.push(worker);
   };
 
-  const submitTask = (worker: Worker, data: T): Promise<R> => {
+  const submitTask = (worker: Worker, data: T, signal?: AbortSignal): Promise<R> => {
+    if (signal?.aborted) {
+      return Promise.reject(createAbortError(signal));
+    }
+
     const workerId = getWorkerId(worker);
     if (workerId === undefined || !activeWorkers.has(workerId)) {
       throw new Error("Worker not found or is not active");
@@ -209,20 +243,43 @@ export function createTaskPool<T, R>({
 
     const taskId = generateTaskId();
     return new Promise<R>((resolve, reject) => {
-      pendingMessages.set(taskId, { workerId, resolve, reject });
+      let settled = false;
+      const cleanupAbort = () => signal?.removeEventListener("abort", onAbort);
+      const finishResolve = (value: R) => {
+        if (settled) return;
+        settled = true;
+        cleanupAbort();
+        resolve(value);
+      };
+      const finishReject = (error: Error) => {
+        if (settled) return;
+        settled = true;
+        cleanupAbort();
+        reject(error);
+      };
+      const onAbort = () => {
+        if (settled) return;
+        pendingMessages.delete(taskId);
+        const error = createAbortError(signal);
+        finishReject(error);
+        retireWorker(worker);
+      };
+
+      pendingMessages.set(taskId, { workerId, resolve: finishResolve, reject: finishReject });
+      signal?.addEventListener("abort", onAbort, { once: true });
       try {
         worker.postMessage({ workerId, taskId, payload: data, type: "task" });
       } catch (error) {
         pendingMessages.delete(taskId);
-        reject(toError(error, `${name} worker postMessage failed`));
+        finishReject(toError(error, `${name} worker postMessage failed`));
       }
     });
   };
 
-  const run = async (value: T): Promise<R> => {
-    const worker = await checkoutWorker();
+  const run = async (value: T, signal?: AbortSignal): Promise<R> => {
+    const worker = await checkoutWorker(signal);
     try {
-      return await submitTask(worker, value);
+      return await submitTask(worker, value, signal);
     } finally {
       checkinWorker(worker);
     }
@@ -241,9 +298,9 @@ export function createTaskPool<T, R>({
     pendingMessages.clear();
 
     while (waitingQueue.length > 0) {
-      waitingQueue.shift()!.reject(
-        new Error(`${name} finalized before a worker became available`)
-      );
+      const waiter = waitingQueue.shift()!;
+      if (waiter.signal && waiter.abort) waiter.signal.removeEventListener("abort", waiter.abort);
+      waiter.reject(new Error(`${name} finalized before a worker became available`));
     }
 
     const workersToTerminate = [...new Set(activeWorkers.values())];
