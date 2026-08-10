@@ -5,6 +5,7 @@ import {
   type WorkerProtocolMessage,
 } from "../lib/worker";
 import { createTaskPool } from "../lib/worker/pool";
+import { createTaskRunner } from "../lib/worker/runner";
 import { idescribe } from "./env.spec";
 
 const flush = () => new Promise(resolve => setTimeout(resolve, 0));
@@ -13,7 +14,7 @@ class MockWorker {
   static instances: MockWorker[] = [];
   static postMessageError: unknown = null;
 
-  readonly listeners: Array<(event: MessageEvent<WorkerProtocolMessage>) => void> = [];
+  readonly listeners = new Map<string, Array<(event: any) => void>>();
   readonly sentMessages: WorkerProtocolMessage[] = [];
   terminated = false;
   __id?: number;
@@ -22,15 +23,17 @@ class MockWorker {
     MockWorker.instances.push(this);
   }
 
-  addEventListener(_type: string, listener: (event: MessageEvent<WorkerProtocolMessage>) => void) {
-    this.listeners.push(listener);
+  addEventListener(type: string, listener: (event: any) => void) {
+    const listeners = this.listeners.get(type) || [];
+    listeners.push(listener);
+    this.listeners.set(type, listeners);
   }
 
-  removeEventListener(_type: string, listener: (event: MessageEvent<WorkerProtocolMessage>) => void) {
-    const index = this.listeners.indexOf(listener);
-    if (index >= 0) {
-      this.listeners.splice(index, 1);
-    }
+  removeEventListener(type: string, listener: (event: any) => void) {
+    const listeners = this.listeners.get(type);
+    if (!listeners) return;
+    const index = listeners.indexOf(listener);
+    if (index >= 0) listeners.splice(index, 1);
   }
 
   postMessage(message: WorkerProtocolMessage) {
@@ -47,7 +50,17 @@ class MockWorker {
 
   dispatch(message: WorkerProtocolMessage) {
     const event = { data: message } as MessageEvent<WorkerProtocolMessage>;
-    for (const listener of [...this.listeners]) {
+    for (const listener of [...(this.listeners.get("message") || [])]) {
+      listener(event);
+    }
+  }
+
+  dispatchError(error: unknown, message = "worker failed") {
+    const event = {
+      error,
+      message,
+    } as ErrorEvent;
+    for (const listener of [...(this.listeners.get("error") || [])]) {
       listener(event);
     }
   }
@@ -165,6 +178,37 @@ idescribe("worker helpers", () => {
     });
   });
 
+
+  describe("createTaskRunner", () => {
+    it("rejects the active task on worker failure and recreates the worker for queued work", async () => {
+      const runner = createTaskRunner<number, number>({
+        name: "runner",
+        main: (value: number) => value,
+        functions: [],
+        generateWorkerScript: () => "runner-worker-script",
+      });
+
+      const failedRun = runner.run(1);
+      const queuedRun = runner.run(2);
+      await flush();
+
+      const failedWorker = MockWorker.instances[0];
+      failedWorker.dispatchError(new Error("runner boom"));
+
+      await expectAsync(failedRun).toBeRejectedWithError("runner boom");
+      await flush();
+      expect(failedWorker.terminated).toBeTrue();
+      expect(MockWorker.instances.length).toBe(2);
+
+      const replacement = MockWorker.instances[1];
+      const message = replacement.sentMessages[0];
+      replacement.dispatch({ ...message, type: "response", payload: 20 });
+
+      await expectAsync(queuedRun).toBeResolvedTo(20);
+      await runner.dispose();
+    });
+  });
+
   describe("createTaskPool", () => {
     it("reuses a busy worker for queued runs when max workers is reached", async () => {
       Object.defineProperty(navigator, "hardwareConcurrency", {
@@ -202,6 +246,43 @@ idescribe("worker helpers", () => {
 
       await expectAsync(firstRun).toBeResolvedTo(10);
       await expectAsync(secondRun).toBeResolvedTo(20);
+      await pool.dispose();
+    });
+
+
+    it("rejects work owned by a failed worker and replaces it for queued work", async () => {
+      Object.defineProperty(navigator, "hardwareConcurrency", {
+        value: 1,
+        configurable: true,
+      });
+
+      const pool = createTaskPool<number, number>({
+        name: "recovering-pool",
+        main: (value: number) => value,
+        functions: [],
+        generateWorkerScript: () => "worker-script",
+      });
+
+      const failedRun = pool.run(1);
+      await flush();
+      const failedWorker = MockWorker.instances[0];
+
+      const queuedRun = pool.run(2);
+      await flush();
+      expect(MockWorker.instances.length).toBe(1);
+
+      failedWorker.dispatchError(new Error("worker boom"));
+      await expectAsync(failedRun).toBeRejectedWithError("worker boom");
+      await flush();
+
+      expect(failedWorker.terminated).toBeTrue();
+      expect(MockWorker.instances.length).toBe(2);
+
+      const replacement = MockWorker.instances[1];
+      const replacementMessage = replacement.sentMessages[0];
+      replacement.dispatch({ ...replacementMessage, type: "response", payload: 20 });
+
+      await expectAsync(queuedRun).toBeResolvedTo(20);
       await pool.dispose();
     });
 
@@ -286,7 +367,7 @@ idescribe("worker helpers", () => {
       await expectAsync(pool.run(3)).toBeRejectedWithError(
         "finalizing-pool is finalizing"
       );
-      expect(warnSpy).toHaveBeenCalledWith("Worker not found.");
+      expect(warnSpy).not.toHaveBeenCalledWith("Worker not found.");
     });
 
     it("uses a custom message handler and treats dispose as idempotent", async () => {

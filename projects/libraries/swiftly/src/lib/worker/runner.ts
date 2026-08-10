@@ -57,6 +57,7 @@ export function createTaskRunner<T, R>({
 
   let worker: Worker | null = null;
   let workerMessageHandler: ((event: MessageEvent<WorkerProtocolMessage>) => void) | null = null;
+  let workerErrorHandler: ((event: ErrorEvent) => void) | null = null;
   let isProcessing = false;
   let isFinalizing = false;
   let hasReleasedBlobUrl = false;
@@ -70,6 +71,26 @@ export function createTaskRunner<T, R>({
     releaseBlobUrl(workerScript);
   };
 
+  const rejectWorkerTasks = (workerId: number, error: Error) => {
+    for (const [taskId, pending] of pendingMessages) {
+      if (pending.workerId !== workerId) {
+        continue;
+      }
+
+      pendingMessages.delete(taskId);
+      pending.reject(error);
+    }
+  };
+
+  const detachWorker = (target: Worker) => {
+    if (workerMessageHandler) {
+      target.removeEventListener("message", workerMessageHandler);
+    }
+    if (workerErrorHandler) {
+      target.removeEventListener("error", workerErrorHandler);
+    }
+  };
+
   const getWorker = (): Worker => {
     if (worker) {
       return worker;
@@ -79,7 +100,26 @@ export function createTaskRunner<T, R>({
     workerMessageHandler = createMessageHandler
       ? createMessageHandler(nextWorker, pendingMessages)
       : createDefaultMessageHandler(nextWorker, pendingMessages);
+    workerErrorHandler = (event: ErrorEvent) => {
+      if (worker !== nextWorker) {
+        return;
+      }
+
+      const error =
+        event.error instanceof Error
+          ? event.error
+          : new Error(event.message || `${name} worker failed`);
+
+      rejectWorkerTasks(runnerWorkerId, error);
+      detachWorker(nextWorker);
+      nextWorker.terminate();
+      worker = null;
+      workerMessageHandler = null;
+      workerErrorHandler = null;
+    };
+
     nextWorker.addEventListener("message", workerMessageHandler);
+    nextWorker.addEventListener("error", workerErrorHandler);
     (nextWorker as any).__id = runnerWorkerId;
     worker = nextWorker;
     return nextWorker;
@@ -154,14 +194,13 @@ export function createTaskRunner<T, R>({
     pendingMessages.clear();
 
     if (worker) {
-      if (workerMessageHandler) {
-        worker.removeEventListener("message", workerMessageHandler);
-      }
+      detachWorker(worker);
       worker.terminate();
       worker = null;
     }
 
     workerMessageHandler = null;
+    workerErrorHandler = null;
     isProcessing = false;
     releaseWorkerScript();
   };
