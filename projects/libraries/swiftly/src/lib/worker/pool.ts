@@ -75,6 +75,7 @@ export function createTaskPool<T, R>({
   let createdWorkersCount = 0;
   let lifecycle: "open" | "closing" | "finalizing" = "open";
   let isFinalized = false;
+  const isFinalizing = () => lifecycle === "finalizing" || isFinalized;
   let admittedRuns = 0;
   let closePromise: Promise<void> | null = null;
   let resolveClose: (() => void) | null = null;
@@ -256,7 +257,7 @@ export function createTaskPool<T, R>({
     if (signal?.aborted) {
       throw createAbortError(signal);
     }
-    if (lifecycle === "finalizing" || isFinalized) {
+    if (isFinalizing()) {
       throw createFinalizedQueuedError();
     }
 
@@ -268,7 +269,7 @@ export function createTaskPool<T, R>({
       createdWorkersCount++;
       try {
         const worker = await createWorker();
-        if (lifecycle === "finalizing" || isFinalized) {
+        if (isFinalizing()) {
           terminateWorkerNow(worker);
           throw createFinalizedQueuedError();
         }

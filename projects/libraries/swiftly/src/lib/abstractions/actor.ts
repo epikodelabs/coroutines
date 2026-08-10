@@ -1278,6 +1278,12 @@ function createActor<S = any, Q = any, D = any, FromMain = any>(
       pendingRequests.delete(requestId);
       cleanup?.();
       reject(new Error(msg.error ?? "Actor request failed"));
+    } else if (type === "error" && !requestId) {
+      const error = new Error(msg.error ?? "Actor behavior failed");
+      running = false;
+      rejectPendingRequests(error);
+      unregisterActorBusTarget(actorRef);
+      void shutdown(true, { reason: "error", error });
     } else if (type === "request") {
       handleRequest(msg, actorRef, worker!);
     } else if (type === "notify") {
@@ -1576,25 +1582,126 @@ export function supervisor(
 
   const maxRestarts = options.maxRestarts ?? 3;
   const restartDelay = options.restartDelay ?? 0;
+  const capacity = options.capacity ?? 0;
+
   if (!Number.isInteger(maxRestarts) || maxRestarts < 0) {
     throw new RangeError("supervisor maxRestarts must be a non-negative integer");
   }
   if (!Number.isFinite(restartDelay) || restartDelay < 0) {
     throw new RangeError("supervisor restartDelay must be a non-negative finite number");
   }
+  if (!Number.isInteger(capacity) || capacity < 0) {
+    throw new RangeError("supervisor capacity must be a non-negative integer");
+  }
 
+  type PendingIngress =
+    | { kind: "post"; msg: any }
+    | {
+        kind: "request";
+        topic: string;
+        msg: any;
+        signal?: AbortSignal;
+        resolve: (value: any) => void;
+        reject: (error: Error) => void;
+        abort?: () => void;
+      };
+
+  const ingress: PendingIngress[] = [];
   let current: Actor | undefined;
   let restarts = 0;
   let stopping = false;
   let settled = false;
+  let restartController: AbortController | undefined;
   let resolveDone!: (exit: ActorExit) => void;
   const done = new Promise<ActorExit>((resolve) => { resolveDone = resolve; });
+
+  const cleanupPendingRequest = (entry: Extract<PendingIngress, { kind: "request" }>) => {
+    if (entry.signal && entry.abort) {
+      entry.signal.removeEventListener("abort", entry.abort);
+    }
+  };
+
+  const rejectIngress = (error: Error) => {
+    while (ingress.length > 0) {
+      const entry = ingress.shift()!;
+      if (entry.kind === "request") {
+        cleanupPendingRequest(entry);
+        entry.reject(error);
+      }
+    }
+  };
 
   const settle = (exit: ActorExit) => {
     if (settled) return;
     settled = true;
+    restartController?.abort(new ContextCancelledError("supervisor stopped"));
+    restartController = undefined;
     unregisterActorBusTarget(handle);
+    rejectIngress(
+      exit.reason === "error"
+        ? exit.error
+        : new ContextCancelledError("supervisor stopped")
+    );
     resolveDone(exit);
+  };
+
+  const flushIngress = () => {
+    const active = current;
+    if (!active?.running) return;
+
+    while (ingress.length > 0 && current === active && active.running) {
+      const entry = ingress.shift()!;
+      if (entry.kind === "post") {
+        actorInternalsMap.get(active)?.post(entry.msg);
+        continue;
+      }
+
+      cleanupPendingRequest(entry);
+      if (entry.signal?.aborted) {
+        entry.reject(createAbortError(entry.signal));
+        continue;
+      }
+
+      actorInternalsMap.get(active)!
+        .request(entry.topic, entry.msg, entry.signal)
+        .then(entry.resolve, entry.reject);
+    }
+  };
+
+  const scheduleRestart = async (failure: Error): Promise<void> => {
+    let lastError = failure;
+
+    while (!stopping && !settled) {
+      if (restarts >= maxRestarts) {
+        settle({ reason: "error", error: lastError });
+        return;
+      }
+
+      restarts += 1;
+      restartController = new AbortController();
+
+      if (restartDelay > 0) {
+        try {
+          await sleep(restartDelay, restartController.signal);
+        } catch (error) {
+          if (stopping || settled) return;
+          lastError = error instanceof Error ? error : new Error(String(error));
+          continue;
+        } finally {
+          restartController = undefined;
+        }
+      }
+
+      if (stopping || settled) return;
+
+      try {
+        const next = factory();
+        bindCurrent(next);
+        return;
+      } catch (error) {
+        lastError = error instanceof Error ? error : new Error(String(error));
+      }
+    }
   };
 
   const bindCurrent = (next: Actor) => {
@@ -1603,7 +1710,9 @@ export function supervisor(
     // registration with the stable supervisor handle.
     unregisterActorBusTarget(next);
     registerActorBusTarget(next.name, handle);
-    void next.done.then(async (exit) => {
+    flushIngress();
+
+    void next.done.then((exit) => {
       if (current !== next || settled) return;
       current = undefined;
 
@@ -1612,34 +1721,7 @@ export function supervisor(
         return;
       }
 
-      if (restarts >= maxRestarts) {
-        settle(exit);
-        return;
-      }
-
-      restarts += 1;
-      if (restartDelay > 0) {
-        try {
-          await sleep(restartDelay);
-        } catch (error) {
-          settle({ reason: "error", error: error instanceof Error ? error : new Error(String(error)) });
-          return;
-        }
-      }
-      if (stopping || settled) {
-        settle({ reason: "stopped" });
-        return;
-      }
-
-      try {
-        unregisterActorBusTarget(handle);
-        bindCurrent(factory());
-      } catch (error) {
-        settle({
-          reason: "error",
-          error: error instanceof Error ? error : new Error(String(error)),
-        });
-      }
+      void scheduleRestart(exit.error);
     });
   };
 
@@ -1658,13 +1740,29 @@ export function supervisor(
     get restarts() {
       return restarts;
     },
+    get capacity() {
+      return capacity;
+    },
+    get pending() {
+      return ingress.length;
+    },
     done,
+  };
+
+  const enqueue = (entry: PendingIngress): boolean => {
+    if (settled || stopping || capacity === 0 || ingress.length >= capacity) {
+      return false;
+    }
+    ingress.push(entry);
+    return true;
   };
 
   actorInternalsMap.set(handle, {
     stop: async () => {
       if (settled) return;
       stopping = true;
+      restartController?.abort(new ContextCancelledError("supervisor stopped"));
+      restartController = undefined;
       const active = current;
       if (active) {
         await actorInternalsMap.get(active)?.stop();
@@ -1675,18 +1773,65 @@ export function supervisor(
     },
     post: (msg: any) => {
       const active = current;
-      if (!active?.running) {
-        console.warn("Supervised actor is not running; message dropped");
+      if (active?.running) {
+        actorInternalsMap.get(active)?.post(msg);
         return;
       }
-      actorInternalsMap.get(active)?.post(msg);
+
+      if (!enqueue({ kind: "post", msg })) {
+        console.warn(
+          settled || stopping
+            ? "Supervised actor is stopped; message dropped"
+            : capacity === 0
+              ? "Supervised actor is restarting; message dropped"
+              : "Supervisor ingress capacity exceeded; message dropped"
+        );
+      }
     },
     request: (topic: string, msg: any, signal?: AbortSignal) => {
       const active = current;
-      if (!active?.running) {
-        return Promise.reject(new Error("Supervised actor is not running"));
+      if (active?.running) {
+        return actorInternalsMap.get(active)!.request(topic, msg, signal);
       }
-      return actorInternalsMap.get(active)!.request(topic, msg, signal);
+      if (signal?.aborted) {
+        return Promise.reject(createAbortError(signal));
+      }
+      if (settled || stopping) {
+        return Promise.reject(new Error("Supervised actor is stopped"));
+      }
+      if (capacity === 0 || ingress.length >= capacity) {
+        return Promise.reject(
+          new Error(
+            capacity === 0
+              ? "Supervised actor is restarting"
+              : "Supervisor ingress capacity exceeded"
+          )
+        );
+      }
+
+      return new Promise((resolve, reject) => {
+        const entry: Extract<PendingIngress, { kind: "request" }> = {
+          kind: "request",
+          topic,
+          msg,
+          signal,
+          resolve,
+          reject,
+        };
+
+        if (signal) {
+          entry.abort = () => {
+            const index = ingress.indexOf(entry);
+            if (index < 0) return;
+            ingress.splice(index, 1);
+            cleanupPendingRequest(entry);
+            reject(createAbortError(signal));
+          };
+          signal.addEventListener("abort", entry.abort, { once: true });
+        }
+
+        ingress.push(entry);
+      });
     },
   });
 

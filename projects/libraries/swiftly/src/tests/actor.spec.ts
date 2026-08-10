@@ -169,18 +169,20 @@ idescribe("actor", () => {
             }
           } catch (err: any) {
             if (requestId) {
-              const event = {
+              const requestError = {
                 data: { workerId: this.workerId, taskId: this.taskId, requestId, type: "error", error: err.message }
               } as any;
-              this.onmessage?.(event);
-              this.listeners["message"]?.forEach(fn => fn(event));
-            } else {
-              const event = {
-                data: { workerId: this.workerId, taskId: this.taskId, type: "notify", payload: { type: "error", error: err.message } }
-              } as any;
-              this.onmessage?.(event);
-              this.listeners["message"]?.forEach(fn => fn(event));
+              this.onmessage?.(requestError);
+              this.listeners["message"]?.forEach(fn => fn(requestError));
             }
+
+            this.actorRunning = false;
+            const fatalError = {
+              data: { workerId: this.workerId, taskId: this.taskId, type: "error", error: err.message }
+            } as any;
+            this.onmessage?.(fatalError);
+            this.listeners["message"]?.forEach(fn => fn(fatalError));
+            break;
           }
         }
 
@@ -1150,6 +1152,18 @@ idescribe("actor", () => {
     await main.outbox.stop(a);
   });
 
+  it("validates supervisor restart-window capacity", () => {
+    async function behavior(_msg: any, state: number) {
+      return state;
+    }
+
+    (globalThis as any).currentMainTask = behavior;
+    expect(() => supervisor(
+      () => actor(nextActorName(), behavior, 0),
+      { capacity: -1 },
+    )).toThrowError(/capacity/);
+  });
+
   it("supervisor restarts failed actors behind a stable handle", async () => {
     async function behavior(_msg: any, state: number) {
       return state;
@@ -1202,6 +1216,173 @@ idescribe("actor", () => {
       expect(exit.error.message).toBe("terminal failure");
     }
     expect(supervised.running).toBe(false);
+  });
+
+
+
+  it("behavior failure terminates the actor generation", async () => {
+    async function behavior(msg: any, state: number) {
+      if (msg?.kind === "actor-bus" && msg.topic === "crash") {
+        throw new Error("behavior crashed");
+      }
+      return state;
+    }
+
+    (globalThis as any).currentMainTask = behavior;
+    const a = actor(nextActorName(), behavior, 0);
+
+    main.outbox.send(a, "crash", undefined);
+    const exit = await a.done;
+
+    expect(exit.reason).toBe("error");
+    if (exit.reason === "error") {
+      expect(exit.error.message).toBe("behavior crashed");
+    }
+    expect(a.running).toBeFalse();
+  });
+
+  it("supervisor restarts after an unhandled behavior failure", async () => {
+    async function behavior(msg: any, state: number) {
+      if (msg?.kind === "actor-bus" && msg.topic === "crash") {
+        throw new Error("behavior crashed");
+      }
+      if (msg?.kind === "actor-bus" && msg.topic === "inc") return state + 1;
+      return state;
+    }
+
+    (globalThis as any).currentMainTask = behavior;
+    const name = nextActorName();
+    const supervised = supervisor(
+      () => actor(name, behavior, 0),
+      { maxRestarts: 2 },
+    );
+    const first = supervised.current;
+
+    main.outbox.send(supervised, "crash", undefined);
+    await pause(30);
+
+    expect(supervised.restarts).toBe(1);
+    expect(supervised.current).not.toBe(first);
+    expect(supervised.running).toBeTrue();
+
+    await main.outbox.stop(supervised);
+  });
+
+  it("supervisor buffers bounded restart-window traffic when configured", async () => {
+    async function behavior(msg: any, state: number) {
+      if (msg?.kind === "actor-bus" && msg.topic === "crash") {
+        throw new Error("behavior crashed");
+      }
+      if (msg?.kind === "actor-bus" && msg.topic === "inc") return state + 1;
+      return state;
+    }
+
+    (globalThis as any).currentMainTask = behavior;
+    const name = nextActorName();
+    const supervised = supervisor(
+      () => actor(name, behavior, 0),
+      { maxRestarts: 2, restartDelay: 25, capacity: 2 },
+    );
+
+    main.outbox.send(supervised, "crash", undefined);
+    await pause(5);
+    expect(supervised.running).toBeFalse();
+
+    main.outbox.send(supervised, "inc", undefined);
+    const state$ = main.outbox.request<any, number>(supervised, "state", undefined);
+    expect(supervised.pending).toBe(2);
+
+    expect(await state$).toBe(1);
+    expect(supervised.pending).toBe(0);
+    expect(supervised.capacity).toBe(2);
+
+    await main.outbox.stop(supervised);
+  });
+
+  it("supervisor rejects restart-window ingress beyond capacity", async () => {
+    async function behavior(msg: any, state: number) {
+      if (msg?.kind === "actor-bus" && msg.topic === "crash") {
+        throw new Error("behavior crashed");
+      }
+      return state;
+    }
+
+    (globalThis as any).currentMainTask = behavior;
+    const name = nextActorName();
+    const supervised = supervisor(
+      () => actor(name, behavior, 0),
+      { maxRestarts: 1, restartDelay: 25, capacity: 1 },
+    );
+
+    main.outbox.send(supervised, "crash", undefined);
+    await pause(5);
+
+    const first = main.outbox.request(supervised, "first", undefined);
+    await expectAsync(
+      main.outbox.request(supervised, "overflow", undefined)
+    ).toBeRejectedWithError(/capacity exceeded/);
+
+    await expectAsync(first).toBeResolved();
+    await main.outbox.stop(supervised);
+  });
+
+  it("cancels a request while it is buffered for supervisor restart", async () => {
+    async function behavior(msg: any, state: number) {
+      if (msg?.kind === "actor-bus" && msg.topic === "crash") {
+        throw new Error("behavior crashed");
+      }
+      if (typeof msg === "number") return state + msg;
+      return state;
+    }
+
+    (globalThis as any).currentMainTask = behavior;
+    const name = nextActorName();
+    const supervised = supervisor(
+      () => actor(name, behavior, 0),
+      { maxRestarts: 1, restartDelay: 25, capacity: 2 },
+    );
+
+    main.outbox.send(supervised, "crash", undefined);
+    await pause(5);
+
+    const controller = new AbortController();
+    const pending = main.outbox.request(supervised, "add", 5, controller.signal);
+    expect(supervised.pending).toBe(1);
+    controller.abort(new ContextCancelledError("cancel buffered request"));
+
+    await expectAsync(pending).toBeRejectedWithError(ContextCancelledError, "cancel buffered request");
+    expect(supervised.pending).toBe(0);
+
+    await pause(35);
+    expect(await main.outbox.request(supervised, "state", undefined)).toBe(0);
+    await main.outbox.stop(supervised);
+  });
+
+  it("supervisor retries replacement factory failures within the restart budget", async () => {
+    async function behavior(_msg: any, state: number) {
+      return state;
+    }
+
+    (globalThis as any).currentMainTask = behavior;
+    const name = nextActorName();
+    let generations = 0;
+    const supervised = supervisor(
+      () => {
+        generations += 1;
+        if (generations === 2) throw new Error("replacement creation failed");
+        return actor(name, behavior, 0);
+      },
+      { maxRestarts: 2 },
+    );
+
+    (globalThis as any).lastMockWorker.emitError(new Error("generation failed"));
+    await pause(30);
+
+    expect(generations).toBe(3);
+    expect(supervised.restarts).toBe(2);
+    expect(supervised.running).toBeTrue();
+
+    await main.outbox.stop(supervised);
   });
 
 

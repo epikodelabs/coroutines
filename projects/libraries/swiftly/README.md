@@ -246,3 +246,39 @@ one stage reports an error, mirroring its immediate-disposal cleanup behavior.
 This distinction is intentionally part of `TaskRunner` rather than separate
 helpers: graceful ownership and forced teardown are different concurrency
 semantics.
+
+## Actor failure and restart-window resilience
+
+An unhandled actor behavior exception terminates that actor generation. This is
+deliberate: failures cross the actor lifecycle boundary instead of being hidden
+as one-way notifications, so `actor.done` and `supervisor()` observe the same
+failure model.
+
+```ts
+const service = supervisor(
+  () => actor('service', behavior, initialState),
+  {
+    maxRestarts: 3,
+    restartDelay: 250,
+    capacity: 32,
+  },
+);
+```
+
+`capacity` is optional and defaults to `0`. When it is greater than zero, sends
+and requests that arrive while a replacement generation is being created may
+wait behind the stable supervisor handle. The queue is strictly bounded; excess
+requests reject and excess one-way sends are dropped with a warning rather than
+creating an unbounded backlog.
+
+Buffered requests keep their `AbortSignal`. Cancelling one removes it from the
+restart queue immediately. Once a request has been dispatched to a concrete
+actor generation it is **not retried automatically** if that generation fails,
+because retrying an in-flight request could duplicate side effects.
+
+Replacement-factory failures consume the same `maxRestarts` budget as actor
+failures. A temporary failure to create one replacement therefore does not
+collapse supervision immediately when restart capacity remains.
+
+The supervisor exposes `pending` and `capacity` for restart-window pressure
+without exposing its internal queue or worker generations.

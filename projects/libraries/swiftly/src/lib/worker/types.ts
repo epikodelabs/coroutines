@@ -72,10 +72,15 @@ export interface Actor {
 
 /** Restart policy for a supervised actor. */
 export type SupervisorOptions = {
-  /** Maximum number of restarts after worker failure. Defaults to 3. */
+  /** Maximum number of restart attempts after actor failure. Defaults to 3. */
   readonly maxRestarts?: number;
-  /** Delay before each restart in milliseconds. Defaults to 0. */
+  /** Delay before each restart attempt in milliseconds. Defaults to 0. */
   readonly restartDelay?: number;
+  /**
+   * Number of sends/requests that may wait while no actor generation is running.
+   * Defaults to 0, preserving fail-fast behavior unless buffering is explicit.
+   */
+  readonly capacity?: number;
 };
 
 /**
@@ -85,8 +90,12 @@ export type SupervisorOptions = {
  * when it is explicitly stopped or its restart budget is exhausted.
  */
 export interface Supervisor extends Actor {
-  /** Number of actor generations restarted after failure. */
+  /** Number of restart attempts consumed after actor failure. */
   readonly restarts: number;
   /** Current actor generation, when one is running. */
   readonly current: Actor | undefined;
+  /** Configured restart-window ingress capacity. */
+  readonly capacity: number;
+  /** Number of sends/requests currently waiting for a replacement generation. */
+  readonly pending: number;
 }

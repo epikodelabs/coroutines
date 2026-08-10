@@ -127,9 +127,13 @@ const __runBehaviorLoop = async (workerId, taskId) => {
       const message = __serializeWorkerError(error);
       if (replyId) {
         __postToMain({ workerId, taskId, type: "error", requestId: replyId, error: message });
-      } else {
-        __postToMain({ workerId, taskId, type: "notify", payload: { type: "error", error: message } });
       }
+
+      // An unhandled behavior exception terminates this actor generation.
+      // Supervision can then make the restart decision at the ownership boundary.
+      __actorRunning = false;
+      __postToMain({ workerId, taskId, type: "error", error: message });
+      break;
     }
   }
 
