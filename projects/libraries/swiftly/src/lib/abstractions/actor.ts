@@ -20,7 +20,45 @@ import { createModuleWorker } from "../worker/module";
 import { buildActorWorkerRuntime } from "../worker/runtimes";
 import { buildWorkerScript } from "../worker/script";
 import type { Actor, ActorExit, ActorOptions, Supervisor, SupervisorOptions } from "../worker/types";
+import {
+  clearActorBusListeners,
+  createActorBusMessage,
+  dispatchActorBusMessage,
+  getActorInternals,
+  getActorRequestHandler,
+  isActorBusMessage,
+  normalizeActorBusTargets,
+  registerActorBusTarget,
+  resolveActorBusTarget,
+  resolveActorTarget,
+  setActorInternals,
+  subscribeActorBus,
+  tryActorInternals,
+  unregisterActorBusTarget,
+} from "./actor-bus";
+import type {
+  ActorBusDispatchOptions,
+  ActorBusHandler,
+  ActorBusMessage,
+  ActorBusTarget,
+} from "./actor-bus";
 export type { Actor, ActorExit, ActorOptions, Supervisor, SupervisorOptions } from "../worker/types";
+export {
+  createActorBusMessage,
+  isActorBusMessage,
+  registerActorRequestHandler,
+  unregisterActorRequestHandler,
+} from "./actor-bus";
+export type {
+  ActorBus,
+  ActorBusDispatchOptions,
+  ActorBusHandler,
+  ActorBusMessage,
+  ActorBusSender,
+  ActorBusTarget,
+  ActorMessageContext,
+  ActorRequestHandler,
+} from "./actor-bus";
 
 /**
  * Concurrency utils injected into actor workers.
@@ -82,11 +120,6 @@ export type WorkerInbox<Incoming = any> = {
 };
 
 /**
- * Actor-bus delivery target.
- */
-export type ActorBusTarget = string | string[];
-
-/**
  * Main-thread communication interface.
  *
  * `Initiator` describes the public shape of `main` so that consumers can
@@ -115,86 +148,6 @@ export interface Initiator {
   };
 }
 
-/** Sender name stamped onto actor-bus messages. */
-export type ActorBusSender = string;
-
-/**
- * Structured bus envelope exchanged between actors through a main-thread bus.
- */
-export type ActorBusMessage<T = any> = {
-  kind: "actor-bus";
-  topic: string;
-  payload: T;
-  from?: ActorBusSender;
-  to?: ActorBusTarget;
-};
-
-/**
- * Dispatch options for main-thread actor-bus publishing.
- */
-export type ActorBusDispatchOptions = {
-  /**
-   * Stable sender name to stamp onto the routed message.
-   */
-  from?: ActorBusSender;
-  /**
-   * Includes the sender during broadcast delivery when `from` is set.
-   */
-  includeSelf?: boolean;
-};
-
-/**
- * Main-thread subscriber invoked for each routed bus envelope.
- */
-export type ActorBusHandler<T = any> = (
-  message: ActorBusMessage<T>
-) => void | Promise<void>;
-
-/**
- * Main-thread actor bus integrated into the actor messaging surface.
- *
- * Workers send direct messages through `utils.outbox.send(to, topic, payload)`,
- * while the main thread can publish or send through `main.bus`.
- */
-export interface ActorBus {
-  /**
-   * Broadcasts a topic payload to every actor.
-   */
-  publish: <T = any>(
-    topic: string,
-    payload: T,
-    options?: ActorBusDispatchOptions
-  ) => void;
-  /**
-   * Sends a topic payload to one or more explicit actor names.
-   */
-  send: <T = any>(
-    to: ActorBusTarget,
-    topic: string,
-    payload: T,
-    options?: Pick<ActorBusDispatchOptions, "from">
-  ) => void;
-  /**
-   * Routes a prebuilt actor-bus envelope.
-   */
-  dispatch: <T = any>(
-    message: ActorBusMessage<T>,
-    options?: Pick<ActorBusDispatchOptions, "includeSelf">
-  ) => void;
-  /**
-   * Listens to all routed bus envelopes, or only to direct messages sent to a name.
-   */
-  listen: {
-    <T = any>(handler: ActorBusHandler<T>): () => void;
-    <T = any>(name: string, handler: ActorBusHandler<T>): () => void;
-  };
-  /**
-   * Clears bus listeners and main-thread request handlers.
-   * Live actor registrations remain intact.
-   */
-  clear: () => void;
-}
-
 /**
  * Utility functions available to actor workers.
  */
@@ -214,89 +167,6 @@ export type WorkerUtils<Q = any, D = any, Incoming = any, ToMain = any> = {
  */
 export interface ActorBehavior<S = any, Q = any, D = any, Incoming = any> {
   (msg: Incoming, state: S, utils: WorkerUtils<Q, D, Incoming>): Promise<S> | S;
-}
-
-/**
- * Public request/message metadata surfaced to advanced actor hooks.
- *
- * This intentionally exposes routing information rather than the full internal
- * worker protocol.
- */
-export type ActorMessageContext = {
-  /** Actor name that initiated the request or direct message, when known. */
-  from?: string;
-  /** Target name(s) for direct actor routing. */
-  to?: ActorBusTarget;
-  /** Topic associated with the routed request or message. */
-  topic?: string;
-};
-
-/**
- * Request handler used by `utils.outbox.request(name, topic, payload)`.
- *
- * Keep this function small, or delegate to a `coroutine(...)` instance via
- * `request: dataWorker.run` when data resolution itself is expensive.
- */
-export type ActorRequestHandler<Q = any, D = any> = (
-  topic: string,
-  request: Q,
-  message: ActorMessageContext
-) => Promise<D> | D;
-
-/**
- * Registry of request handlers looked up by actor name.
- */
-const actorRequestHandlers = new Map<string, ActorRequestHandler<any, any>>();
-
-/**
- * Registers a main-thread request handler for a target actor name.
- * Workers call `utils.outbox.request(name, topic, payload)` — the handler
- * registered for `name` receives the call and returns the response.
- *
- * Register `"main"` to handle requests sent to the main thread.
- */
-export function registerActorRequestHandler<Q = any, D = any>(
-  name: string,
-  handler: ActorRequestHandler<Q, D>
-): () => void {
-  actorRequestHandlers.set(name, handler);
-  return () => actorRequestHandlers.delete(name);
-}
-
-/**
- * Removes a request handler previously registered for a name.
- */
-export function unregisterActorRequestHandler(name: string): void {
-  actorRequestHandlers.delete(name);
-}
-
-/**
- * Creates a typed actor-bus envelope.
- */
-export function createActorBusMessage<T = any>(
-  topic: string,
-  payload: T,
-  options?: { from?: string; to?: ActorBusTarget }
-): ActorBusMessage<T> {
-  return {
-    kind: "actor-bus",
-    topic,
-    payload,
-    from: options?.from,
-    to: options?.to,
-  };
-}
-
-/**
- * Checks whether a payload is an actor-bus envelope.
- */
-export function isActorBusMessage<T = any>(value: unknown): value is ActorBusMessage<T> {
-  return (
-    typeof value === "object" &&
-    value !== null &&
-    (value as ActorBusMessage<T>).kind === "actor-bus" &&
-    typeof (value as ActorBusMessage<T>).topic === "string"
-  );
 }
 
 const ACTOR_CONCURRENCY_RUNTIME = `
@@ -1066,7 +936,7 @@ function handleRequest<Q>(
   }
 
   const targetName = targets[0];
-  const handler = actorRequestHandlers.get(targetName);
+  const handler = getActorRequestHandler(targetName);
 
   if (!handler) {
     postActorResponse(sourceActor, worker, {
@@ -1516,190 +1386,13 @@ function createActor<S = any, Q = any, D = any, FromMain = any>(
     },
   };
 
-  actorInternalsMap.set(actor, internals);
+  setActorInternals(actor, internals);
 
   return actor;
 }
 
-type ActorBusRegistration = {
-  actor: Actor;
-  name: string;
-};
-
-const actorBusRegistrationsById = new Map<string, ActorBusRegistration>();
-const actorBusRegistrationsByActor = new Map<Actor, ActorBusRegistration>();
-const actorBusDirectListeners = new Map<string, Set<ActorBusHandler>>();
-const actorBusListeners = new Set<ActorBusHandler>();
-
-type ActorInternals = {
-  stop(): Promise<void>;
-  post(msg: any): void;
-  request(topic: string, msg: any, signal?: AbortSignal): Promise<any>;
-};
-
-const actorInternalsMap = new WeakMap<Actor, ActorInternals>();
-
-const getActorInternals = (actor: Actor): ActorInternals => {
-  const internals = actorInternalsMap.get(actor);
-  if (!internals) {
-    throw new Error(`Actor "${actor.name}" is unavailable`);
-  }
-  return internals;
-};
-
-const tryActorInternals = (actor: Actor): ActorInternals | undefined =>
-  actorInternalsMap.get(actor);
-
-function resolveActorTarget(actorOrName: Actor | string): Actor | undefined {
-  if (typeof actorOrName !== "string") {
-    return actorOrName;
-  }
-
-  return actorBusRegistrationsById.get(actorOrName)?.actor;
-}
-
-function resolveActorBusTarget(to: Actor | string | string[]): string | string[] {
-  if (Array.isArray(to)) {
-    return to;
-  }
-  return typeof to === "string" ? to : to.name;
-}
-
-const normalizeActorBusTargets = (to?: ActorBusTarget): string[] => {
-  if (!to) {
-    return [];
-  }
-
-  return Array.isArray(to) ? [...to] : [to];
-};
-
 const warnAsyncActorBusFailure = (scope: string, error: unknown) => {
   console.warn(`${scope} failed:`, error);
-};
-
-function deliverActorBusMessage(actor: Actor, message: ActorBusMessage) {
-  try {
-    tryActorInternals(actor)?.post(message);
-  } catch (error) {
-    warnAsyncActorBusFailure("Actor bus delivery", error);
-  }
-}
-
-function notifyActorBusSubscribers(message: ActorBusMessage) {
-  const directHandlers = message.to
-    ? normalizeActorBusTargets(message.to)
-        .flatMap((name) => [...(actorBusDirectListeners.get(name) ?? [])])
-    : [];
-  const handlers = [...actorBusListeners, ...directHandlers];
-
-  for (const handler of handlers) {
-    Promise.resolve(handler(message)).catch((error) => {
-      warnAsyncActorBusFailure("Actor bus subscriber", error);
-    });
-  }
-}
-
-function unregisterActorBusTarget(idOrActor: string | Actor) {
-  const registration =
-    typeof idOrActor === "string"
-      ? actorBusRegistrationsById.get(idOrActor)
-      : actorBusRegistrationsByActor.get(idOrActor);
-
-  if (!registration) {
-    return;
-  }
-
-  actorBusRegistrationsById.delete(registration.name);
-  actorBusRegistrationsByActor.delete(registration.actor);
-}
-
-function registerActorBusTarget(
-  name: string,
-  actor: Actor
-) {
-  const existingRegistration = actorBusRegistrationsById.get(name);
-  if (existingRegistration && existingRegistration.actor !== actor) {
-    throw new Error(`Actor name "${name}" is already registered`);
-  }
-
-  unregisterActorBusTarget(actor);
-
-  const registration: ActorBusRegistration = {
-    actor,
-    name,
-  };
-
-  actorBusRegistrationsById.set(name, registration);
-  actorBusRegistrationsByActor.set(actor, registration);
-
-  return () => unregisterActorBusTarget(actor);
-}
-
-function clearActorBusListeners() {
-  actorBusDirectListeners.clear();
-  actorBusListeners.clear();
-  actorRequestHandlers.clear();
-}
-
-function dispatchActorBusMessage<T = any>(
-  message: ActorBusMessage<T>,
-  options?: { fromActor?: Actor; includeSelf?: boolean }
-) {
-  const from =
-    message.from ??
-    (options?.fromActor
-      ? actorBusRegistrationsByActor.get(options.fromActor)?.name ?? options.fromActor.name
-      : undefined);
-
-  const routedMessage =
-    from && message.from !== from ? { ...message, from } : message;
-
-  notifyActorBusSubscribers(routedMessage);
-
-  const targets = normalizeActorBusTargets(routedMessage.to);
-  if (targets.length > 0) {
-    const seen = new Set<string>();
-
-    for (const target of targets) {
-      if (seen.has(target)) {
-        continue;
-      }
-
-      seen.add(target);
-      const registration = actorBusRegistrationsById.get(target);
-      if (registration) {
-        deliverActorBusMessage(registration.actor, routedMessage);
-      }
-    }
-
-    return;
-  }
-
-  for (const registration of actorBusRegistrationsById.values()) {
-    if (
-      routedMessage.from &&
-      !options?.includeSelf &&
-      registration.name === routedMessage.from
-    ) {
-      continue;
-    }
-
-    deliverActorBusMessage(registration.actor, routedMessage);
-  }
-}
-
-/**
- * Main-thread communication utility.
- *
- * Extends the worker-side `utils` structure:
- * - `main.outbox.send(to, topic, payload)` — fire-and-forget bus message
- * - `main.outbox.request(to, topic, payload)` — send request and await response
- * - `main.outbox.stop(actor)` — stop actor and release resources
- * - `main.inbox.subscribe(handler)` — subscribe to all actor-bus messages
- */
-const subscribeMainInbox: Initiator["inbox"]["subscribe"] = (handler) => {
-  actorBusListeners.add(handler);
-  return () => actorBusListeners.delete(handler);
 };
 
 /**
@@ -1951,7 +1644,7 @@ export function supervisor(
     return true;
   };
 
-  actorInternalsMap.set(handle, {
+  setActorInternals(handle, {
     stop: async () => {
       if (settled) return;
       stopping = true;
@@ -2083,7 +1776,7 @@ export const main: Initiator = {
   },
 
   inbox: {
-    subscribe: subscribeMainInbox,
+    subscribe: subscribeActorBus,
 
     clear: () => {
       clearActorBusListeners();
