@@ -7,87 +7,66 @@ import { generateTaskId } from "./utils";
 import { createAbortError } from "../utils/context";
 import type { TaskRunControl } from "../utils/transfer";
 import { normalizeTaskRunControl } from "./control";
-import { takeNextScheduled } from "./scheduler";
 
 export type PoolOptions = {
   name: string;
-  concurrency?: number;
-  maxQueued?: number;
   config?: WorkerScriptConfig;
   main: Function;
   functions: Function[];
-  generateWorkerScript: (main: Function, functions: Function[], config?: WorkerScriptConfig) => string;
-  createMessageHandler?: (worker: Worker, pendingTasks: PendingTaskMap) => (event: MessageEvent<WorkerProtocolMessage>) => void;
-};
-
-type WaitingWorker = {
-  resolve: (worker: Worker) => void;
-  reject: (error: Error) => void;
-  signal?: AbortSignal;
-  priority: number;
-  sequence: number;
-  bypasses: number;
-  abort?: () => void;
+  generateWorkerScript: (
+    main: Function,
+    functions: Function[],
+    config?: WorkerScriptConfig,
+  ) => string;
+  createMessageHandler?: (
+    worker: Worker,
+    pendingTasks: PendingTaskMap,
+  ) => (event: MessageEvent<WorkerProtocolMessage>) => void;
 };
 
 const toError = (error: unknown, fallback: string): Error =>
   error instanceof Error ? error : new Error(error ? String(error) : fallback);
 
 /**
- * Internal compute-only worker pool.
+ * Internal elastic worker pool used by compute().
  *
- * Unlike `createTaskRunner()`, this abstraction can create multiple workers
- * for the same baked task and lend them to queued compute submissions.
+ * The pool owns worker reuse, not concurrency policy. Each concurrently
+ * admitted run either reuses an idle worker or lazily creates another one.
+ * Callers bound concurrency structurally with group() or semaphore().
  */
 export interface TaskPool<T = any, R = any> extends TaskRunner<T, R> {
-  readonly concurrency: number;
-  readonly queued: number;
+  /** Number of workers currently executing submissions. */
   readonly active: number;
+  /** Total number of worker instances currently owned by the pool. */
+  readonly size: number;
 }
 
 export function createTaskPool<T, R>({
   name,
-  concurrency,
-  maxQueued,
   config,
   main,
   functions,
   generateWorkerScript,
   createMessageHandler,
 }: PoolOptions): TaskPool<T, R> {
-  const maxWorkers =
-    concurrency ??
-    ((typeof navigator !== "undefined" ? navigator.hardwareConcurrency : undefined) || 4);
-  const maxWaiting = maxQueued ?? Number.POSITIVE_INFINITY;
-
-  if (!Number.isInteger(maxWorkers) || maxWorkers <= 0) {
-    throw new RangeError(`${name} concurrency must be a positive integer`);
-  }
-  if (
-    maxWaiting !== Number.POSITIVE_INFINITY &&
-    (!Number.isInteger(maxWaiting) || maxWaiting < 0)
-  ) {
-    throw new RangeError(`${name} maxQueued must be a non-negative integer`);
-  }
   const idleWorkers: Worker[] = [];
-  const waitingQueue: WaitingWorker[] = [];
-  const activeWorkers = new Map<number, Worker>();
-  const workerMessageHandlers = new Map<number, (event: MessageEvent<WorkerProtocolMessage>) => void>();
+  const workers = new Map<number, Worker>();
+  const workerMessageHandlers = new Map<
+    number,
+    (event: MessageEvent<WorkerProtocolMessage>) => void
+  >();
   const workerErrorHandlers = new Map<number, (event: ErrorEvent) => void>();
   const pendingMessages: PendingTaskMap = new Map();
+
   const workerScript = generateWorkerScript(main, functions, config);
   let blobUrl: string | null = null;
-
-  let createdWorkersCount = 0;
   let lifecycle: "open" | "closing" | "finalizing" = "open";
   let isFinalized = false;
-  const isFinalizing = () => lifecycle === "finalizing" || isFinalized;
   let admittedRuns = 0;
   let closePromise: Promise<void> | null = null;
   let resolveClose: (() => void) | null = null;
   let nextWorkerId = 0;
   let hasReleasedBlobUrl = false;
-  let nextWaiterSequence = 0;
 
   const getWorkerScriptUrl = (): string => {
     if (blobUrl) return blobUrl;
@@ -95,43 +74,32 @@ export function createTaskPool<T, R>({
     return blobUrl;
   };
 
-  const releaseWorkerScript = () => {
-    if (hasReleasedBlobUrl || !blobUrl) {
-      return;
-    }
-
+  const releaseWorkerScript = (): void => {
+    if (hasReleasedBlobUrl || !blobUrl) return;
     hasReleasedBlobUrl = true;
     releaseBlobUrl(workerScript);
     blobUrl = null;
   };
 
-  const getWorkerId = (worker: Worker): number | undefined => {
-    return (worker as any).__id;
+  const getWorkerId = (worker: Worker): number | undefined =>
+    (worker as any).__id;
+
+  const removeFromIdleWorkers = (worker: Worker): void => {
+    const index = idleWorkers.indexOf(worker);
+    if (index >= 0) idleWorkers.splice(index, 1);
   };
 
-  const removeFromIdleWorkers = (worker: Worker) => {
-    const idleIndex = idleWorkers.findIndex((entry) => entry === worker);
-    if (idleIndex >= 0) {
-      idleWorkers.splice(idleIndex, 1);
-    }
-  };
-
-  const rejectWorkerTasks = (workerId: number, error: Error) => {
+  const rejectWorkerTasks = (workerId: number, error: Error): void => {
     for (const [taskId, pending] of pendingMessages) {
-      if (pending.workerId !== workerId) {
-        continue;
-      }
-
+      if (pending.workerId !== workerId) continue;
       pendingMessages.delete(taskId);
       pending.reject(error);
     }
   };
 
-  const detachWorker = (worker: Worker) => {
+  const detachWorker = (worker: Worker): void => {
     const workerId = getWorkerId(worker);
-    if (workerId === undefined) {
-      return;
-    }
+    if (workerId === undefined) return;
 
     const messageHandler = workerMessageHandlers.get(workerId);
     if (messageHandler) {
@@ -146,60 +114,46 @@ export function createTaskPool<T, R>({
     }
   };
 
-  let satisfyWaitingQueue: () => void;
+  const terminateWorkerNow = (worker: Worker): void => {
+    const workerId = getWorkerId(worker);
+    detachWorker(worker);
+    removeFromIdleWorkers(worker);
+    if (workerId !== undefined) workers.delete(workerId);
+    worker.terminate();
+  };
 
   const createFinalizedActiveError = () =>
     new Error(`${name} finalized before the worker task completed`);
   const createFinalizedQueuedError = () =>
     new Error(`${name} finalized before a worker became available`);
-  const createRunClosedError = () => {
-    if (lifecycle === "closing") {
-      return new Error(`${name} is closed`);
-    }
-    return new Error(`${name} is finalizing`);
-  };
-
-  const terminateWorkerNow = (worker: Worker) => {
-    const workerId = getWorkerId(worker);
-    detachWorker(worker);
-    if (workerId !== undefined) {
-      activeWorkers.delete(workerId);
-    }
-
-    removeFromIdleWorkers(worker);
-    worker.terminate();
-    createdWorkersCount = Math.max(0, createdWorkersCount - 1);
-  };
+  const createRunClosedError = () =>
+    new Error(lifecycle === "closing" ? `${name} is closed` : `${name} is finalizing`);
 
   const finalizeGracefulClose = (): void => {
-    if (lifecycle !== "closing" || isFinalized || admittedRuns > 0) {
-      return;
-    }
+    if (lifecycle !== "closing" || isFinalized || admittedRuns > 0) return;
 
     isFinalized = true;
-
-    const workersToTerminate = [...new Set(activeWorkers.values())];
-    activeWorkers.clear();
+    const owned = [...workers.values()];
+    workers.clear();
     idleWorkers.length = 0;
 
-    for (const worker of workersToTerminate) {
+    for (const worker of owned) {
       detachWorker(worker);
       worker.terminate();
     }
 
     workerMessageHandlers.clear();
     workerErrorHandlers.clear();
-    createdWorkersCount = 0;
     releaseWorkerScript();
     resolveClose?.();
     resolveClose = null;
   };
 
-  const retireWorker = (worker: Worker, error?: Error) => {
+  const retireWorker = (worker: Worker, error?: Error): void => {
     const workerId = getWorkerId(worker);
     if (
       workerId === undefined ||
-      (!activeWorkers.has(workerId) &&
+      (!workers.has(workerId) &&
         !workerMessageHandlers.has(workerId) &&
         !workerErrorHandlers.has(workerId))
     ) {
@@ -207,18 +161,11 @@ export function createTaskPool<T, R>({
     }
 
     terminateWorkerNow(worker);
-
-    if (error) {
-      rejectWorkerTasks(workerId, error);
-    }
-
-    if (!isFinalized && lifecycle !== "finalizing") {
-      satisfyWaitingQueue();
-      finalizeGracefulClose();
-    }
+    if (error) rejectWorkerTasks(workerId, error);
+    finalizeGracefulClose();
   };
 
-  const createWorker = async (): Promise<Worker> => {
+  const createWorker = (): Worker => {
     const workerId = ++nextWorkerId;
     const worker = new Worker(getWorkerScriptUrl(), { type: "module" });
     const messageHandler = createMessageHandler
@@ -237,116 +184,25 @@ export function createTaskPool<T, R>({
     (worker as any).__id = workerId;
     workerMessageHandlers.set(workerId, messageHandler);
     workerErrorHandlers.set(workerId, errorHandler);
-    activeWorkers.set(workerId, worker);
+    workers.set(workerId, worker);
     return worker;
   };
 
-  const takeNextWaiter = (): WaitingWorker | undefined =>
-    takeNextScheduled(waitingQueue);
-
-  satisfyWaitingQueue = () => {
-    while (lifecycle !== "finalizing" && !isFinalized && waitingQueue.length > 0 && createdWorkersCount < maxWorkers) {
-      const waiter = takeNextWaiter()!;
-      if (waiter.signal?.aborted) {
-        waiter.reject(createAbortError(waiter.signal));
-        continue;
-      }
-      if (waiter.signal && waiter.abort) {
-        waiter.signal.removeEventListener("abort", waiter.abort);
-      }
-      createdWorkersCount++;
-      void createWorker().then((worker) => {
-        if (lifecycle === "finalizing" || isFinalized) {
-          terminateWorkerNow(worker);
-          waiter.reject(createFinalizedQueuedError());
-          return;
-        }
-        waiter.resolve(worker);
-      }, (error) => {
-        createdWorkersCount = Math.max(0, createdWorkersCount - 1);
-        waiter.reject(toError(error, `${name} worker creation failed`));
-        satisfyWaitingQueue();
-      });
-    }
-  };
-
-  const checkoutWorker = async (signal?: AbortSignal, priority = 0): Promise<Worker> => {
-    if (signal?.aborted) {
-      throw createAbortError(signal);
-    }
-    if (isFinalizing()) {
+  const checkoutWorker = (signal?: AbortSignal): Worker => {
+    if (signal?.aborted) throw createAbortError(signal);
+    if (lifecycle === "finalizing" || isFinalized) {
       throw createFinalizedQueuedError();
     }
 
-    if (idleWorkers.length > 0) {
-      return idleWorkers.shift()!;
-    }
-
-    if (createdWorkersCount < maxWorkers) {
-      createdWorkersCount++;
-      try {
-        const worker = await createWorker();
-        if (isFinalizing()) {
-          terminateWorkerNow(worker);
-          throw createFinalizedQueuedError();
-        }
-        return worker;
-      } catch (error) {
-        if (
-          error instanceof Error &&
-          error.message === createFinalizedQueuedError().message
-        ) {
-          throw error;
-        }
-        createdWorkersCount = Math.max(0, createdWorkersCount - 1);
-        throw toError(error, `${name} worker creation failed`);
-      }
-    }
-
-    if (waitingQueue.length >= maxWaiting) {
-      throw new Error(`${name} queue capacity exceeded`);
-    }
-
-    return new Promise((resolve, reject) => {
-      const waiter: WaitingWorker = {
-        resolve,
-        reject,
-        signal,
-        priority,
-        sequence: nextWaiterSequence++,
-        bypasses: 0,
-      };
-      if (signal) {
-        waiter.abort = () => {
-          const index = waitingQueue.indexOf(waiter);
-          if (index < 0) return;
-          waitingQueue.splice(index, 1);
-          signal.removeEventListener("abort", waiter.abort!);
-          reject(createAbortError(signal));
-        };
-        signal.addEventListener("abort", waiter.abort, { once: true });
-      }
-      waitingQueue.push(waiter);
-    });
+    return idleWorkers.shift() ?? createWorker();
   };
 
   const checkinWorker = (worker: Worker): void => {
     const workerId = getWorkerId(worker);
-    if (workerId === undefined || !activeWorkers.has(workerId)) {
-      return;
-    }
+    if (workerId === undefined || !workers.has(workerId)) return;
 
     if (lifecycle === "finalizing" || isFinalized) {
       retireWorker(worker);
-      return;
-    }
-
-    if (waitingQueue.length > 0) {
-      const waiter = takeNextWaiter()!;
-      if (waiter.signal && waiter.abort) {
-        waiter.signal.removeEventListener("abort", waiter.abort);
-      }
-      waiter.resolve(worker);
       return;
     }
 
@@ -359,13 +215,11 @@ export function createTaskPool<T, R>({
     signal?: AbortSignal,
     transferables: Transferable[] = [],
   ): Promise<R> => {
-    if (signal?.aborted) {
-      return Promise.reject(createAbortError(signal));
-    }
+    if (signal?.aborted) return Promise.reject(createAbortError(signal));
 
     const workerId = getWorkerId(worker);
-    if (workerId === undefined || !activeWorkers.has(workerId)) {
-      throw new Error("Worker not found or is not active");
+    if (workerId === undefined || !workers.has(workerId)) {
+      return Promise.reject(new Error("Worker not found or is not active"));
     }
 
     const taskId = generateTaskId();
@@ -387,13 +241,17 @@ export function createTaskPool<T, R>({
       const onAbort = () => {
         if (settled) return;
         pendingMessages.delete(taskId);
-        const error = createAbortError(signal);
-        finishReject(error);
+        finishReject(createAbortError(signal));
         retireWorker(worker);
       };
 
-      pendingMessages.set(taskId, { workerId, resolve: finishResolve, reject: finishReject });
+      pendingMessages.set(taskId, {
+        workerId,
+        resolve: finishResolve,
+        reject: finishReject,
+      });
       signal?.addEventListener("abort", onAbort, { once: true });
+
       try {
         worker.postMessage(
           { workerId, taskId, payload: data, type: "task" },
@@ -402,20 +260,19 @@ export function createTaskPool<T, R>({
       } catch (error) {
         pendingMessages.delete(taskId);
         finishReject(toError(error, `${name} worker postMessage failed`));
+        retireWorker(worker);
       }
     });
   };
 
   const run = async (value: T, control?: TaskRunControl): Promise<R> => {
-    const { signal, transfer, priority } = normalizeTaskRunControl(control);
+    const { signal, transfer } = normalizeTaskRunControl(control);
 
-    if (lifecycle !== "open") {
-      throw createRunClosedError();
-    }
+    if (lifecycle !== "open") throw createRunClosedError();
 
     admittedRuns += 1;
     try {
-      const worker = await checkoutWorker(signal, priority);
+      const worker = checkoutWorker(signal);
       try {
         return await submitTask(worker, value, signal, transfer);
       } finally {
@@ -428,28 +285,19 @@ export function createTaskPool<T, R>({
   };
 
   const close = (): Promise<void> => {
-    if (isFinalized || lifecycle === "finalizing") {
-      return Promise.resolve();
-    }
-
-    if (closePromise) {
-      return closePromise;
-    }
+    if (isFinalized || lifecycle === "finalizing") return Promise.resolve();
+    if (closePromise) return closePromise;
 
     lifecycle = "closing";
     closePromise = new Promise<void>((resolve) => {
       resolveClose = resolve;
     });
-
-    satisfyWaitingQueue();
     finalizeGracefulClose();
     return closePromise;
   };
 
-  const dispose = async () => {
-    if (isFinalized || lifecycle === "finalizing") {
-      return;
-    }
+  const dispose = async (): Promise<void> => {
+    if (isFinalized || lifecycle === "finalizing") return;
 
     lifecycle = "finalizing";
     isFinalized = true;
@@ -459,24 +307,17 @@ export function createTaskPool<T, R>({
     });
     pendingMessages.clear();
 
-    while (waitingQueue.length > 0) {
-      const waiter = waitingQueue.shift()!;
-      if (waiter.signal && waiter.abort) waiter.signal.removeEventListener("abort", waiter.abort);
-      waiter.reject(createFinalizedQueuedError());
-    }
-
-    const workersToTerminate = [...new Set(activeWorkers.values())];
-    activeWorkers.clear();
+    const owned = [...workers.values()];
+    workers.clear();
     idleWorkers.length = 0;
 
-    for (const worker of workersToTerminate) {
+    for (const worker of owned) {
       detachWorker(worker);
       worker.terminate();
     }
 
     workerMessageHandlers.clear();
     workerErrorHandlers.clear();
-    createdWorkersCount = 0;
     releaseWorkerScript();
 
     resolveClose?.();
@@ -484,14 +325,11 @@ export function createTaskPool<T, R>({
   };
 
   return {
-    get concurrency() {
-      return maxWorkers;
-    },
-    get queued() {
-      return waitingQueue.length;
-    },
     get active() {
-      return Math.max(0, createdWorkersCount - idleWorkers.length);
+      return Math.max(0, workers.size - idleWorkers.length);
+    },
+    get size() {
+      return workers.size;
     },
     run,
     close,

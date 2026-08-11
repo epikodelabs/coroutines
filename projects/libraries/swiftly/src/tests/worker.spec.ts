@@ -248,7 +248,6 @@ idescribe("worker helpers", () => {
 
       const pool = createTaskPool<number, number>({
         name: "lazy-pool",
-        concurrency: 1,
         main: (value: number) => value,
         functions: [],
         generateWorkerScript: () => "lazy-pool-worker-script",
@@ -571,148 +570,47 @@ idescribe("worker helpers", () => {
     });
 
   describe("createTaskPool", () => {
-
-
-    it("schedules saturated pool waiters by priority and preserves FIFO ties", async () => {
-      Object.defineProperty(navigator, "hardwareConcurrency", {
-        value: 1,
-        configurable: true,
-      });
-
+    it("creates one worker per concurrent demand and reuses idle workers", async () => {
       const pool = createTaskPool<number, number>({
-        name: "priority-pool",
-        concurrency: 1,
-        maxQueued: 4,
+        name: "elastic-pool",
         main: (value: number) => value,
         functions: [],
         generateWorkerScript: () => "worker-script",
       });
 
-      const active = pool.run(1);
-      await flush();
-      const worker = MockWorker.instances[0];
-
-      const low = pool.run(2, { priority: -1 });
-      const highA = pool.run(3, { priority: 5 });
-      const highB = pool.run(4, { priority: 5 });
+      const first = pool.run(1);
+      const second = pool.run(2);
+      const third = pool.run(3);
       await flush();
 
-      worker.dispatch({ ...worker.sentMessages[0], type: "response", payload: 1 });
-      await expectAsync(active).toBeResolvedTo(1);
-      await flush();
+      expect(MockWorker.instances.length).toBe(3);
+      expect(pool.active).toBe(3);
+      expect(pool.size).toBe(3);
 
-      expect(worker.sentMessages[1].payload).toBe(3);
-      worker.dispatch({ ...worker.sentMessages[1], type: "response", payload: 3 });
-      await expectAsync(highA).toBeResolvedTo(3);
-      await flush();
-
-      expect(worker.sentMessages[2].payload).toBe(4);
-      worker.dispatch({ ...worker.sentMessages[2], type: "response", payload: 4 });
-      await expectAsync(highB).toBeResolvedTo(4);
-      await flush();
-
-      expect(worker.sentMessages[3].payload).toBe(2);
-      worker.dispatch({ ...worker.sentMessages[3], type: "response", payload: 2 });
-      await expectAsync(low).toBeResolvedTo(2);
-
-      await pool.dispose();
-    });
-
-
-    it("prevents starvation of low-priority pool waiters under sustained priority pressure", async () => {
-      const pool = createTaskPool<number, number>({
-        name: "fair-pool",
-        concurrency: 1,
-        maxQueued: 64,
-        main: (value: number) => value,
-        functions: [],
-        generateWorkerScript: () => "worker-script",
-      });
-
-      const active = pool.run(0);
-      await flush();
-      const worker = MockWorker.instances[0];
-
-      const low = pool.run(-1, { priority: -1000 });
-      const high = Array.from({ length: 40 }, (_, index) =>
-        pool.run(index + 1, { priority: 1000 })
-      );
-
-      worker.dispatch({ ...worker.sentMessages[0], type: "response", payload: 0 });
-      await active;
-
-      for (let index = 1; index <= 32; index++) {
-        await flush();
-        expect(worker.sentMessages[index].payload).toBe(index);
-        worker.dispatch({
-          ...worker.sentMessages[index],
-          type: "response",
-          payload: index,
-        });
-        await high[index - 1];
+      for (let index = 0; index < 3; index++) {
+        const worker = MockWorker.instances[index];
+        const message = worker.sentMessages[0];
+        worker.dispatch({ ...message, type: "response", payload: index + 10 });
       }
 
+      await expectAsync(first).toBeResolvedTo(10);
+      await expectAsync(second).toBeResolvedTo(11);
+      await expectAsync(third).toBeResolvedTo(12);
+      expect(pool.active).toBe(0);
+      expect(pool.size).toBe(3);
+
+      const reused = pool.run(4);
       await flush();
-      expect(worker.sentMessages[33].payload).toBe(-1);
-      worker.dispatch({
-        ...worker.sentMessages[33],
-        type: "response",
-        payload: -1,
-      });
-      await expectAsync(low).toBeResolvedTo(-1);
+      expect(MockWorker.instances.length).toBe(3);
+      const reusedWorker = MockWorker.instances.find((worker) => worker.sentMessages.length === 2)!;
+      const message = reusedWorker.sentMessages[1];
+      reusedWorker.dispatch({ ...message, type: "response", payload: 40 });
+      await expectAsync(reused).toBeResolvedTo(40);
 
-      await pool.dispose();
-      for (const pending of high.slice(32)) {
-        await expectAsync(pending).toBeRejected();
-      }
-    });
-
-    it("reuses a busy worker for queued runs when max workers is reached", async () => {
-      Object.defineProperty(navigator, "hardwareConcurrency", {
-        value: 1,
-        configurable: true,
-      });
-
-      const pool = createTaskPool<number, number>({
-        name: "pool",
-        main: (value: number) => value,
-        functions: [],
-        generateWorkerScript: () => "worker-script",
-      });
-
-      const firstRun = pool.run(1);
-      await flush();
-
-      const worker = MockWorker.instances[0];
-      expect(worker.sentMessages.length).toBe(1);
-
-      const secondRun = pool.run(2);
-      await flush();
-
-      expect(MockWorker.instances.length).toBe(1);
-      expect(worker.sentMessages.length).toBe(1);
-
-      const firstMessage = worker.sentMessages[0];
-      worker.dispatch({ ...firstMessage, type: "response", payload: 10 });
-      await flush();
-
-      expect(worker.sentMessages.length).toBe(2);
-
-      const secondMessage = worker.sentMessages[1];
-      worker.dispatch({ ...secondMessage, type: "response", payload: 20 });
-
-      await expectAsync(firstRun).toBeResolvedTo(10);
-      await expectAsync(secondRun).toBeResolvedTo(20);
       await pool.dispose();
     });
 
-
-    it("passes transfer lists through pooled submissions without reusing them", async () => {
-      Object.defineProperty(navigator, "hardwareConcurrency", {
-        value: 1,
-        configurable: true,
-      });
-
+    it("passes transfer lists through elastic pooled submissions", async () => {
       const pool = createTaskPool<ArrayBuffer, number>({
         name: "transfer-pool",
         main: (value: ArrayBuffer) => value.byteLength,
@@ -733,12 +631,7 @@ idescribe("worker helpers", () => {
       await pool.dispose();
     });
 
-    it("rejects work owned by a failed worker and replaces it for queued work", async () => {
-      Object.defineProperty(navigator, "hardwareConcurrency", {
-        value: 1,
-        configurable: true,
-      });
-
+    it("isolates a failed worker without affecting concurrent workers", async () => {
       const pool = createTaskPool<number, number>({
         name: "recovering-pool",
         main: (value: number) => value,
@@ -747,25 +640,21 @@ idescribe("worker helpers", () => {
       });
 
       const failedRun = pool.run(1);
+      const healthyRun = pool.run(2);
       await flush();
-      const failedWorker = MockWorker.instances[0];
 
-      const queuedRun = pool.run(2);
-      await flush();
-      expect(MockWorker.instances.length).toBe(1);
+      const failedWorker = MockWorker.instances[0];
+      const healthyWorker = MockWorker.instances[1];
 
       failedWorker.dispatchError(new Error("worker boom"));
       await expectAsync(failedRun).toBeRejectedWithError("worker boom");
-      await flush();
+
+      const healthyMessage = healthyWorker.sentMessages[0];
+      healthyWorker.dispatch({ ...healthyMessage, type: "response", payload: 20 });
+      await expectAsync(healthyRun).toBeResolvedTo(20);
 
       expect(failedWorker.terminated).toBeTrue();
-      expect(MockWorker.instances.length).toBe(2);
-
-      const replacement = MockWorker.instances[1];
-      const replacementMessage = replacement.sentMessages[0];
-      replacement.dispatch({ ...replacementMessage, type: "response", payload: 20 });
-
-      await expectAsync(queuedRun).toBeResolvedTo(20);
+      expect(pool.size).toBe(1);
       await pool.dispose();
     });
 
@@ -779,7 +668,6 @@ idescribe("worker helpers", () => {
       }
 
       (globalThis as any).Worker = ThrowingWorker;
-
       const ctorPool = createTaskPool<number, number>({
         name: "ctor-pool",
         main: (value: number) => value,
@@ -789,24 +677,6 @@ idescribe("worker helpers", () => {
 
       await expectAsync(ctorPool.run(1)).toBeRejectedWithError("worker ctor boom");
       await ctorPool.dispose();
-
-      class ThrowingErrorWorker {
-        constructor() {
-          throw new Error("worker ctor error");
-        }
-      }
-
-      (globalThis as any).Worker = ThrowingErrorWorker;
-
-      const errorCtorPool = createTaskPool<number, number>({
-        name: "ctor-error-pool",
-        main: (value: number) => value,
-        functions: [],
-        generateWorkerScript: () => "worker-script",
-      });
-
-      await expectAsync(errorCtorPool.run(1)).toBeRejectedWithError("worker ctor error");
-      await errorCtorPool.dispose();
 
       (globalThis as any).Worker = originalWorkerCtor;
 
@@ -819,15 +689,11 @@ idescribe("worker helpers", () => {
       });
 
       await expectAsync(postPool.run(1)).toBeRejectedWithError("postMessage boom");
+      expect(postPool.size).toBe(0);
       await postPool.dispose();
     });
 
-    it("rejects active and queued work when disposed, and rejects new runs after finalization", async () => {
-      Object.defineProperty(navigator, "hardwareConcurrency", {
-        value: 1,
-        configurable: true,
-      });
-
+    it("dispose rejects every active submission and releases all workers", async () => {
       const pool = createTaskPool<number, number>({
         name: "finalizing-pool",
         main: (value: number) => value,
@@ -835,83 +701,77 @@ idescribe("worker helpers", () => {
         generateWorkerScript: () => "worker-script",
       });
 
-      const active = pool.run(1);
+      const first = pool.run(1);
+      const second = pool.run(2);
       await flush();
-      const queued = pool.run(2);
+
+      expect(pool.active).toBe(2);
+      expect(pool.size).toBe(2);
 
       await pool.dispose();
 
-      await expectAsync(active).toBeRejectedWithError(
-        "finalizing-pool finalized before the worker task completed"
+      await expectAsync(first).toBeRejectedWithError(
+        "finalizing-pool finalized before the worker task completed",
       );
-      await expectAsync(queued).toBeRejectedWithError(
-        "finalizing-pool finalized before a worker became available"
+      await expectAsync(second).toBeRejectedWithError(
+        "finalizing-pool finalized before the worker task completed",
       );
       await expectAsync(pool.run(3)).toBeRejectedWithError(
-        "finalizing-pool is finalizing"
+        "finalizing-pool is finalizing",
       );
-      expect(warnSpy).not.toHaveBeenCalledWith("Worker not found.");
+      expect(pool.active).toBe(0);
+      expect(pool.size).toBe(0);
     });
 
-
-    it("continues graceful pool draining after an active worker fails", async () => {
+    it("close drains all concurrent admitted submissions before releasing workers", async () => {
       const pool = createTaskPool<number, number>({
-        name: "closing-failure-pool",
-        concurrency: 1,
-        maxQueued: 2,
+        name: "closing-pool",
         main: (value: number) => value,
         functions: [],
         generateWorkerScript: () => "worker-script",
       });
 
-      const active = pool.run(1);
+      const first = pool.run(1);
+      const second = pool.run(2);
       await flush();
-      const queued = pool.run(2);
+
       const closing = pool.close();
+      await expectAsync(pool.run(3)).toBeRejectedWithError("closing-pool is closed");
 
-      const failedWorker = MockWorker.instances[0];
-      failedWorker.dispatchError(new Error("pool worker failed during close"));
+      for (const worker of MockWorker.instances) {
+        const message = worker.sentMessages[0];
+        worker.dispatch({ ...message, type: "response", payload: message.payload * 10 });
+      }
 
-      await expectAsync(active).toBeRejectedWithError("pool worker failed during close");
-      await flush();
-
-      expect(MockWorker.instances.length).toBe(2);
-      const replacement = MockWorker.instances[1];
-      replacement.dispatch({
-        ...replacement.sentMessages[0],
-        type: "response",
-        payload: 22,
-      });
-
-      await expectAsync(queued).toBeResolvedTo(22);
+      await expectAsync(first).toBeResolvedTo(10);
+      await expectAsync(second).toBeResolvedTo(20);
       await expectAsync(closing).toBeResolved();
-      expect(replacement.terminated).toBeTrue();
+
+      expect(pool.active).toBe(0);
+      expect(pool.size).toBe(0);
+      expect(MockWorker.instances.every((worker) => worker.terminated)).toBeTrue();
     });
 
-    it("allows dispose to escalate a pool that is already closing", async () => {
+    it("allows dispose to escalate an elastic pool that is already closing", async () => {
       const pool = createTaskPool<number, number>({
         name: "close-dispose-pool",
-        concurrency: 1,
-        maxQueued: 2,
         main: (value: number) => value,
         functions: [],
         generateWorkerScript: () => "worker-script",
       });
 
-      const active = pool.run(1);
+      const first = pool.run(1);
+      const second = pool.run(2);
       await flush();
-      const queued = pool.run(2);
-      const worker = MockWorker.instances[0];
 
       const closing = pool.close();
       await pool.dispose();
 
-      await expectAsync(active).toBeRejectedWithError(/finalized before the worker task completed/);
-      await expectAsync(queued).toBeRejectedWithError(/finalized before a worker became available/);
+      await expectAsync(first).toBeRejectedWithError(/finalized before the worker task completed/);
+      await expectAsync(second).toBeRejectedWithError(/finalized before the worker task completed/);
       await expectAsync(closing).toBeResolved();
-      expect(worker.terminated).toBeTrue();
       expect(pool.active).toBe(0);
-      expect(pool.queued).toBe(0);
+      expect(pool.size).toBe(0);
     });
 
     it("uses a custom message handler and treats dispose as idempotent", async () => {
@@ -943,12 +803,7 @@ idescribe("worker helpers", () => {
       await pool.dispose();
     });
 
-    it("cancels active pooled work without poisoning queued submissions", async () => {
-      Object.defineProperty(navigator, "hardwareConcurrency", {
-        value: 1,
-        configurable: true,
-      });
-
+    it("cancels one active worker without poisoning concurrent submissions", async () => {
       const pool = createTaskPool<number, number>({
         name: "cancellable-pool",
         main: (value: number) => value,
@@ -958,22 +813,21 @@ idescribe("worker helpers", () => {
 
       const controller = new AbortController();
       const cancelled = pool.run(1, controller.signal);
+      const healthy = pool.run(2);
       await flush();
-      const queued = pool.run(2);
+
       const failedWorker = MockWorker.instances[0];
+      const healthyWorker = MockWorker.instances[1];
 
       controller.abort(new Error("cancel pooled task"));
       await expectAsync(cancelled).toBeRejectedWithError("cancel pooled task");
-      await flush();
+
+      const message = healthyWorker.sentMessages[0];
+      healthyWorker.dispatch({ ...message, type: "response", payload: 200 });
+      await expectAsync(healthy).toBeResolvedTo(200);
 
       expect(failedWorker.terminated).toBeTrue();
-      expect(MockWorker.instances.length).toBe(2);
-
-      const replacement = MockWorker.instances[1];
-      const message = replacement.sentMessages[0];
-      replacement.dispatch({ ...message, type: "response", payload: 200 });
-      await expectAsync(queued).toBeResolvedTo(200);
-
+      expect(pool.size).toBe(1);
       await pool.dispose();
     });
   });

@@ -1,5 +1,5 @@
 /**
- * Internal queued-work scheduler shared by dedicated runners and compute pools.
+ * Internal queued-work scheduler for execution paths that actually queue work.
  *
  * Priority is preferential, not absolute: after 32 bypasses the oldest waiting
  * item is promoted once. This bounds starvation while preserving strict FIFO

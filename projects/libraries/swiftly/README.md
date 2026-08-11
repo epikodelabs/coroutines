@@ -7,7 +7,7 @@ Swiftly treats concurrency as a programming model rather than exposing Web Worke
 ## Core model
 
 - `coroutine()` — reusable sequential submissions on one dedicated worker.
-- `compute()` — pooled worker execution for independent parallel submissions, including zero-copy transfer ownership.
+- `compute()` — reusable multi-worker execution for independent parallel submissions, including zero-copy transfer ownership.
 - `group()` — structured ownership for dynamic concurrent work, with fail-fast sibling cancellation and optional concurrency bounds.
 - `channel()` + `select()` — communication and coordination. `select()` can also race cancellable `operation()` cases.
 - `background()`, `withCancel()`, `withTimeout()`, `withDeadline()` — cancellation and lifetime propagation.
@@ -37,9 +37,19 @@ try {
 }
 ```
 
-`group({ concurrency: 4 })` bounds child execution without changing the child operation itself. Unlike `Promise.all()`, the group owns cancellation and failure propagation.
+This example has one explicit concurrency policy: `group({ concurrency: 4 })`. At most four group children may execute at once, so at most four `hash()` calls can be active at once.
 
-Calling `wait()` closes the group to new work. Cancelling the parent signal or calling `group.cancel()` propagates to running children and to children waiting for a concurrency permit.
+`compute()` does not choose another worker count underneath that policy. It owns a reusable list of workers: an idle worker is reused when available, otherwise another worker is created lazily for the concurrent call. As a result, this operation needs at most four compute workers because the group admits at most four concurrent calls.
+
+The responsibilities are intentionally separate:
+
+- `group()` owns task lifetime, failure propagation, cancellation, and concurrency.
+- `compute()` owns worker execution and worker reuse.
+
+Unlike `Promise.all()`, the group owns cancellation and failure propagation. Calling `wait()` closes the group to new work. Cancelling the parent signal or calling `group.cancel()` propagates to running children and to children waiting for a concurrency permit.
+
+When several independent groups share one compute runner, each group controls its own concurrency while the compute runner reuses the same worker list across them.
+
 
 ## Cancellable worker submissions
 
@@ -56,7 +66,7 @@ controller.abort();
 parse.run(source, { signal: controller.signal });
 ```
 
-A worker task cannot be pre-empted safely inside arbitrary JavaScript, so Swiftly cancels an active worker submission by terminating that worker. Dedicated coroutine workers are recreated for later queued work; compute pools retire only the cancelled worker and restore pool capacity. Queued submissions can be cancelled without starting a worker task.
+A worker task cannot be pre-empted safely inside arbitrary JavaScript, so Swiftly cancels an active worker submission by terminating that worker. Dedicated coroutine workers are recreated for later queued work; compute worker lists retire only the cancelled worker and restore pool capacity. Queued submissions can be cancelled without starting a worker task.
 
 `compose()` forwards the same cancellation signal through every runner stage.
 
@@ -150,27 +160,34 @@ This composes actor request lifetimes with task groups and contexts without
 inventing a separate timeout/retry API.
 
 
-## Bounded compute admission
+## Elastic compute workers
 
-`compute()` can bound both execution and waiting work:
+`compute()` is the multi-worker counterpart of `coroutine()`.
 
 ```ts
 const hash = compute(
   (value: string) => expensiveHash(value),
-  {
-    concurrency: 4,
-    maxQueued: 16,
-  },
 );
 ```
 
-`concurrency` is the maximum worker count. `maxQueued` is the maximum number of
-submissions allowed to wait for a worker after the pool is saturated. When that
-queue is full, further submissions reject immediately instead of growing an
-unbounded backlog.
+A coroutine owns one reusable worker and serializes its submissions through that worker. A compute runner owns a reusable **list** of workers. For each concurrent submission, Swiftly reuses an idle worker when possible and lazily creates another worker when all existing workers are busy.
 
-Compute runners expose `concurrency`, `active`, and `queued` so pressure can be
-observed without exposing Worker objects.
+There is deliberately no implicit `navigator.hardwareConcurrency` limit and no compute-local admission queue. `compute()` answers only the execution question: **where does this work run?**
+
+Concurrency policy belongs to structured coordination:
+
+```ts
+const work = group({ concurrency: 4 });
+
+const results = inputs.map((input) =>
+  work.spawn((signal) => hash(input, signal)),
+);
+```
+
+Here the group admits at most four hash operations concurrently, so the compute runner needs at most four workers for this operation. If a broader shared resource budget is needed across unrelated groups, use `semaphore()`.
+
+Compute runners expose `active` as lightweight execution observability: it is the number of workers currently executing submissions. The reusable worker list itself remains an implementation detail.
+
 
 ## Channel closure is explicit
 
@@ -215,9 +232,9 @@ for (let i = 0; i < 4; i++) {
 }
 ```
 
-The composition remains explicit: channel capacity bounds data in flight, group
-concurrency bounds owned operations, and compute pool settings bound worker and
-queue pressure.
+The composition remains explicit: channel capacity bounds data in flight,
+group concurrency bounds owned operations, and compute owns only worker execution
+and reuse.
 
 
 ## Graceful lifecycle
@@ -225,10 +242,7 @@ queue pressure.
 Worker-backed task runners distinguish graceful closure from immediate teardown.
 
 ```ts
-const worker = compute(expensiveWork, {
-  concurrency: 4,
-  maxQueued: 16,
-});
+const worker = compute(expensiveWork);
 
 // Already-admitted work is allowed to finish.
 await worker.close();
@@ -346,10 +360,10 @@ Higher numeric priorities are selected first **only while work is still waiting*
 Swiftly never preempts a running JavaScript task. Equal priorities preserve strict
 submission order, so the default `priority: 0` remains FIFO-compatible.
 
-The same rule applies to dedicated coroutine queues, saturated compute-pool
-admission, and composed runners. Cancellation removes queued work without
-reordering the remaining submissions, and graceful `close()` drains admitted
-work using the same scheduler policy.
+The rule applies wherever Swiftly actually has queued admission, such as a
+dedicated coroutine queue and composed queued runners. Elastic `compute()` does
+not maintain an admission queue, so priority does not create a hidden compute
+scheduling policy.
 
 Priority is deliberately a property of task admission rather than a separate
 scheduler abstraction. The runtime therefore gains scheduling semantics without
@@ -412,8 +426,8 @@ worker.run(urgentJob, { priority: 20 });
 ```
 
 Priority never preempts JavaScript that is already running. Fairness applies
-only at worker-admission boundaries and is shared by dedicated coroutines and
-compute pools. The rule is deterministic and has no timer dependency.
+only where work is actually waiting in a scheduler. Elastic compute submissions
+create or reuse a worker immediately, so compute itself has no priority queue.
 
 
 ## Structured completion reports
@@ -500,7 +514,7 @@ observation is attached before buffered ingress is flushed, so a transport
 failure during restart delivery cannot leave the supervisor watching a dead
 generation incorrectly.
 
-Dedicated runners and compute pools are regression-tested for the same lifecycle
+Dedicated runners and compute worker lists are regression-tested for the same lifecycle
 pressure: worker failure during graceful close must continue draining admitted
 queued work, while `dispose()` may escalate an in-progress close and settle the
 close promise without stranding callers.

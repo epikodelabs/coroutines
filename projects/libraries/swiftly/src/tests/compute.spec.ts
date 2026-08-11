@@ -87,78 +87,70 @@ idescribe("compute", () => {
     await run.dispose();
   });
 
-  it("should expose and enforce bounded pool admission", async () => {
-    const run = compute<number, number>(
-      async (x: number) => {
-        await new Promise((resolve) => setTimeout(resolve, 30));
-        return x * 2;
-      },
-      { concurrency: 1, maxQueued: 1 },
-    );
-
-    expect(run.concurrency).toBe(1);
+  it("should grow elastically with concurrent demand and reuse workers", async () => {
+    const run = compute<number, number>(async (x: number) => {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      return x * 2;
+    });
 
     const first = run(1);
     const second = run(2);
     const third = run(3);
 
-    expect(run.queued).toBe(1);
-    await expectAsync(third).toBeRejectedWithError(/queue capacity exceeded/);
+    expect(run.active).toBe(3);
 
     expect(await first).toBe(2);
     expect(await second).toBe(4);
-    expect(run.queued).toBe(0);
+    expect(await third).toBe(6);
+
+    expect(run.active).toBe(0);
+
+    expect(await run(4)).toBe(8);
 
     await run.dispose();
   });
 
-  it("should preserve helper-function overloads with compute options support", async () => {
+  it("should preserve helper-function overloads without compute policy options", async () => {
     function addOne(x: number) {
       return x + 1;
     }
 
-    const legacy = compute<number, number>(
+    const run = compute<number, number>(
       (x: number) => addOne(x),
       addOne,
     );
-    const configured = compute<number, number>(
-      (x: number) => addOne(x),
-      { concurrency: 2 },
-      addOne,
-    );
 
-    expect(await legacy(4)).toBe(5);
-    expect(await configured(4)).toBe(5);
-    expect(configured.concurrency).toBe(2);
-
-    await legacy.dispose();
-    await configured.dispose();
-  });
-
-  it("should apply pool options to computeScript", async () => {
-    const run = computeScript<number, number>(
-      { main: (x: number) => x + 1 },
-      { concurrency: 1, maxQueued: 0 },
-    );
-
-    expect(run.concurrency).toBe(1);
-    expect(run.queued).toBe(0);
+    expect(await run(4)).toBe(5);
+    expect(run.active).toBe(0);
 
     await run.dispose();
   });
 
+  it("should create elastic compute runners from coroutine scripts", async () => {
+    const run = computeScript<number, number>({
+      main: async (x: number) => {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        return x + 1;
+      },
+    });
 
+    const first = run(1);
+    const second = run(2);
 
-  it("should compose bounded channels, groups, and compute without an extra pipeline abstraction", async () => {
+    expect(run.active).toBe(2);
+    expect(await first).toBe(2);
+    expect(await second).toBe(3);
+
+    await run.dispose();
+  });
+
+  it("should compose bounded channels, groups, and elastic compute without an extra pipeline abstraction", async () => {
     const input = channel<number>(2);
     const output = channel<number>(2);
-    const run = compute<number, number>(
-      async (x: number) => {
-        await new Promise((resolve) => setTimeout(resolve, 2));
-        return x * x;
-      },
-      { concurrency: 2, maxQueued: 2 },
-    );
+    const run = compute<number, number>(async (x: number) => {
+      await new Promise((resolve) => setTimeout(resolve, 2));
+      return x * x;
+    });
     const work = group({ concurrency: 3 });
     const collected: number[] = [];
 
@@ -191,20 +183,15 @@ idescribe("compute", () => {
     await collector;
 
     expect(collected.slice().sort((a, b) => a - b)).toEqual([1, 4, 9, 16, 25, 36]);
-    expect(run.queued).toBe(0);
+    expect(run.active).toBe(0);
     await run.dispose();
   });
 
-
-
-  it("close drains admitted compute work including queued submissions", async () => {
-    const run = compute<number, number>(
-      async (x: number) => {
-        await new Promise((resolve) => setTimeout(resolve, 10));
-        return x * 3;
-      },
-      { concurrency: 1, maxQueued: 4 },
-    );
+  it("close drains every admitted elastic compute submission", async () => {
+    const run = compute<number, number>(async (x: number) => {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      return x * 3;
+    });
 
     const first = run(1);
     const second = run(2);
@@ -217,28 +204,23 @@ idescribe("compute", () => {
     expect(await third).toBe(9);
     await expectAsync(closing).toBeResolved();
     expect(run.active).toBe(0);
-    expect(run.queued).toBe(0);
   });
 
-  it("dispose rejects active and waiting compute submissions immediately", async () => {
-    const run = compute<number, number>(
-      async (x: number) => {
-        await new Promise((resolve) => setTimeout(resolve, 30));
-        return x;
-      },
-      { concurrency: 1, maxQueued: 2 },
-    );
+  it("dispose rejects all active elastic compute submissions immediately", async () => {
+    const run = compute<number, number>(async (x: number) => {
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      return x;
+    });
 
-    const active = run(1);
-    const queued = run(2);
+    const first = run(1);
+    const second = run(2);
 
     await run.dispose();
 
-    await expectAsync(active).toBeRejected();
-    await expectAsync(queued).toBeRejected();
+    await expectAsync(first).toBeRejected();
+    await expectAsync(second).toBeRejected();
     await expectAsync(run.close()).toBeResolved();
   });
-
 
   it("transfers ArrayBuffer ownership into and back out of compute workers", async () => {
     const run = compute<ArrayBuffer, ArrayBuffer>((buffer, { transfer }) => {
@@ -260,28 +242,29 @@ idescribe("compute", () => {
     await run.dispose();
   });
 
-  it("does not transfer queued compute input when cancellation wins first", async () => {
-    const run = compute<{ delay: number; buffer: ArrayBuffer }, number>(
-      async ({ delay, buffer }) => {
-        await new Promise((resolve) => setTimeout(resolve, delay));
-        return buffer.byteLength;
-      },
-      { concurrency: 1, maxQueued: 2 },
-    );
+  it("does not transfer group-gated compute input when cancellation wins before admission", async () => {
+    const run = compute<ArrayBuffer, number>((buffer) => buffer.byteLength);
+    const work = group({ concurrency: 1 });
+    const blocker = new Promise<void>(() => {});
 
-    const occupying = run({ delay: 30, buffer: new ArrayBuffer(1) });
-    const controller = new AbortController();
+    work.spawn(async (signal) => {
+      await new Promise<void>((_resolve, reject) => {
+        signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+      });
+      await blocker;
+    }).catch(() => undefined);
+
     const queuedBuffer = new ArrayBuffer(16);
-    const queued = run(
-      { delay: 0, buffer: queuedBuffer },
-      { signal: controller.signal, transfer: [queuedBuffer] },
+    const pending = work.spawn((signal) =>
+      run(queuedBuffer, { signal, transfer: [queuedBuffer] }),
     );
 
-    controller.abort(new Error("cancel queued transfer"));
+    work.cancel(new Error("cancel before compute admission"));
 
-    await expectAsync(queued).toBeRejectedWithError("cancel queued transfer");
+    await expectAsync(pending).toBeRejected();
     expect(queuedBuffer.byteLength).toBe(16);
-    await occupying;
+
+    await work.settle();
     await run.dispose();
   });
 
