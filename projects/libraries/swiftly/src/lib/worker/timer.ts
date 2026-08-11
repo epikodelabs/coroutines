@@ -70,7 +70,9 @@ const failPendingTimers = (error: Error): void => {
   }
 
   if (callbackError !== undefined) {
-    throw callbackError;
+    queueMicrotask(() => {
+      throw callbackError;
+    });
   }
 };
 

@@ -1,8 +1,9 @@
-// utils/image-processing.utils.ts
+import type { WorkerTaskResult, WorkerTaskUtils } from '@epikodelabs/swiftly';
 
 export interface FileTask {
   file: File;
   id: string;
+  settings: ProcessingSettings;
 }
 
 export interface ProcessingSettings {
@@ -33,18 +34,14 @@ export interface ProcessInput {
   fileName: string;
 }
 
-export interface ResizeOutput extends ProcessInput {
-  resizedBlob: ArrayBuffer;
-  resizedSize: number;
-}
-
-export interface CompressOutput extends ResizeOutput {
+export interface ProcessOutput extends ProcessInput {
   finalBlob: ArrayBuffer;
+  resizedSize: number;
   compressedSize: number;
 }
 
 export interface JobProgress {
-  stage: 'resize' | 'compress' | 'idle';
+  stage: 'processing' | 'idle';
   percent: number;
   taskId?: string;
 }
@@ -63,22 +60,18 @@ export interface ProcessedResult {
 }
 
 /**
- * Resizes an image using OffscreenCanvas inside a Web Worker.
+ * Resizes and encodes an image inside one worker task.
  */
-export async function resizeImage(
+export async function processImage(
   data: ProcessInput,
-  utils: { outbox: { send: (to: string, topic: string, payload: JobProgress) => void } }
-): Promise<ResizeOutput> {
-  utils.outbox.send('main', 'progress', { stage: 'resize', percent: 10, taskId: data.taskId });
-
+  utils: WorkerTaskUtils,
+): Promise<WorkerTaskResult<ProcessOutput>> {
   const imageBitmap = await createImageBitmap(new Blob([data.blob]));
   const ratio = Math.min(data.width / imageBitmap.width, data.height / imageBitmap.height, 1);
-  const w = Math.round(imageBitmap.width * ratio);
-  const h = Math.round(imageBitmap.height * ratio);
+  const width = Math.round(imageBitmap.width * ratio);
+  const height = Math.round(imageBitmap.height * ratio);
 
-  utils.outbox.send('main', 'progress', { stage: 'resize', percent: 40, taskId: data.taskId });
-
-  const canvas = new OffscreenCanvas(w, h);
+  const canvas = new OffscreenCanvas(width, height);
   const ctx = canvas.getContext('2d');
   if (!ctx) throw new Error('No 2D context');
 
@@ -86,55 +79,21 @@ export async function resizeImage(
     ctx.filter = 'grayscale(100%)';
   }
 
-  ctx.drawImage(imageBitmap, 0, 0, w, h);
+  ctx.drawImage(imageBitmap, 0, 0, width, height);
   imageBitmap.close();
-
-  utils.outbox.send('main', 'progress', { stage: 'resize', percent: 80, taskId: data.taskId });
-
-  const outputBlob = await canvas.convertToBlob({ type: data.format, quality: data.quality });
-  const resizedBlob = await outputBlob.arrayBuffer();
-
-  utils.outbox.send('main', 'progress', { stage: 'resize', percent: 100, taskId: data.taskId });
-
-  return {
-    ...data,
-    width: w,
-    height: h,
-    resizedBlob,
-    resizedSize: outputBlob.size,
-  };
-}
-
-/**
- * Re-encodes the resized image at the target quality/format.
- */
-export async function compressImage(
-  data: ResizeOutput,
-  utils: { outbox: { send: (to: string, topic: string, payload: JobProgress) => void } }
-): Promise<CompressOutput> {
-  utils.outbox.send('main', 'progress', { stage: 'compress', percent: 10, taskId: data.taskId });
-
-  const imageBitmap = await createImageBitmap(new Blob([data.resizedBlob]));
-
-  utils.outbox.send('main', 'progress', { stage: 'compress', percent: 40, taskId: data.taskId });
-
-  const canvas = new OffscreenCanvas(data.width, data.height);
-  const ctx = canvas.getContext('2d');
-  if (!ctx) throw new Error('No 2D context');
-
-  ctx.drawImage(imageBitmap, 0, 0);
-  imageBitmap.close();
-
-  utils.outbox.send('main', 'progress', { stage: 'compress', percent: 70, taskId: data.taskId });
 
   const outputBlob = await canvas.convertToBlob({ type: data.format, quality: data.quality });
   const finalBlob = await outputBlob.arrayBuffer();
 
-  utils.outbox.send('main', 'progress', { stage: 'compress', percent: 100, taskId: data.taskId });
-
-  return {
-    ...data,
+  return utils.transfer(
+    {
+      ...data,
+      width,
+      height,
+      finalBlob,
+      resizedSize: outputBlob.size,
+      compressedSize: outputBlob.size,
+    },
     finalBlob,
-    compressedSize: outputBlob.size,
-  };
+  );
 }

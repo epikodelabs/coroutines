@@ -11,6 +11,31 @@ function isCoroutineScript(value: unknown): value is CoroutineScript {
   );
 }
 
+async function composedCoroutineMain(data: any, utils: any): Promise<any> {
+  const stages = (globalThis as typeof globalThis & {
+    __composeStages?: Array<(value: any, utils: any) => any>;
+  }).__composeStages;
+
+  if (!Array.isArray(stages)) {
+    throw new Error("compose stages are not initialized");
+  }
+
+  let result = data;
+  for (let index = 0; index < stages.length; index += 1) {
+    result = await stages[index](result, utils);
+    if (
+      index < stages.length - 1 &&
+      result &&
+      typeof result === "object" &&
+      (result as { __transferResult?: boolean }).__transferResult === true
+    ) {
+      result = (result as { value: any }).value;
+    }
+  }
+
+  return result;
+}
+
 /**
  * Merges multiple `CoroutineScript`s into a single composed script suitable for
  * baking into a worker blob via `createTaskRunner`.
@@ -36,34 +61,23 @@ ${depsSection ? '  ' + depsSection.replace(/\n/g, '\n  ') + '\n' : ''}  return (
 })();`;
     })
     .reduce((acc, body, i) => `${acc}${i > 0 ? '\n\n' : ''}${body}`, '');
-
-  const composedMain = new Function(
-    `return async function(data, utils) {
-      let result = data;
-      ${scripts
-        .map((_, i) =>
-          i === scripts.length - 1
-            ? `result = await __stage${i}(result, utils);`
-            : `result = await __stage${i}(result, utils);\n      if (result && result.__swiftlyTransferResult === true) result = result.value;`
-        )
-        .reduce((acc, line, i) => `${acc}${i > 0 ? "\n      " : ""}${line}`, "")}
-      return result;
-    };`
-  )() as (data: any) => Promise<any>;
+  const stageRegistry = `globalThis.__composeStages = [${scripts
+    .map((_, i) => `__stage${i}`)
+    .join(", ")}];`;
 
   const generateScript = (task: Function, taskHelpers?: string[]) => {
     const allHelpers = Array.from(
       new Set([...(taskHelpers || []), ...helpers])
     );
     return buildWorkerScript({
-      helpers: [stageBodies, ...allHelpers],
+      helpers: [stageBodies, stageRegistry, ...allHelpers],
       main: task,
       functions: [],
       runtime: buildCoroutineWorkerRuntime(),
     });
   };
 
-  return { main: composedMain, helpers, generateScript };
+  return { main: composedCoroutineMain, helpers, generateScript };
 }
 
 /**

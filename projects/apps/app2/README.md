@@ -1,15 +1,17 @@
-# App 6 — Image Processor
+# App 2 - Image Processor
 
-Reactive image pipeline with `swiftly` workers and a direct async queue.
+Reactive image pipeline with `swiftly` workers and group-bounded concurrency.
 
 ## What it demonstrates
 
-- **Reactive image pipeline** — drag-and-drop → process → download
-- **Custom pipes** — `fileSize` formatting
-- **Service-based streams** — `ImagePipelineService` exposing operator chains
+- **Reactive image pipeline** - drag-and-drop to process to download
+- **`group`** - bounds how many image jobs run at once
+- **`coroutine`** - performs resize and encode in one worker task
+- **Custom pipes** - `fileSize` formatting
+- **Signal-based service state** - `ImagePipelineService` exposes jobs and settings
 
 ## Run
 
 ```bash
-ng serve app6
+ng serve app2
 ```

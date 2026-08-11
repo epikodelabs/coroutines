@@ -6,29 +6,29 @@
  * itself is authored and reviewed separately from actor lifecycle code.
  */
 export const ACTOR_CONCURRENCY_RUNTIME = `
-class __swiftlyChannelClosedError extends Error {
+class __channelClosedError extends Error {
   constructor(message = "channel is closed") {
     super(message);
     this.name = "ChannelClosedError";
   }
 }
 
-class __swiftlyContextCancelledError extends Error {
+class __contextCancelledError extends Error {
   constructor(message = "context cancelled") {
     super(message);
     this.name = "ContextCancelledError";
   }
 }
 
-const __swiftlyCreateAbortError = (signal) => {
+const __createAbortError = (signal) => {
   const reason = signal?.reason;
   if (reason instanceof Error) return reason;
-  return new __swiftlyContextCancelledError(reason ? String(reason) : undefined);
+  return new __contextCancelledError(reason ? String(reason) : undefined);
 };
 
-const __swiftlyChannelInternals = Symbol("swiftly.channelInternals");
+const __channelInternals = Symbol("swiftly.channelInternals");
 
-const __swiftlyChannel = (capacity = 0) => {
+const __channel = (capacity = 0) => {
   if (!Number.isInteger(capacity) || capacity < 0) {
     throw new RangeError("channel capacity must be a non-negative integer");
   }
@@ -241,8 +241,8 @@ const __swiftlyChannel = (capacity = 0) => {
   };
 
   const sendValue = (value, signal) => {
-    if (isClosed) return Promise.reject(new __swiftlyChannelClosedError());
-    if (signal?.aborted) return Promise.reject(__swiftlyCreateAbortError(signal));
+    if (isClosed) return Promise.reject(new __channelClosedError());
+    if (signal?.aborted) return Promise.reject(__createAbortError(signal));
 
     if (tryDispatchToWaitingReceiver(value)) {
       return Promise.resolve();
@@ -258,7 +258,7 @@ const __swiftlyChannel = (capacity = 0) => {
       if (signal) {
         sender.abort = () => {
           removeSender(sender);
-          reject(__swiftlyCreateAbortError(signal));
+          reject(__createAbortError(signal));
         };
         signal.addEventListener("abort", sender.abort, { once: true });
       }
@@ -282,14 +282,14 @@ const __swiftlyChannel = (capacity = 0) => {
       return Promise.resolve({ ok: false, value: undefined });
     }
 
-    if (signal?.aborted) return Promise.reject(__swiftlyCreateAbortError(signal));
+    if (signal?.aborted) return Promise.reject(__createAbortError(signal));
 
     return new Promise((resolve, reject) => {
       const receiver = { resolve, reject, signal };
       if (signal) {
         receiver.abort = () => {
           removeReceiver(receiver);
-          reject(__swiftlyCreateAbortError(signal));
+          reject(__createAbortError(signal));
         };
         signal.addEventListener("abort", receiver.abort, { once: true });
       }
@@ -352,7 +352,7 @@ const __swiftlyChannel = (capacity = 0) => {
       while (senders.length > 0) {
         const sender = senders.shift();
         cleanupSender(sender);
-        const error = new __swiftlyChannelClosedError();
+        const error = new __channelClosedError();
         if (sender.select) {
           rejectSelectedWaiter(sender, error);
         } else {
@@ -360,7 +360,7 @@ const __swiftlyChannel = (capacity = 0) => {
         }
       }
     },
-    [__swiftlyChannelInternals]: {
+    [__channelInternals]: {
       registerSelectReceive(registration, meta) {
         if (registration.isSettled()) {
           return () => {};
@@ -392,7 +392,7 @@ const __swiftlyChannel = (capacity = 0) => {
         }
 
         if (isClosed) {
-          registration.reject(new __swiftlyChannelClosedError());
+          registration.reject(new __channelClosedError());
           return () => {};
         }
 
@@ -417,7 +417,7 @@ const __swiftlyChannel = (capacity = 0) => {
   };
 };
 
-const __swiftlyCreateContext = (controller) => {
+const __createContext = (controller) => {
   const signal = controller.signal;
   const done = new Promise((resolve) => {
     if (signal.aborted) {
@@ -436,14 +436,14 @@ const __swiftlyCreateContext = (controller) => {
   };
 };
 
-const __swiftlyBackgroundContext =
-  __swiftlyCreateContext(new AbortController());
-const __swiftlyBackground = () => __swiftlyBackgroundContext;
+const __backgroundContext =
+  __createContext(new AbortController());
+const __background = () => __backgroundContext;
 
-const __swiftlyWithCancel = (parent = __swiftlyBackground()) => {
+const __withCancel = (parent = __background()) => {
   const controller = new AbortController();
   const onParentAbort = () =>
-    controller.abort(parent.reason ?? new __swiftlyContextCancelledError());
+    controller.abort(parent.reason ?? new __contextCancelledError());
 
   if (parent.signal.aborted) {
     onParentAbort();
@@ -451,8 +451,8 @@ const __swiftlyWithCancel = (parent = __swiftlyBackground()) => {
     parent.signal.addEventListener("abort", onParentAbort, { once: true });
   }
 
-  const ctx = __swiftlyCreateContext(controller);
-  const cancel = (reason = new __swiftlyContextCancelledError()) => {
+  const ctx = __createContext(controller);
+  const cancel = (reason = new __contextCancelledError()) => {
     parent.signal.removeEventListener("abort", onParentAbort);
     if (!controller.signal.aborted) controller.abort(reason);
   };
@@ -460,36 +460,36 @@ const __swiftlyWithCancel = (parent = __swiftlyBackground()) => {
   return [ctx, cancel];
 };
 
-const __swiftlyWithTimeout = (parent, ms) => {
+const __withTimeout = (parent, ms) => {
   if (!Number.isFinite(ms) || ms < 0) {
     throw new RangeError("timer duration must be a finite non-negative number");
   }
 
-  const [ctx, cancel] = __swiftlyWithCancel(parent);
-  const timer = setTimeout(() => cancel(new __swiftlyContextCancelledError("context timeout after " + ms + "ms")), ms);
+  const [ctx, cancel] = __withCancel(parent);
+  const timer = setTimeout(() => cancel(new __contextCancelledError("context timeout after " + ms + "ms")), ms);
   ctx.done.finally(() => clearTimeout(timer));
   return [ctx, cancel];
 };
 
-const __swiftlyWithDeadline = (parent, deadline) => {
+const __withDeadline = (parent, deadline) => {
   const time = typeof deadline === "number" ? deadline : deadline.getTime();
   const remaining = time - Date.now();
 
   if (remaining <= 0) {
-    const [ctx, cancel] = __swiftlyWithCancel(parent);
-    cancel(new __swiftlyContextCancelledError("context deadline exceeded"));
+    const [ctx, cancel] = __withCancel(parent);
+    cancel(new __contextCancelledError("context deadline exceeded"));
     return [ctx, cancel];
   }
 
-  return __swiftlyWithTimeout(parent, remaining);
+  return __withTimeout(parent, remaining);
 };
 
-const __swiftlySleep = (ms, signal) => {
+const __sleep = (ms, signal) => {
   if (!Number.isFinite(ms) || ms < 0) {
     return Promise.reject(new RangeError("timer duration must be a finite non-negative number"));
   }
   if (signal?.aborted) {
-    return Promise.reject(__swiftlyCreateAbortError(signal));
+    return Promise.reject(__createAbortError(signal));
   }
 
   return new Promise((resolve, reject) => {
@@ -501,7 +501,7 @@ const __swiftlySleep = (ms, signal) => {
     const abort = () => {
       clearTimeout(timer);
       cleanup();
-      reject(__swiftlyCreateAbortError(signal));
+      reject(__createAbortError(signal));
     };
 
     const cleanup = () => signal?.removeEventListener("abort", abort);
@@ -509,12 +509,12 @@ const __swiftlySleep = (ms, signal) => {
   });
 };
 
-const __swiftlyRecv = (ch, name) => ({ op: "receive", channel: ch, name });
-const __swiftlySend = (ch, value, name) => ({ op: "send", channel: ch, value, name });
-const __swiftlyOtherwise = (name = "default") => ({ op: "default", name });
-const __swiftlyOperation = (run, name) => ({ op: "operation", run, name });
+const __recv = (ch, name) => ({ op: "receive", channel: ch, name });
+const __send = (ch, value, name) => ({ op: "send", channel: ch, value, name });
+const __otherwise = (name = "default") => ({ op: "default", name });
+const __operation = (run, name) => ({ op: "operation", run, name });
 
-const __swiftlyShuffledIndices = (length) => {
+const __shuffledIndices = (length) => {
   const indices = Array.from({ length }, (_, i) => i);
   for (let i = length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1));
@@ -523,8 +523,8 @@ const __swiftlyShuffledIndices = (length) => {
   return indices;
 };
 
-const __swiftlySelect = async (cases, ctx = __swiftlyBackground()) => {
-  if (ctx.signal.aborted) throw __swiftlyCreateAbortError(ctx.signal);
+const __select = async (cases, ctx = __background()) => {
+  if (ctx.signal.aborted) throw __createAbortError(ctx.signal);
   if (cases.length === 0) {
     throw new RangeError("select requires at least one case");
   }
@@ -540,7 +540,7 @@ const __swiftlySelect = async (cases, ctx = __swiftlyBackground()) => {
     .map((item, i) => ({ item, i }))
     .filter(({ item }) => item.op === "receive" || item.op === "send")
     .map(({ i }) => i);
-  const randomChannelOrder = __swiftlyShuffledIndices(channelIndices.length).map((j) => channelIndices[j]);
+  const randomChannelOrder = __shuffledIndices(channelIndices.length).map((j) => channelIndices[j]);
 
   for (const index of randomChannelOrder) {
     const item = cases[index];
@@ -551,7 +551,7 @@ const __swiftlySelect = async (cases, ctx = __swiftlyBackground()) => {
       }
     } else if (item.op === "send") {
       if (item.channel.closed) {
-        throw new __swiftlyChannelClosedError();
+        throw new __channelClosedError();
       }
       if (item.channel.trySend(item.value)) {
         return { index, case: item, op: item.op, name: item.name, ok: true };
@@ -567,7 +567,7 @@ const __swiftlySelect = async (cases, ctx = __swiftlyBackground()) => {
   const contenders = cases
     .map((item, i) => ({ item, i }))
     .filter(({ item }) => item.op !== "default");
-  const randomOrder = __swiftlyShuffledIndices(contenders.length).map((j) => contenders[j].i);
+  const randomOrder = __shuffledIndices(contenders.length).map((j) => contenders[j].i);
   const selectId = Symbol("swiftly.select");
   let settled = false;
   let winnerIndex = -1;
@@ -588,7 +588,7 @@ const __swiftlySelect = async (cases, ctx = __swiftlyBackground()) => {
         if (settled) return false;
         settled = true;
         winnerIndex = result.index;
-        abortLosingOperations(new __swiftlyContextCancelledError("select case lost"));
+        abortLosingOperations(new __contextCancelledError("select case lost"));
         resolve(result);
         return true;
       };
@@ -617,7 +617,7 @@ const __swiftlySelect = async (cases, ctx = __swiftlyBackground()) => {
       };
 
       const onContextAbort = () => {
-        rejectSelection(__swiftlyCreateAbortError(ctx.signal));
+        rejectSelection(__createAbortError(ctx.signal));
       };
 
       ctx.signal.addEventListener("abort", onContextAbort, { once: true });
@@ -636,9 +636,9 @@ const __swiftlySelect = async (cases, ctx = __swiftlyBackground()) => {
           continue;
         }
 
-        const internals = item.channel[__swiftlyChannelInternals];
+        const internals = item.channel[__channelInternals];
         if (!internals) {
-          rejectSelection(new __swiftlyContextCancelledError("channel does not support select"));
+          rejectSelection(new __contextCancelledError("channel does not support select"));
           break;
         }
 
@@ -694,24 +694,24 @@ const __swiftlySelect = async (cases, ctx = __swiftlyBackground()) => {
     while (cleanupFns.length > 0) {
       cleanupFns.pop()();
     }
-    abortLosingOperations(new __swiftlyContextCancelledError("select completed"));
+    abortLosingOperations(new __contextCancelledError("select completed"));
   }
 };
 
-const __swiftlyConcurrency = Object.freeze({
-  channel: __swiftlyChannel,
-  receive: __swiftlyRecv,
-  send: __swiftlySend,
-  otherwise: __swiftlyOtherwise,
-  operation: __swiftlyOperation,
-  select: __swiftlySelect,
-  background: __swiftlyBackground,
-  withCancel: __swiftlyWithCancel,
-  withTimeout: __swiftlyWithTimeout,
-  withDeadline: __swiftlyWithDeadline,
-  sleep: __swiftlySleep,
-  ChannelClosedError: __swiftlyChannelClosedError,
-  ContextCancelledError: __swiftlyContextCancelledError,
+const __concurrency = Object.freeze({
+  channel: __channel,
+  receive: __recv,
+  send: __send,
+  otherwise: __otherwise,
+  operation: __operation,
+  select: __select,
+  background: __background,
+  withCancel: __withCancel,
+  withTimeout: __withTimeout,
+  withDeadline: __withDeadline,
+  sleep: __sleep,
+  ChannelClosedError: __channelClosedError,
+  ContextCancelledError: __contextCancelledError,
 });
 
 `;

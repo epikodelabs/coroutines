@@ -6,9 +6,8 @@ import type { CoroutineScript } from "./types";
  */
 const ASYNC_WORKER_BOOTSTRAP = `var __defProp=Object.defineProperty,__defProps=Object.defineProperties,__getOwnPropDescs=Object.getOwnPropertyDescriptors,__getOwnPropSymbols=Object.getOwnPropertySymbols,__hasOwnProp=Object.prototype.hasOwnProperty,__propIsEnum=Object.prototype.propertyIsEnumerable,__knownSymbol=(r,e)=>(e=Symbol[r])?e:Symbol.for("Symbol."+r),__defNormalProp=(r,e,o)=>e in r?__defProp(r,e,{enumerable:!0,configurable:!0,writable:!0,value:o}):r[e]=o,__spreadValues=(r,e)=>{for(var o in e||={})__hasOwnProp.call(e,o)&&__defNormalProp(r,o,e[o]);if(__getOwnPropSymbols)for(var o of __getOwnPropSymbols(e))__propIsEnum.call(e,o)&&__defNormalProp(r,o,e[o]);return r},__spreadProps=(r,e)=>__defProps(r,__getOwnPropDescs(e)),__async=(r,e,o)=>new Promise((t,n)=>{var a=r=>{try{s(o.next(r))}catch(e){n(e)}},p=r=>{try{s(o.throw(r))}catch(e){n(e)}},s=r=>r.done?t(r.value):Promise.resolve(r.value).then(a,p);s((o=o.apply(r,e)).next())}),__await=function(r,e){this[0]=r,this[1]=e},__asyncGenerator=(r,e,o)=>{var t=(r,e,n,a)=>{try{var p=o[r](e),s=(e=p.value)instanceof __await,l=p.done;Promise.resolve(s?e[0]:e).then(o=>s?t("return"===r?r:"next",e[1]?{done:o.done,value:o.value}:o,n,a):n({value:o,done:l})).catch(r=>t("throw",r,n,a))}catch(y){a(y)}},n=r=>a[r]=e=>new Promise((o,n)=>t(r,e,o,n)),a={};return o=o.apply(r,e),a[__knownSymbol("asyncIterator")] =()=>a,n("next"),n("throw"),n("return"),a};`;
 
-
 const TRANSFER_WORKER_BOOTSTRAP = `
-const __swiftlyWorkerUtils = Object.freeze({
+const __workerUtils = Object.freeze({
   transfer(value, ...transferables) {
     const seen = new Set();
     for (const item of transferables) {
@@ -19,18 +18,52 @@ const __swiftlyWorkerUtils = Object.freeze({
     }
 
     return {
-      __swiftlyTransferResult: true,
+      __transferResult: true,
       value,
       transfer: transferables,
     };
   },
 });`;
 
+const NAMED_FUNCTION_DECLARATION_RE =
+  /^(async\s+)?function(?:\s+[A-Za-z_$][\w$]*)\s*\(/;
+const METHOD_SHORTHAND_RE =
+  /^(async\s+)?([A-Za-z_$][\w$]*)\s*\(/;
+
+const normalizeCallableSource = (fn: Function): string => {
+  const source = fn.toString().trim();
+
+  if (source.startsWith("function") || source.startsWith("async function")) {
+    return source;
+  }
+
+  const methodMatch = METHOD_SHORTHAND_RE.exec(source);
+  if (!methodMatch) {
+    return source;
+  }
+
+  const [, asyncPrefix = "", name] = methodMatch;
+  return source.replace(
+    METHOD_SHORTHAND_RE,
+    `${asyncPrefix}function ${name}(`,
+  );
+};
+
+const serializeDependencyFunction = (fn: Function, index: number): string => {
+  const source = normalizeCallableSource(fn);
+  if (NAMED_FUNCTION_DECLARATION_RE.test(source)) {
+    return source;
+  }
+
+  const bindingName = fn.name || `__helper${index}`;
+  return `const ${bindingName} = ${source};`;
+};
+
 /**
  * Serializes helper and task functions for worker-script injection.
  */
 export function serializeFunction(fn: Function): string {
-  return fn.toString().replace(/function[\s]*\(/, `function ${fn.name || ""}(`);
+  return normalizeCallableSource(fn);
 }
 
 /**
@@ -78,7 +111,9 @@ export function buildWorkerScript({
   runtime: string;
 }): string {
   const helperSections = [ASYNC_WORKER_BOOTSTRAP, TRANSFER_WORKER_BOOTSTRAP, ...(helpers || [])];
-  const dependencySection = functions.map(serializeFunction).join(";\n");
+  const dependencySection = functions
+    .map((fn, index) => serializeDependencyFunction(fn, index))
+    .join("\n");
   const mainSection = `const __mainTask = ${serializeFunction(main)};`;
 
   return joinScriptSections([

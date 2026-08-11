@@ -14,7 +14,7 @@ export type TaskRunControl = AbortSignal | TaskRunOptions | undefined;
 
 /** Marker returned by worker task utilities when a result should be transferred. */
 export type TransferResult<T> = {
-  readonly __swiftlyTransferResult: true;
+  readonly __transferResult: true;
   readonly value: T;
   readonly transfer: readonly Transferable[];
 };

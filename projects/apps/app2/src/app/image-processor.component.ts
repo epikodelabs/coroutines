@@ -11,7 +11,7 @@ import { ImagePipelineService } from './image-pipeline.service';
     <div class="app">
       <header class="header">
         <h1>🖼️ Smart Image Processor</h1>
-        <p class="subtitle">Resize, compress &amp; convert images with swiftly workers</p>
+        <p class="subtitle">Resize and convert images with group-bounded swiftly workers</p>
       </header>
 
       <section class="toolbar">

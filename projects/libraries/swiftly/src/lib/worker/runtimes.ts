@@ -19,10 +19,10 @@ onmessage = async (event) => {
   }
 
   try {
-    const result = await __mainTask(payload, __swiftlyWorkerUtils);
+    const result = await __mainTask(payload, __workerUtils);
     if (
       result &&
-      result.__swiftlyTransferResult === true &&
+      result.__transferResult === true &&
       Array.isArray(result.transfer)
     ) {
       postMessage(
@@ -42,7 +42,7 @@ onmessage = async (event) => {
  * Actor worker runtime.
  *
  * Supports persistent behavior loop via `init`, `notify`, `request`,
- * and `stop` messages. Uses `__swiftlyConcurrency` helpers injected
+ * and `stop` messages. Uses `__concurrency` helpers injected
  * by the build script.
  */
 export const buildActorWorkerRuntime = (mailboxCapacity?: number): string => `
@@ -85,7 +85,7 @@ const __requestMain = (workerId, taskId, to, topic, payload) => {
   });
 };
 
-const __workerInbox = __swiftlyConcurrency.channel();
+const __workerInbox = __concurrency.channel();
 
 const __enqueueActorInbox = (payload, scope) => {
   __workerInbox.send(payload).catch((error) => {
@@ -113,14 +113,14 @@ const __createWorkerUtils = (workerId, taskId) => {
         return result.ok ? result.value : undefined;
       },
     },
-    concurrency: __swiftlyConcurrency,
+    concurrency: __concurrency,
   };
 };
 
 const __actorMailboxCapacity = ${mailboxCapacity === undefined ? "undefined" : mailboxCapacity};
 const __actorMailbox = __actorMailboxCapacity === undefined
-  ? __swiftlyConcurrency.channel()
-  : __swiftlyConcurrency.channel(__actorMailboxCapacity);
+  ? __concurrency.channel()
+  : __concurrency.channel(__actorMailboxCapacity);
 
 const __enqueueActorMessage = (value, requestId) => {
   if (__actorMailboxCapacity === undefined) {

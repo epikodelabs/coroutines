@@ -504,6 +504,10 @@ idescribe("worker helpers", () => {
 
     it("notifies every pending timer even when one failure callback throws", () => {
       const notified: string[] = [];
+      let queuedThrow: (() => void) | undefined;
+      const queueMicrotaskSpy = spyOn(globalThis, "queueMicrotask").and.callFake((callback: VoidFunction) => {
+        queuedThrow = callback;
+      });
 
       scheduleWorkerTimer(
         1000,
@@ -535,10 +539,13 @@ idescribe("worker helpers", () => {
           error: new Error("timer worker failed"),
           message: "timer worker failed",
         }),
-      ).toThrowError("failure callback exploded");
+      ).not.toThrow();
 
       expect(notified).toEqual(["first", "second", "third"]);
       expect(timerWorker.terminated).toBeTrue();
+      expect(queueMicrotaskSpy).toHaveBeenCalled();
+      expect(queuedThrow).toBeDefined();
+      expect(() => queuedThrow?.()).toThrowError("failure callback exploded");
     });
 
     it("releases an idle timer worker even when the elapsed callback throws", () => {

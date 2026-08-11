@@ -31,6 +31,38 @@ describe("worker module scripts", () => {
     });
 
     expect(script).not.toContain("importWorkerModule");
-    expect(script).not.toContain("__swiftlyImport");
+    expect(script).not.toContain("__import");
+  });
+
+  it("binds named arrow-function helpers into worker scope", () => {
+    const helper = (value: number) => value + 1;
+
+    const script = buildWorkerScript({
+      main: function main(value: number) {
+        return helper(value);
+      },
+      functions: [helper],
+      runtime: buildCoroutineWorkerRuntime(),
+    });
+
+    expect(script).toContain("const helper =");
+  });
+
+  it("normalizes method shorthand helpers into function declarations", () => {
+    const helper = {
+      transform(value: number) {
+        return value + 1;
+      },
+    }.transform;
+
+    const script = buildWorkerScript({
+      main: function main(value: number) {
+        return helper(value);
+      },
+      functions: [helper],
+      runtime: buildCoroutineWorkerRuntime(),
+    });
+
+    expect(script).toContain("function transform(");
   });
 });

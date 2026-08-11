@@ -1,17 +1,15 @@
 import { computed, Injectable, signal } from '@angular/core';
-import { ActorBusMessage, actor, main } from '@epikodelabs/swiftly';
+import { coroutine, group } from '@epikodelabs/swiftly';
 import { zipSync } from 'fflate';
 import {
-  compressImage,
-  CompressOutput,
   DEFAULT_SETTINGS,
   FileTask,
   JobProgress,
+  processImage,
   ProcessedResult,
   ProcessingSettings,
   ProcessInput,
-  resizeImage,
-  ResizeOutput,
+  ProcessOutput,
 } from './image-processing.utils';
 
 export interface ImageJob {
@@ -39,49 +37,23 @@ export class ImagePipelineService {
   );
   readonly isProcessing = computed(() => this.jobs().some((job) => job.state === 'processing'));
 
-  private readonly queue: FileTask[] = [];
-  private queueActive = false;
   private destroyed = false;
-  private readonly inboxUnsubscribe: () => void;
-
-  private readonly resizeActor = actor<ResizeOutput, any, any, ProcessInput>(
-    'image-resize',
-    (msg: ProcessInput, _state: any, utils: any) => resizeImage(msg, utils),
-    null!,
-    resizeImage,
-  );
-
-  private readonly compressActor = actor<CompressOutput, any, any, ResizeOutput>(
-    'image-compress',
-    (msg: ResizeOutput, _state: any, utils: any) => compressImage(msg, utils),
-    null!,
-    compressImage,
-  );
-
-  constructor() {
-    this.inboxUnsubscribe = main.inbox.subscribe((message: ActorBusMessage<any>) => {
-      if (message.topic !== 'progress') {
-        return;
-      }
-
-      const progress = message.payload as JobProgress;
-      if (!progress.taskId) {
-        return;
-      }
-
-      this.jobs.update((list) =>
-        list.map((job) =>
-          job.id === progress.taskId
-            ? { ...job, progress, state: 'processing' as const }
-            : job,
-        ),
-      );
-    });
-  }
+  private readonly processor = coroutine<ProcessInput, ProcessOutput>(processImage);
+  private readonly work = group({
+    concurrency: Math.max(
+      1,
+      Math.min(typeof navigator === 'undefined' ? 4 : (navigator.hardwareConcurrency || 4), 4),
+    ),
+  });
 
   uploadFile(file: File): void {
+    if (this.destroyed) {
+      return;
+    }
+
     const id = crypto.randomUUID();
     const url = URL.createObjectURL(file);
+    const settings = { ...this.settings() };
 
     this.jobs.update((list) => [
       ...list,
@@ -92,12 +64,13 @@ export class ImagePipelineService {
         progress: { stage: 'idle', percent: 0 },
         originalSize: file.size,
         originalUrl: url,
-        settings: { ...this.settings() },
+        settings,
       },
     ]);
 
-    this.queue.push({ file, id });
-    void this.drainQueue();
+    void this.work.spawn((signal) =>
+      this.processTask({ file, id, settings }, signal)
+    ).catch(() => undefined);
   }
 
   removeJob(id: string): void {
@@ -179,75 +152,56 @@ export class ImagePipelineService {
     }
 
     this.destroyed = true;
-    this.queue.length = 0;
-    this.inboxUnsubscribe();
-
-    await Promise.all([
-      main.outbox.stop(this.resizeActor),
-      main.outbox.stop(this.compressActor),
-    ]);
+    this.work.cancel(new Error('Image pipeline destroyed'));
+    await this.work.settle();
+    await this.processor.dispose();
 
     this.clearAll();
   }
 
-  private async drainQueue(): Promise<void> {
-    if (this.queueActive || this.destroyed) {
-      return;
-    }
-
-    this.queueActive = true;
-
-    try {
-      while (this.queue.length > 0 && !this.destroyed) {
-        const task = this.queue.shift()!;
-
-        if (!task.file.type.startsWith('image/')) {
-          this.jobs.update((list) =>
-            list.map((job) =>
-              job.id === task.id
-                ? { ...job, state: 'error' as const, error: 'Only image files are supported.' }
-                : job,
-            ),
-          );
-          continue;
-        }
-
-        await this.processTask(task);
-      }
-    } finally {
-      this.queueActive = false;
-      if (this.queue.length > 0 && !this.destroyed) {
-        void this.drainQueue();
-      }
-    }
-  }
-
-  private async processTask(task: FileTask): Promise<void> {
+  private async processTask(task: FileTask, signal: AbortSignal): Promise<void> {
     this.jobs.update((list) =>
       list.map((job) =>
         job.id === task.id
-          ? { ...job, state: 'processing' as const, progress: { stage: 'idle', percent: 0 } }
+          ? { ...job, state: 'processing' as const, progress: { stage: 'processing', percent: 5 } }
           : job,
       ),
     );
 
+    if (!task.file.type.startsWith('image/')) {
+      this.jobs.update((list) =>
+        list.map((job) =>
+          job.id === task.id
+            ? { ...job, state: 'error' as const, error: 'Only image files are supported.' }
+            : job,
+        ),
+      );
+      return;
+    }
+
     try {
-      const { arrayBuffer } = await this.readFile(task.file);
-      const settings = this.settings();
+      const arrayBuffer = await task.file.arrayBuffer();
+      this.setJobProgress(task.id, { stage: 'processing', percent: 20 });
+
       const input: ProcessInput = {
         blob: arrayBuffer,
-        width: settings.maxWidth,
-        height: settings.maxHeight,
-        quality: settings.quality,
-        format: settings.format,
-        grayscale: settings.grayscale,
+        width: task.settings.maxWidth,
+        height: task.settings.maxHeight,
+        quality: task.settings.quality,
+        format: task.settings.format,
+        grayscale: task.settings.grayscale,
         taskId: task.id,
         originalSize: task.file.size,
         fileName: task.file.name,
       };
 
-      const output = await this.runPipeline(input);
-      if (this.destroyed) {
+      const output = await this.processor.run(input, signal);
+      if (this.destroyed || signal.aborted) {
+        return;
+      }
+
+      this.setJobProgress(task.id, { stage: 'processing', percent: 90 });
+      if (!this.jobs().some((job) => job.id === input.taskId)) {
         return;
       }
 
@@ -274,13 +228,13 @@ export class ImagePipelineService {
                 state: 'done' as const,
                 resultUrl: url,
                 result,
-                progress: { stage: 'idle' as const, percent: 100 },
+                progress: { stage: 'idle', percent: 100 },
               }
             : job,
         ),
       );
     } catch (error) {
-      if (this.destroyed) {
+      if (this.destroyed || signal.aborted) {
         return;
       }
 
@@ -295,22 +249,13 @@ export class ImagePipelineService {
     }
   }
 
-  private async readFile(file: File): Promise<{ arrayBuffer: ArrayBuffer }> {
-    return {
-      arrayBuffer: await file.arrayBuffer(),
-    };
-  }
-
-  private async runPipeline(input: ProcessInput): Promise<CompressOutput> {
-    const resized = await main.outbox.request<ProcessInput, ResizeOutput>(
-      this.resizeActor,
-      'process',
-      input,
-    );
-    return main.outbox.request<ResizeOutput, CompressOutput>(
-      this.compressActor,
-      'process',
-      resized,
+  private setJobProgress(taskId: string, progress: JobProgress): void {
+    this.jobs.update((list) =>
+      list.map((job) =>
+        job.id === taskId
+          ? { ...job, progress, state: 'processing' as const }
+          : job,
+      ),
     );
   }
 }

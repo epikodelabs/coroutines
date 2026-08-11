@@ -344,6 +344,7 @@ export class AppComponent implements AfterViewInit, OnDestroy {
 
   private runner = coroutine<BatchParams, Pixel[]>(juliaBatchWorker);
   private abortController: AbortController | null = null;
+  private renderGeneration = 0;
 
   ngAfterViewInit(): void {
     this.drawJulia();
@@ -377,6 +378,7 @@ export class AppComponent implements AfterViewInit, OnDestroy {
 
     this.abortController?.abort();
     this.abortController = new AbortController();
+    const generation = ++this.renderGeneration;
     const signal = this.abortController.signal;
 
     const ctx = canvas.getContext('2d')!;
@@ -417,9 +419,9 @@ export class AppComponent implements AfterViewInit, OnDestroy {
     try {
       await Promise.all(
         promises.map(async (p) => {
-          if (signal.aborted) return;
+          if (signal.aborted || generation !== this.renderGeneration) return;
           const pixels = await p;
-          if (signal.aborted) return;
+          if (signal.aborted || generation !== this.renderGeneration) return;
 
           for (const pix of pixels) {
             const idx = pix.i * 4;
@@ -428,6 +430,8 @@ export class AppComponent implements AfterViewInit, OnDestroy {
             data[idx + 2] = pix.b;
             data[idx + 3] = 255;
           }
+
+          if (signal.aborted || generation !== this.renderGeneration) return;
 
           completed++;
           this.progress = (completed / totalBatches) * 100;
@@ -440,7 +444,7 @@ export class AppComponent implements AfterViewInit, OnDestroy {
       // aborted or error
     }
 
-    if (!signal.aborted) {
+    if (!signal.aborted && generation === this.renderGeneration) {
       this.elapsed = performance.now() - start;
       this.generating = false;
       this.cdr.detectChanges();

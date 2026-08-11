@@ -150,16 +150,11 @@ export interface Initiator {
   };
 }
 
-/**
- * Utility functions available to actor workers.
- */
-type WorkerUtilsCompatibility<_T> = {};
-
 export type WorkerUtils<Q = any, D = any, Incoming = any, ToMain = any> = {
   concurrency: WorkerConcurrency;
   outbox: WorkerOutbox<Q, D>;
   inbox: WorkerInbox<Incoming>;
-} & WorkerUtilsCompatibility<ToMain>;
+};
 
 /**
  * Actor behavior signature for autonomous entity mode.
