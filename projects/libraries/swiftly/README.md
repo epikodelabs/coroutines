@@ -193,6 +193,37 @@ share a broader resource budget, use `semaphore()`.
 Persistent worker-local state does not belong in a coroutine. Use `actor()` when
 worker identity and state must survive across messages.
 
+## Native module workers
+
+Every Swiftly-owned worker is created as a native ES module worker. This applies
+to coroutine workers, actor workers, and the shared timer worker.
+
+Because coroutine task source is executed inside a module worker, ordinary
+absolute dynamic imports remain ordinary JavaScript:
+
+```ts
+const normalize = coroutine(async (value: string) => {
+  const { default: slugify } = await import(
+    'https://esm.sh/@sindresorhus/slugify'
+  );
+
+  return slugify(value);
+});
+```
+
+Swiftly does not wrap or rewrite `import()`. CDN and other absolute module URLs
+therefore use the browser's normal module loader, HTTP cache, CORS policy, and
+Content Security Policy.
+
+Relative imports inside an inline serialized coroutine are intentionally not
+rewritten. Their natural base is the generated worker module URL rather than
+the source TypeScript module. Use an absolute URL when an inline coroutine needs
+to load another module.
+
+Module loading does not change concurrency ownership: `coroutine()` owns worker
+execution and module instances, while `group()` still owns the number of
+concurrent operations.
+
 ## Channel closure is explicit
 
 Channel receive results distinguish a value from closure:
@@ -237,8 +268,8 @@ for (let i = 0; i < 4; i++) {
 ```
 
 The composition remains explicit: channel capacity bounds data in flight,
-group concurrency bounds owned operations, and coroutine owns only worker execution and reuse
-and reuse.
+group concurrency bounds owned operations, and coroutine owns only worker
+execution and reuse.
 
 
 ## Graceful lifecycle
@@ -262,8 +293,7 @@ worker resources are released immediately. Worker-script blob URLs are acquired
 lazily on first execution, so constructing an unused coroutine
 does not reserve browser worker resources.
 
-The same contract is shared by `coroutine()`,
-and `compose()`. `compose().close()` attempts to close every owned stage even if
+The same contract is shared by `coroutine()` and `compose()`. `compose().close()` attempts to close every owned stage even if
 one stage reports an error, mirroring its immediate-disposal cleanup behavior.
 
 This distinction is intentionally part of `TaskRunner` rather than separate

@@ -19,12 +19,16 @@ class MockWorker {
   private timers = new Map<number, ReturnType<typeof setTimeout>>();
 
   readonly listeners = new Map<string, Array<(event: any) => void>>();
+  readonly url: string;
+  readonly options: WorkerOptions | undefined;
   readonly sentMessages: WorkerProtocolMessage[] = [];
   readonly sentTransfers: Transferable[][] = [];
   terminated = false;
   __id?: number;
 
-  constructor(_url: string, _options?: WorkerOptions) {
+  constructor(url: string, options?: WorkerOptions) {
+    this.url = url;
+    this.options = options;
     MockWorker.instances.push(this);
   }
 
@@ -193,6 +197,37 @@ idescribe("worker helpers", () => {
     });
   });
 
+
+  describe("module worker invariant", () => {
+    it("creates task workers as native ES module workers", async () => {
+      const runner = createTaskRunner<number, number>({
+        name: "module-runner",
+        main: (value: number) => value,
+        functions: [],
+        generateWorkerScript: () => "module-worker-script",
+      });
+
+      const pending = runner.run(1);
+      await flush();
+
+      const worker = MockWorker.instances[0];
+      expect(worker.options?.type).toBe("module");
+
+      const message = worker.sentMessages[0];
+      worker.dispatch({ ...message, type: "response", payload: 1 });
+      await expectAsync(pending).toBeResolvedTo(1);
+      await runner.dispose();
+    });
+
+    it("creates the shared timer worker as a native ES module worker", () => {
+      const timer = scheduleWorkerTimer(10000, () => fail("timer should not elapse"));
+      const worker = MockWorker.instances[0];
+
+      expect(worker.options?.type).toBe("module");
+
+      timer.cancel();
+    });
+  });
 
   describe("worker script ownership", () => {
     it("acquires blob URLs lazily and releases them only after worker use", async () => {

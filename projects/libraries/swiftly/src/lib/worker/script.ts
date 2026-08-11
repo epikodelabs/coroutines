@@ -61,6 +61,10 @@ const joinScriptSections = (sections: string[]): string =>
  * - serialized helper functions
  * - the main task function
  * - the runtime wrapper
+ *
+ * The generated blob is executed as an ES module worker. Native module syntax
+ * inside serialized task code, including absolute dynamic `import()`, is left
+ * untouched and resolved by the browser.
  */
 export function buildWorkerScript({
   helpers,

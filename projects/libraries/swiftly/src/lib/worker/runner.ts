@@ -1,6 +1,7 @@
 import { acquireBlobUrl, releaseBlobUrl } from "./blob";
 import type { PendingTaskMap, WorkerProtocolMessage } from "./messages";
 import { createDefaultMessageHandler } from "./messages";
+import { createModuleWorker } from "./module";
 import type { TaskRunner } from "./types";
 import { generateTaskId } from "./utils";
 import { createAbortError } from "../utils/context";
@@ -163,7 +164,7 @@ export function createTaskRunner<T, R>({
 
   const createWorker = (): Worker => {
     const workerId = ++nextWorkerId;
-    const worker = new Worker(getWorkerScriptUrl(), { type: "module" });
+    const worker = createModuleWorker(getWorkerScriptUrl());
     const messageHandler = createMessageHandler
       ? createMessageHandler(worker, pendingMessages)
       : createDefaultMessageHandler(worker, pendingMessages);

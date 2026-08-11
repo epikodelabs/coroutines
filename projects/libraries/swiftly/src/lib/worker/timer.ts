@@ -1,4 +1,5 @@
 import { acquireBlobUrl, releaseBlobUrl } from "./blob";
+import { createModuleWorker } from "./module";
 
 const TIMER_WORKER_SCRIPT = `
 const timers = new Map();
@@ -100,7 +101,7 @@ const ensureTimerWorker = (): Worker => {
 
   let createdWorker: Worker;
   try {
-    createdWorker = new Worker(blobUrl);
+    createdWorker = createModuleWorker(blobUrl);
     worker = createdWorker;
     workerConstructor = Worker;
   } catch (error) {

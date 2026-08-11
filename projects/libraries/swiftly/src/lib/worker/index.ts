@@ -4,3 +4,4 @@ export * from './script';
 export * from './runtimes';
 export * from './runner';
 export * from './utils';
+export * from "./module";

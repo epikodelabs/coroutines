@@ -16,6 +16,7 @@ import {
 } from "../utils";
 import { acquireBlobUrl, releaseBlobUrl } from "../worker/blob";
 import type { WorkerProtocolMessage } from "../worker/messages";
+import { createModuleWorker } from "../worker/module";
 import { buildActorWorkerRuntime } from "../worker/runtimes";
 import { buildWorkerScript } from "../worker/script";
 import type { Actor, ActorExit, ActorOptions, Supervisor, SupervisorOptions } from "../worker/types";
@@ -1228,7 +1229,7 @@ function createActor<S = any, Q = any, D = any, FromMain = any>(
   };
 
   try {
-    worker = new Worker(blobUrl, { type: "module" });
+    worker = createModuleWorker(blobUrl);
   } catch (error) {
     releaseBlobUrl(workerScript);
     throw error;

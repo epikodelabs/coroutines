@@ -61,6 +61,7 @@ idescribe("actor", () => {
       onmessage: ((ev: any) => void) | null = null;
       listeners: Record<string, ((ev: any) => void)[]> = {};
       terminated = false;
+      readonly options: WorkerOptions | undefined;
       readonly sentMessages: any[] = [];
       private workerInbox = channel<any>();
       private busInbox = channel<any>();
@@ -74,7 +75,8 @@ idescribe("actor", () => {
       private requestCounter = 0;
       private timers = new Map<number, ReturnType<typeof setTimeout>>();
 
-      constructor(_url: string, _options?: any) {
+      constructor(_url: string, options?: WorkerOptions) {
+        this.options = options;
         this.workerId = Math.floor(Math.random() * 100000);
         (globalThis as any).lastMockWorker = this;
       }
@@ -1492,6 +1494,20 @@ idescribe("actor", () => {
     expect(settled).toBeFalse();
 
     await expectAsync(pending).toBeResolvedTo(5);
+    await main.outbox.stop(a);
+  });
+
+  it("creates actor workers as native ES module workers", async () => {
+    async function behavior(_msg: any, state: number) {
+      return state;
+    }
+
+    (globalThis as any).currentMainTask = behavior;
+    const a = actor(nextActorName(), behavior, 0);
+    const worker = (globalThis as any).lastMockWorker;
+
+    expect(worker.options?.type).toBe("module");
+
     await main.outbox.stop(a);
   });
 
