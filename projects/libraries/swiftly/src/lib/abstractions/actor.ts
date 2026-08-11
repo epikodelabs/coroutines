@@ -291,14 +291,21 @@ function handleRequest<Q>(
 /**
  * Creates an autonomous behavior-mode actor.
  *
- * `actor(behavior, ...helpers)` returns a factory function that accepts
- * a stable actor name plus `initialState` and eagerly creates the worker.
+ * `actor(name, behavior, initialState, ...helpers)` eagerly creates one
+ * stable named actor worker and returns its handle.
  *
  * @example
  * ```ts
- * const counter = actor("counter", (msg, state, utils) => state + msg.payload.n, 0);
- * main.outbox.send(counter, "inc", { n: 1 });
+ * const counter = actor(
+ *   "counter",
+ *   (msg, state) =>
+ *     msg.kind === "actor-bus" && msg.topic === "inc"
+ *       ? state + msg.payload.n
+ *       : state,
+ *   0,
+ * );
  * const value = await main.outbox.request(counter, "inc", { n: 2 });
+ * await main.outbox.stop(counter);
  * ```
  */
 export function actor<S = any, Q = any, D = any, FromMain = any>(

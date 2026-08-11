@@ -1,8 +1,10 @@
-# @epikodelabs/swiftly
+# Swiftly
 
 Concurrent JavaScript built around workers, structured task ownership, channels, actors, and cancellation.
 
 Swiftly treats concurrency as a programming model rather than exposing Web Workers as application infrastructure. Worker-backed computation, coordination, cancellation, and long-lived actors share one small set of primitives.
+
+For a concept-by-concept guide to ownership, boundaries, and when to use each primitive, see [`concepts.md`](../../../docs/concepts.md).
 
 ## Core model
 
@@ -45,8 +47,9 @@ try {
 }
 ```
 
-The number `4` is the only concurrency policy in this example. At most four
-group children may execute at once, therefore at most four `hash.run()` calls
+The number `4` is the only concurrency policy in this example. The group owns a
+FIFO admission queue: at most four children execute at once, and queued child
+operations have not called `hash.run()` yet. Therefore at most four hash calls
 can be active and at most four coroutine workers are needed for this operation.
 
 The responsibilities are intentionally separate:
@@ -76,9 +79,13 @@ const controller = new AbortController();
 
 const result = parse.run(source, controller.signal);
 controller.abort();
+await result.catch(() => undefined);
 
 // Equivalent options form, also used when transferring ownership.
-parse.run(source, { signal: controller.signal });
+const otherController = new AbortController();
+const otherResult = parse.run(source, { signal: otherController.signal });
+otherController.abort();
+await otherResult.catch(() => undefined);
 ```
 
 A worker task cannot be pre-empted safely inside arbitrary JavaScript, so Swiftly cancels an active worker submission by terminating only the worker that owns it. Concurrent sibling submissions continue on their own workers. Work waiting behind a `group()` concurrency permit can be cancelled before a coroutine worker is needed.
@@ -104,11 +111,12 @@ Actors are long-lived stateful workers. Communication happens through the actor 
 
 ```ts
 const counter = actor('counter', (message, state: number) => {
-  if (message.topic === 'inc') return state + 1;
+  if (message.kind === 'actor-bus' && message.topic === 'inc') return state + 1;
   return state;
 }, 0);
 
-main.outbox.send(counter, 'inc', undefined);
+const value = await main.outbox.request(counter, 'inc', undefined);
+await main.outbox.stop(counter);
 
 const exit = await counter.done;
 ```
@@ -138,7 +146,8 @@ const service = supervisor(
   },
 );
 
-main.outbox.send(service, "refresh", undefined);
+await main.outbox.request(service, "refresh", undefined);
+await main.outbox.stop(service);
 
 const exit = await service.done;
 ```
@@ -169,6 +178,7 @@ const result = main.outbox.request(
 );
 
 controller.abort();
+await result.catch(() => undefined);
 ```
 
 This composes actor request lifetimes with task groups and contexts without
@@ -269,7 +279,16 @@ coroutine owns worker execution:
 ```ts
 const input = channel<Job>(8);
 const output = channel<Result>(8);
-const workers = group({ concurrency: 4 });
+const workers = group();
+const consume = (async () => {
+  const results: Result[] = [];
+
+  for await (const result of output) {
+    results.push(result);
+  }
+
+  return results;
+})();
 
 for (let i = 0; i < 4; i++) {
   workers.spawn(async (signal) => {
@@ -282,11 +301,23 @@ for (let i = 0; i < 4; i++) {
     }
   });
 }
+
+await Promise.all(inputs.map((job) => input.send(job)));
+input.close();
+
+try {
+  await workers.wait();
+} finally {
+  output.close();
+}
+
+const results = await consume;
 ```
 
 The composition remains explicit: channel capacity bounds data in flight,
-group concurrency bounds owned operations, and coroutine owns only worker
-execution and reuse.
+the number of spawned workers bounds parallel processing, `group()` owns worker
+lifetime and failure propagation, and coroutine owns only worker execution and
+reuse.
 
 
 ## Graceful lifecycle
