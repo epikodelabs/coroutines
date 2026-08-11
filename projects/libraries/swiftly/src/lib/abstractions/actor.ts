@@ -1263,6 +1263,14 @@ function createActor<S = any, Q = any, D = any, FromMain = any>(
     pendingRequests.clear();
   };
 
+  const takePendingRequest = (requestId: string) => {
+    const pending = pendingRequests.get(requestId);
+    if (!pending) return undefined;
+    pendingRequests.delete(requestId);
+    pending.cleanup?.();
+    return pending;
+  };
+
   const postToWorker = (
     target: Worker,
     message: Omit<WorkerProtocolMessage, "workerId">
@@ -1335,6 +1343,14 @@ function createActor<S = any, Q = any, D = any, FromMain = any>(
     return shutdown$;
   };
 
+  const failActor = (error: Error): void => {
+    if (!running && shutdown$) return;
+    running = false;
+    rejectPendingRequests(error);
+    unregisterActorBusTarget(actorRef);
+    void shutdown(true, { reason: "error", error });
+  };
+
   const handleMessage = (event: MessageEvent<WorkerProtocolMessage>) => {
     const msg = event.data;
 
@@ -1347,22 +1363,14 @@ function createActor<S = any, Q = any, D = any, FromMain = any>(
 
     const { type, payload, requestId } = msg;
 
-    if (type === "response" && requestId && pendingRequests.has(requestId)) {
-      const { resolve, cleanup } = pendingRequests.get(requestId)!;
-      pendingRequests.delete(requestId);
-      cleanup?.();
-      resolve(payload);
-    } else if (type === "error" && requestId && pendingRequests.has(requestId)) {
-      const { reject, cleanup } = pendingRequests.get(requestId)!;
-      pendingRequests.delete(requestId);
-      cleanup?.();
-      reject(new Error(msg.error ?? "Actor request failed"));
+    if (type === "response" && requestId) {
+      takePendingRequest(requestId)?.resolve(payload);
+    } else if (type === "error" && requestId) {
+      takePendingRequest(requestId)?.reject(
+        new Error(msg.error ?? "Actor request failed"),
+      );
     } else if (type === "error" && !requestId) {
-      const error = new Error(msg.error ?? "Actor behavior failed");
-      running = false;
-      rejectPendingRequests(error);
-      unregisterActorBusTarget(actorRef);
-      void shutdown(true, { reason: "error", error });
+      failActor(new Error(msg.error ?? "Actor behavior failed"));
     } else if (type === "overflow") {
       if (!running) return;
       dropped += 1;
@@ -1400,10 +1408,7 @@ function createActor<S = any, Q = any, D = any, FromMain = any>(
         ? event.error
         : new Error(event.message || "Actor worker failed");
 
-    running = false;
-    rejectPendingRequests(error);
-    unregisterActorBusTarget(actorRef);
-    void shutdown(true, { reason: "error", error });
+    failActor(error);
   };
 
   const actor: Actor = {
@@ -1483,10 +1488,8 @@ function createActor<S = any, Q = any, D = any, FromMain = any>(
       const id = String(nextRequestId++);
       return new Promise((resolve, reject) => {
         const onAbort = () => {
-          const pending = pendingRequests.get(id);
+          const pending = takePendingRequest(id);
           if (!pending) return;
-          pendingRequests.delete(id);
-          pending.cleanup?.();
           reject(createAbortError(signal));
         };
         const cleanup = () => signal?.removeEventListener("abort", onAbort);
@@ -1528,7 +1531,24 @@ const actorBusRegistrationsByActor = new Map<Actor, ActorBusRegistration>();
 const actorBusDirectListeners = new Map<string, Set<ActorBusHandler>>();
 const actorBusListeners = new Set<ActorBusHandler>();
 
-const actorInternalsMap = new WeakMap<Actor, { stop(): Promise<void>; post(msg: any): void; request(topic: string, msg: any, signal?: AbortSignal): Promise<any> }>();
+type ActorInternals = {
+  stop(): Promise<void>;
+  post(msg: any): void;
+  request(topic: string, msg: any, signal?: AbortSignal): Promise<any>;
+};
+
+const actorInternalsMap = new WeakMap<Actor, ActorInternals>();
+
+const getActorInternals = (actor: Actor): ActorInternals => {
+  const internals = actorInternalsMap.get(actor);
+  if (!internals) {
+    throw new Error(`Actor "${actor.name}" is unavailable`);
+  }
+  return internals;
+};
+
+const tryActorInternals = (actor: Actor): ActorInternals | undefined =>
+  actorInternalsMap.get(actor);
 
 function resolveActorTarget(actorOrName: Actor | string): Actor | undefined {
   if (typeof actorOrName !== "string") {
@@ -1559,7 +1579,7 @@ const warnAsyncActorBusFailure = (scope: string, error: unknown) => {
 
 function deliverActorBusMessage(actor: Actor, message: ActorBusMessage) {
   try {
-    actorInternalsMap.get(actor)?.post(message);
+    tryActorInternals(actor)?.post(message);
   } catch (error) {
     warnAsyncActorBusFailure("Actor bus delivery", error);
   }
@@ -1772,7 +1792,7 @@ export function supervisor(
       const entry = ingress.shift()!;
       if (entry.kind === "post") {
         try {
-          actorInternalsMap.get(active)?.post(entry.msg);
+          tryActorInternals(active)?.post(entry.msg);
         } catch (error) {
           warnAsyncActorBusFailure("Supervisor buffered delivery", error);
         }
@@ -1785,7 +1805,7 @@ export function supervisor(
         continue;
       }
 
-      const internals = actorInternalsMap.get(active);
+      const internals = tryActorInternals(active);
       if (!internals) {
         entry.reject(new Error("Supervised actor generation is unavailable"));
         continue;
@@ -1837,7 +1857,7 @@ export function supervisor(
           const error = new Error(
             `supervisor replacement name must remain "${first.name}"; received "${next.name}"`,
           );
-          await actorInternalsMap.get(next)?.stop();
+          await tryActorInternals(next)?.stop();
           next = undefined;
           throw error;
         }
@@ -1846,7 +1866,7 @@ export function supervisor(
         return;
       } catch (error) {
         if (next && current !== next) {
-          await actorInternalsMap.get(next)?.stop().catch(() => undefined);
+          await tryActorInternals(next)?.stop().catch(() => undefined);
         }
 
         lastError = error instanceof Error ? error : new Error(String(error));
@@ -1939,7 +1959,7 @@ export function supervisor(
       restartController = undefined;
       const active = current;
       if (active) {
-        await actorInternalsMap.get(active)?.stop();
+        await tryActorInternals(active)?.stop();
       } else {
         settle({ reason: "stopped" });
       }
@@ -1948,7 +1968,7 @@ export function supervisor(
     post: (msg: any) => {
       const active = current;
       if (active?.running) {
-        actorInternalsMap.get(active)?.post(msg);
+        tryActorInternals(active)?.post(msg);
         return;
       }
 
@@ -1965,7 +1985,7 @@ export function supervisor(
     request: (topic: string, msg: any, signal?: AbortSignal) => {
       const active = current;
       if (active?.running) {
-        return actorInternalsMap.get(active)!.request(topic, msg, signal);
+        return getActorInternals(active).request(topic, msg, signal);
       }
       if (signal?.aborted) {
         return Promise.reject(createAbortError(signal));
@@ -2048,7 +2068,7 @@ export const main: Initiator = {
         return Promise.reject(new Error(`Unknown actor target "${String(to)}"`));
       }
 
-      return actorInternalsMap.get(target)!.request(topic, payload, signal);
+      return getActorInternals(target).request(topic, payload, signal);
     },
 
     /** Stops the actor, terminates its worker, and releases resources. */
@@ -2058,7 +2078,7 @@ export const main: Initiator = {
         return Promise.reject(new Error(`Unknown actor target "${String(actor)}"`));
       }
 
-      return actorInternalsMap.get(target)!.stop();
+      return getActorInternals(target).stop();
     },
   },
 
