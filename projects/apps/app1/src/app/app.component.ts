@@ -1,7 +1,7 @@
 import { DecimalPipe } from '@angular/common';
 import { AfterViewInit, ChangeDetectorRef, Component, ElementRef, OnDestroy, ViewChild } from '@angular/core';
 import { FormsModule } from '@angular/forms';
-import { coroutine } from '@epikodelabs/swiftly';
+import { coroutine, group } from '@epikodelabs/swiftly';
 
 interface JuliaPreset {
   name: string;
@@ -396,14 +396,21 @@ export class AppComponent implements AfterViewInit, OnDestroy {
 
     const { cr, ci, zoom, maxIterations, palette } = this;
 
+    const work = group({
+      concurrency: Math.max(1, navigator.hardwareConcurrency || 4),
+      signal,
+    });
+
     const promises = [];
     for (let y = 0; y < h; y += batchHeight) {
       promises.push(
-        this.runner.run({
-          width: w, height: h,
-          startY: y, endY: Math.min(y + batchHeight, h),
-          cr, ci, zoom, maxIterations, palette,
-        }, signal)
+        work.spawn((childSignal) =>
+          this.runner.run({
+            width: w, height: h,
+            startY: y, endY: Math.min(y + batchHeight, h),
+            cr, ci, zoom, maxIterations, palette,
+          }, childSignal)
+        )
       );
     }
 
@@ -428,6 +435,7 @@ export class AppComponent implements AfterViewInit, OnDestroy {
           ctx.putImageData(imageData, 0, 0);
         })
       );
+      await work.wait();
     } catch {
       // aborted or error
     }

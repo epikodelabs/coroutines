@@ -1,10 +1,11 @@
 # App 2 — Julia Set Explorer
 
-Dedicated fractal renderer using `swiftly` compute workers.
+Fractal renderer using `swiftly` coroutine workers.
 
 ## What it demonstrates
 
-- **`compute`** — offloads Julia set pixel batches to a pooled Web Worker
+- **`coroutine`** — offloads Julia set pixel batches to reusable Web Workers
+- **`group`** — bounds concurrent row batches explicitly
 - **Progressive rendering** — row batches draw to canvas as workers complete
 - **Interactive parameters** — presets, c (Re/Im), color palette
 - **Reactive UI** — `ChangeDetectorRef.detectChanges()` for smooth progress updates

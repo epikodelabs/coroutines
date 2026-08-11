@@ -5,7 +5,7 @@
  *   • Cashier actor  : receives orders, forwards to chef via actor bus
  *   • Chef actor     : receives orders from cashier, requests recipes and
  *                      oven bakes from main thread, emits lifecycle events
- *   • Oven coroutines: 3 dedicated workers for actual baking
+ *   • Oven coroutines: worker-backed baking operations
  *
  * Communication flow:
  *   UI → Cashier : main.outbox.send(cashier, 'runShift' | 'cancel' | 'close', payload)

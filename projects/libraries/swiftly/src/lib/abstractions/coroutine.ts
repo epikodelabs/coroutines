@@ -51,13 +51,13 @@ function createCoroutineImpl<T, R>(
 }
 
 /**
- * Creates a reusable coroutine task runner with its worker script baked once.
+ * Creates a reusable stateless worker-backed task runner.
  *
- * A coroutine owns one dedicated worker, reuses it across calls, and queues
- * `run()` submissions on that worker. The returned `Coroutine` can be
- * used with `pipe()` in stream pipelines or called directly. Call
- * `.dispose()` when done to terminate the underlying worker. Raw helper
- * snippets can be provided through an optional trailing options object.
+ * The task script is baked once. Concurrent `run()` calls reuse idle workers or
+ * lazily create additional workers as demand requires. Coroutine itself does
+ * not impose a concurrency policy; use `group()` or `semaphore()` when work
+ * should be bounded. Call `.dispose()` when done to terminate all owned workers.
+ * Raw helper snippets can be provided through an optional trailing options object.
  */
 export function coroutine<T, R>(
   main: CoroutineTask<T, R>,

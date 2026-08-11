@@ -14,7 +14,6 @@ const assertUniqueTransferables = (items: readonly Transferable[]): void => {
 export function normalizeTaskRunControl(control: TaskRunControl): {
   signal?: AbortSignal;
   transfer: Transferable[];
-  priority: number;
 } {
   if (
     control &&
@@ -22,17 +21,12 @@ export function normalizeTaskRunControl(control: TaskRunControl): {
     "aborted" in control &&
     typeof (control as AbortSignal).addEventListener === "function"
   ) {
-    return { signal: control as AbortSignal, transfer: [], priority: 0 };
+    return { signal: control as AbortSignal, transfer: [] };
   }
 
   const options = (control ?? {}) as TaskRunOptions;
   const transferables = [...(options.transfer ?? [])];
   assertUniqueTransferables(transferables);
 
-  const priority = options.priority ?? 0;
-  if (!Number.isFinite(priority)) {
-    throw new RangeError("task priority must be a finite number");
-  }
-
-  return { signal: options.signal, transfer: transferables, priority };
+  return { signal: options.signal, transfer: transferables };
 }

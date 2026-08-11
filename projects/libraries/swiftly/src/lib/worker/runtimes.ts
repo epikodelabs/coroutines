@@ -1,7 +1,7 @@
 /**
  * Standard coroutine worker runtime.
  *
- * Used by `coroutine()`, `compute()`, and `compose()`.
+ * Used by `coroutine()` and `compose()`.
  */
 export const buildCoroutineWorkerRuntime = (): string => `
 const __serializeWorkerError = (error) => {

@@ -6,7 +6,6 @@ export * from "./event";
 export * from "./group";
 export * from "./select";
 export * from "./semaphore";
-export * from "./wait-group";
 
 export * from "./timer";
 export * from "./transfer";

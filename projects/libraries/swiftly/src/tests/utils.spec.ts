@@ -13,7 +13,6 @@ import {
   semaphore,
   send,
   withCancel,
-  waitGroup,
   withDeadline,
   withTimeout,
 } from "../public-api";
@@ -1054,7 +1053,6 @@ describe("operation selection", () => {
     const ch = channel<number>();
     const gate = event();
     const sem = semaphore(1);
-    const wg = waitGroup();
 
     for (let index = 0; index < 100; index++) {
       const controller = new AbortController();
@@ -1065,22 +1063,16 @@ describe("operation selection", () => {
       const held = await sem.acquire();
       const acquirePending = sem.acquire(controller.signal);
 
-      wg.add();
-      const waitPending = wg.wait(controller.signal);
-
       controller.abort(new ContextCancelledError("stress cancel"));
 
       await expectAsync(receivePending).toBeRejected();
       await expectAsync(eventPending).toBeRejected();
       await expectAsync(acquirePending).toBeRejected();
-      await expectAsync(waitPending).toBeRejected();
 
       held();
-      wg.done();
 
       expect(gate.waiting).toBe(0);
       expect(sem.waiting).toBe(0);
-      expect(wg.waiting).toBe(0);
     }
 
     ch.close();

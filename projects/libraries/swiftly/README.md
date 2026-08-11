@@ -6,27 +6,28 @@ Swiftly treats concurrency as a programming model rather than exposing Web Worke
 
 ## Core model
 
-- `coroutine()` — reusable sequential submissions on one dedicated worker.
-- `compute()` — reusable multi-worker execution for independent parallel submissions, including zero-copy transfer ownership.
+- `coroutine()` — stateless worker execution with lazy worker reuse across concurrent submissions, including zero-copy transfer ownership.
 - `group()` — structured ownership for dynamic concurrent work, with fail-fast sibling cancellation and optional concurrency bounds.
 - `channel()` + `select()` — communication and coordination. `select()` can also race cancellable `operation()` cases.
 - `background()`, `withCancel()`, `withTimeout()`, `withDeadline()` — cancellation and lifetime propagation.
 - `actor()` — long-lived stateful workers with messaging and observable termination.
-- `semaphore()`, `barrier()`, `waitGroup()`, `event()` — synchronization primitives with distinct semantics.
+- `semaphore()`, `barrier()`, `event()` — synchronization primitives with distinct semantics.
 - `sleep()` — worker-backed timing integrated with cancellation contexts.
 
 ## Structured concurrent work
 
-A task group owns every child started through it. The first child failure aborts the group's signal, siblings receive that cancellation, and `wait()` does not complete until all started children have settled.
+`coroutine()` executes stateless work on Web Workers. It does not choose a
+concurrency limit: concurrent calls reuse idle workers or lazily create more
+workers as needed. `group()` owns the structured lifetime and concurrency policy.
 
 ```ts
-import { compute, group } from '@epikodelabs/swiftly';
+import { coroutine, group } from '@epikodelabs/swiftly';
 
-const hash = compute<string, string>((value) => expensiveHash(value));
+const hash = coroutine<string, string>((value) => expensiveHash(value));
 const work = group({ concurrency: 4 });
 
 const results = inputs.map((input) =>
-  work.spawn((signal) => hash(input, signal)),
+  work.spawn((signal) => hash.run(input, signal)),
 );
 
 try {
@@ -37,23 +38,22 @@ try {
 }
 ```
 
-This example has one explicit concurrency policy: `group({ concurrency: 4 })`. At most four group children may execute at once, so at most four `hash()` calls can be active at once.
-
-`compute()` does not choose another worker count underneath that policy. It owns a reusable list of workers: an idle worker is reused when available, otherwise another worker is created lazily for the concurrent call. As a result, this operation needs at most four compute workers because the group admits at most four concurrent calls.
+The number `4` is the only concurrency policy in this example. At most four
+group children may execute at once, therefore at most four `hash.run()` calls
+can be active and at most four coroutine workers are needed for this operation.
 
 The responsibilities are intentionally separate:
 
 - `group()` owns task lifetime, failure propagation, cancellation, and concurrency.
-- `compute()` owns worker execution and worker reuse.
+- `coroutine()` owns worker execution, worker reuse, transfer ownership, and worker lifecycle.
 
-Unlike `Promise.all()`, the group owns cancellation and failure propagation. Calling `wait()` closes the group to new work. Cancelling the parent signal or calling `group.cancel()` propagates to running children and to children waiting for a concurrency permit.
-
-When several independent groups share one compute runner, each group controls its own concurrency while the compute runner reuses the same worker list across them.
-
+This keeps worker count out of the execution primitive itself. If several groups
+share the same coroutine, each group can apply its own concurrency policy while
+the coroutine reuses the same idle worker list.
 
 ## Cancellable worker submissions
 
-`Coroutine.run()` and compute runners accept either an `AbortSignal` or per-run execution options:
+`Coroutine.run()` accepts either an `AbortSignal` or per-run execution options:
 
 ```ts
 const parse = coroutine((text: string) => parseLargeDocument(text));
@@ -66,7 +66,7 @@ controller.abort();
 parse.run(source, { signal: controller.signal });
 ```
 
-A worker task cannot be pre-empted safely inside arbitrary JavaScript, so Swiftly cancels an active worker submission by terminating that worker. Dedicated coroutine workers are recreated for later queued work; compute worker lists retire only the cancelled worker and restore pool capacity. Queued submissions can be cancelled without starting a worker task.
+A worker task cannot be pre-empted safely inside arbitrary JavaScript, so Swiftly cancels an active worker submission by terminating only the worker that owns it. Concurrent sibling submissions continue on their own workers. Work waiting behind a `group()` concurrency permit can be cancelled before a coroutine worker is needed.
 
 `compose()` forwards the same cancellation signal through every runner stage.
 
@@ -160,34 +160,38 @@ This composes actor request lifetimes with task groups and contexts without
 inventing a separate timeout/retry API.
 
 
-## Elastic compute workers
+## Elastic coroutine workers
 
-`compute()` is the multi-worker counterpart of `coroutine()`.
+A coroutine is a reusable stateless worker-backed operation:
 
 ```ts
-const hash = compute(
+const hash = coroutine(
   (value: string) => expensiveHash(value),
 );
 ```
 
-A coroutine owns one reusable worker and serializes its submissions through that worker. A compute runner owns a reusable **list** of workers. For each concurrent submission, Swiftly reuses an idle worker when possible and lazily creates another worker when all existing workers are busy.
+The worker script is baked once. When `hash.run()` is called, Swiftly reuses an
+idle worker if one exists; otherwise it lazily creates another worker for that
+concurrent invocation. Completed workers return to the coroutine's reusable
+worker list.
 
-There is deliberately no implicit `navigator.hardwareConcurrency` limit and no compute-local admission queue. `compute()` answers only the execution question: **where does this work run?**
-
-Concurrency policy belongs to structured coordination:
+There is deliberately no implicit `navigator.hardwareConcurrency` limit and no
+coroutine-local admission queue. Concurrency policy belongs to `group()`:
 
 ```ts
 const work = group({ concurrency: 4 });
 
 const results = inputs.map((input) =>
-  work.spawn((signal) => hash(input, signal)),
+  work.spawn((signal) => hash.run(input, signal)),
 );
 ```
 
-Here the group admits at most four hash operations concurrently, so the compute runner needs at most four workers for this operation. If a broader shared resource budget is needed across unrelated groups, use `semaphore()`.
+Here the group admits at most four hash operations concurrently, so this
+structured operation needs at most four workers. If unrelated operations must
+share a broader resource budget, use `semaphore()`.
 
-Compute runners expose `active` as lightweight execution observability: it is the number of workers currently executing submissions. The reusable worker list itself remains an implementation detail.
-
+Persistent worker-local state does not belong in a coroutine. Use `actor()` when
+worker identity and state must survive across messages.
 
 ## Channel closure is explicit
 
@@ -212,7 +216,7 @@ same rule internally and stops only after an explicit closed result.
 
 Swiftly does not add a separate pipeline abstraction for bounded streaming work.
 Channels provide backpressure, groups own lifetime and failure propagation, and
-compute owns worker parallelism:
+coroutine owns worker execution:
 
 ```ts
 const input = channel<Job>(8);
@@ -233,7 +237,7 @@ for (let i = 0; i < 4; i++) {
 ```
 
 The composition remains explicit: channel capacity bounds data in flight,
-group concurrency bounds owned operations, and compute owns only worker execution
+group concurrency bounds owned operations, and coroutine owns only worker execution and reuse
 and reuse.
 
 
@@ -242,7 +246,7 @@ and reuse.
 Worker-backed task runners distinguish graceful closure from immediate teardown.
 
 ```ts
-const worker = compute(expensiveWork);
+const worker = coroutine(expensiveWork);
 
 // Already-admitted work is allowed to finish.
 await worker.close();
@@ -255,10 +259,10 @@ normal lifecycle boundary when submitted work must not be lost.
 
 `dispose()` means **terminate now**. Active and queued work is rejected and
 worker resources are released immediately. Worker-script blob URLs are acquired
-lazily on first execution, so constructing an unused coroutine or compute runner
+lazily on first execution, so constructing an unused coroutine
 does not reserve browser worker resources.
 
-The same contract is shared by `coroutine()`, `compute()`, `computeScript()`,
+The same contract is shared by `coroutine()`,
 and `compose()`. `compose().close()` attempts to close every owned stage even if
 one stage reports an error, mirroring its immediate-disposal cleanup behavior.
 
@@ -321,7 +325,7 @@ Worker task functions receive a small second argument. Its `transfer()` method
 marks a result for transfer back to the caller:
 
 ```ts
-const transform = compute<ArrayBuffer, ArrayBuffer>(
+const transform = coroutine<ArrayBuffer, ArrayBuffer>(
   (buffer, { transfer }) => {
     const bytes = new Uint8Array(buffer);
     mutate(bytes);
@@ -331,7 +335,7 @@ const transform = compute<ArrayBuffer, ArrayBuffer>(
 );
 
 const input = new ArrayBuffer(1024 * 1024);
-const output = await transform(input, { transfer: [input] });
+const output = await transform.run(input, { transfer: [input] });
 ```
 
 The transfer wrapper is worker-internal: callers receive `output` directly, not
@@ -346,28 +350,6 @@ stages inside one merged coroutine worker does not cross a worker boundary, so
 intermediate transfer wrappers are unwrapped locally and only a final-stage
 transfer is posted back to the caller.
 
-
-## Priority scheduling
-
-Worker submissions can carry a scheduling priority through the existing run control:
-
-```ts
-const low = work.run(backgroundJob, { priority: -10 });
-const urgent = work.run(userVisibleJob, { priority: 20 });
-```
-
-Higher numeric priorities are selected first **only while work is still waiting**.
-Swiftly never preempts a running JavaScript task. Equal priorities preserve strict
-submission order, so the default `priority: 0` remains FIFO-compatible.
-
-The rule applies wherever Swiftly actually has queued admission, such as a
-dedicated coroutine queue and composed queued runners. Elastic `compute()` does
-not maintain an admission queue, so priority does not create a hidden compute
-scheduling policy.
-
-Priority is deliberately a property of task admission rather than a separate
-scheduler abstraction. The runtime therefore gains scheduling semantics without
-adding another public concurrency object.
 
 ## Shared memory
 
@@ -410,24 +392,6 @@ when the actor behavior loop is ready to receive it.
 Supervisor `capacity` remains a separate policy: it bounds traffic waiting
 between actor generations during restart. Actor `mailboxCapacity` bounds traffic
 inside the currently running generation.
-
-
-## Priority fairness
-
-Task priority is preferential rather than absolute. Higher-priority queued work
-runs first under ordinary load, and equal priorities remain FIFO. A queued task
-that has been bypassed 32 times is promoted for one dispatch, so a continuous
-stream of urgent submissions cannot starve older work indefinitely.
-
-```ts
-worker.run(backgroundJob, { priority: -10 });
-worker.run(normalJob);
-worker.run(urgentJob, { priority: 20 });
-```
-
-Priority never preempts JavaScript that is already running. Fairness applies
-only where work is actually waiting in a scheduler. Elastic compute submissions
-create or reuse a worker immediately, so compute itself has no priority queue.
 
 
 ## Structured completion reports
@@ -493,7 +457,7 @@ rejects new pipeline runs, but a run already admitted is allowed to traverse
 
 This matters when a pipeline is between stages: closing stage 2 while an admitted
 run is still finishing stage 1 would violate the same drain guarantee provided
-by `coroutine()` and `compute()`.
+by `coroutine()`.
 
 `dispose()` remains immediate and can override a concurrent graceful close;
 the close promise is settled by that teardown rather than being left pending.
@@ -514,7 +478,7 @@ observation is attached before buffered ingress is flushed, so a transport
 failure during restart delivery cannot leave the supervisor watching a dead
 generation incorrectly.
 
-Dedicated runners and compute worker lists are regression-tested for the same lifecycle
+Coroutine workers are regression-tested for lifecycle
 pressure: worker failure during graceful close must continue draining admitted
 queued work, while `dispose()` may escalate an in-progress close and settle the
 close promise without stranding callers.

@@ -70,7 +70,7 @@ ${depsSection ? '  ' + depsSection.replace(/\n/g, '\n  ') + '\n' : ''}  return (
  * Chains multiple coroutines sequentially into a single `Coroutine`.
  *
  * `CoroutineScript` inputs (created by `coroutine()`) are merged into one
- * worker script so the entire pipeline runs inside one dedicated worker task.
+ * worker script so the entire pipeline runs inside one worker task per concurrent invocation.
  *
  * `TaskRunner` inputs are chained in the main thread after the worker
  * stage completes.
@@ -195,17 +195,15 @@ export function compose<T = any, R = any>(
     activeRuns += 1;
     try {
       let result: any = data;
-      const { signal, transfer, priority } = normalizeTaskRunControl(control);
+      const { signal, transfer } = normalizeTaskRunControl(control);
       let transferPending = transfer.length > 0;
 
       if (workerRunner) {
         result = await workerRunner.run(
           result,
           transferPending
-            ? { signal, transfer, priority }
-            : priority !== 0
-              ? { signal, priority }
-              : signal,
+            ? { signal, transfer }
+            : signal,
         );
         transferPending = false;
       }
@@ -214,10 +212,8 @@ export function compose<T = any, R = any>(
         result = await runner.run(
           result,
           transferPending
-            ? { signal, transfer, priority }
-            : priority !== 0
-              ? { signal, priority }
-              : signal,
+            ? { signal, transfer }
+            : signal,
         );
         transferPending = false;
       }

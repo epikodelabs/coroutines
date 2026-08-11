@@ -200,7 +200,7 @@ idescribe('coroutine', () => {
     expect(processed).toEqual([2, 3, 4]); // Fixed expectation: x + 1
   });
 
-  it('should process multiple tasks in sequence', async () => {
+  it('should process concurrent tasks on elastic workers', async () => {
     const mainTask = (x: number) => x * 2; // Fixed: consistent task logic
     (globalThis as any).currentMainTask = mainTask;
     
@@ -213,7 +213,8 @@ idescribe('coroutine', () => {
     ]);
 
     expect(results).toEqual([2, 4, 6]); // Fixed expectation: x * 2
-    expect(mockWorkerCreations).toBe(1);
+    expect(mockWorkerCreations).toBe(3);
+    await co.dispose();
   });
 
   it('should dispose and terminate all workers', async () => {
@@ -421,23 +422,18 @@ idescribe('coroutine', () => {
     await co.dispose();
   });
 
-  it('should reject queued run requests when finalized', async () => {
-    const mainTask = (x: number) => {
-      if (x === 1) {
-        return new Promise<number>(() => {}); // never resolves
-      }
-      return x;
-    };
+  it('should reject all concurrent run requests when finalized', async () => {
+    const mainTask = (_x: number) => new Promise<number>(() => {});
     (globalThis as any).currentMainTask = mainTask;
 
     const co = coroutine(mainTask);
-    const active = co.run(1);
-    const queued = co.run(2);
+    const first = co.run(1);
+    const second = co.run(2);
 
     await co.dispose();
 
-    await expectAsync(active).toBeRejectedWithError(/finalized before the worker task completed/);
-    await expectAsync(queued).toBeRejectedWithError(/finalized before a worker became available/);
+    await expectAsync(first).toBeRejectedWithError(/finalized before the worker task completed/);
+    await expectAsync(second).toBeRejectedWithError(/finalized before the worker task completed/);
   });
 
   it('dispose is safe when called before any worker is created', async () => {
@@ -474,7 +470,7 @@ idescribe('coroutine', () => {
     await expectAsync(co.close()).toBeResolved();
   });
 
-  it("dispose remains immediate and rejects queued coroutine work", async () => {
+  it("dispose remains immediate and rejects all active coroutine work", async () => {
     const mainTask = async (x: number) => {
       await new Promise((resolve) => setTimeout(resolve, 25));
       return x;
@@ -482,13 +478,13 @@ idescribe('coroutine', () => {
     (globalThis as any).currentMainTask = mainTask;
 
     const co = coroutine(mainTask);
-    const active = co.run(1);
-    const queued = co.run(2);
+    const first = co.run(1);
+    const second = co.run(2);
 
     await co.dispose();
 
-    await expectAsync(active).toBeRejected();
-    await expectAsync(queued).toBeRejectedWithError(/disposed/);
+    await expectAsync(first).toBeRejected();
+    await expectAsync(second).toBeRejected();
     await expectAsync(co.close()).toBeResolved();
   });
 

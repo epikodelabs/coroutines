@@ -7,13 +7,6 @@
 export type TaskRunOptions = {
   signal?: AbortSignal;
   transfer?: readonly Transferable[];
-  /**
-   * Scheduling priority for work that has not started yet. Higher values are
-   * preferred and equal priorities preserve submission order. To prevent
-   * starvation, a waiting task is promoted after 32 bypasses. Defaults to `0`.
-   * Running work is never preempted.
-   */
-  priority?: number;
 };
 
 /** Accepted second argument for worker-backed task execution. */
@@ -29,7 +22,7 @@ export type TransferResult<T> = {
 /** A worker task may return a normal value or explicitly transfer its result. */
 export type WorkerTaskResult<T> = T | TransferResult<T>;
 
-/** Utilities injected as the second argument of coroutine/compute task functions. */
+/** Utilities injected as the second argument of coroutine task functions. */
 export interface WorkerTaskUtils {
   /**
    * Transfers ownership of one or more transferable objects with the task result.

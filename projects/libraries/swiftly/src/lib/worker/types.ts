@@ -34,7 +34,7 @@ export interface TaskRunner<T = any, R = any> {
 }
 
 /**
- * Plain background-task runner backed by one dedicated worker.
+ * Stateless background-task runner backed by an elastic reusable worker list.
  *
  * Created by `coroutine(mainTask)` and accepted by `compose(...)`.
  */
@@ -65,7 +65,7 @@ export type ActorOptions = {
  * Lifecycle is managed through the bus — call `main.outbox.stop(actorOrName)`
  * to stop the actor and release resources.
  *
- * Unlike `Coroutine`, an actor owns exactly one worker.
+ * Unlike `Coroutine`, an actor owns persistent worker identity and state.
  */
 export interface Actor {
   /** Stable actor name used for actor-to-actor addressing. */
