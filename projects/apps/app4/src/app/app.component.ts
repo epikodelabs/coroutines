@@ -140,30 +140,17 @@ function getHoshiSet(size: number): Set<string> {
   `,
 })
 export class AppComponent implements OnInit, OnDestroy {
-  private readonly unsubscribe: Array<() => void> = [];
-  readonly state = signal<TerritoryWarsState | null>(null);
+  readonly state = this.service.state;
   readonly currentSize = signal(11);
   readonly hoshiSet = computed(() => getHoshiSet(this.currentSize()));
 
   constructor(private readonly service: TerritoryWarsService) {}
 
   ngOnInit(): void {
-    this.unsubscribe.push(
-      this.service.state$.subscribe((nextState) => {
-        if (!nextState) {
-          return;
-        }
-        this.state.set(nextState);
-      }),
-    );
-
     this.startMatch(this.currentSize());
   }
 
   ngOnDestroy(): void {
-    while (this.unsubscribe.length > 0) {
-      this.unsubscribe.pop()!();
-    }
     void this.service.destroy();
   }
 

@@ -1,9 +1,7 @@
-import { ChangeDetectorRef, Component, OnDestroy, OnInit } from '@angular/core';
+import { Component, OnDestroy } from '@angular/core';
 import {
   KitchenService,
-  KitchenStats,
   Order,
-  OvenState,
 } from './kitchen.service';
 
 @Component({
@@ -13,38 +11,38 @@ import {
   template: `
     <div class="kitchen">
       <div class="controls">
-        <button [disabled]="isRunning" (click)="runShift(morningOrders)">🌅 Morning Shift</button>
-        <button [disabled]="isRunning" (click)="runShift(lunchOrders)">🌞 Lunch Rush</button>
-        <button [disabled]="isRunning" (click)="runShift(afternoonOrders)">🌤️ Afternoon</button>
-        <button [disabled]="isRunning" (click)="runShift(eveningOrders)">🌙 Evening Rush</button>
-        <button [disabled]="isRunning" (click)="runFullDay()" class="primary">🍕 Full Day</button>
-        <button [disabled]="!isRunning" (click)="closeKitchen()" class="danger">🚨 Close Kitchen</button>
+        <button [disabled]="isRunning()" (click)="runShift(morningOrders)">🌅 Morning Shift</button>
+        <button [disabled]="isRunning()" (click)="runShift(lunchOrders)">🌞 Lunch Rush</button>
+        <button [disabled]="isRunning()" (click)="runShift(afternoonOrders)">🌤️ Afternoon</button>
+        <button [disabled]="isRunning()" (click)="runShift(eveningOrders)">🌙 Evening Rush</button>
+        <button [disabled]="isRunning()" (click)="runFullDay()" class="primary">🍕 Full Day</button>
+        <button [disabled]="!isRunning()" (click)="closeKitchen()" class="danger">🚨 Close Kitchen</button>
       </div>
 
       <div class="stats">
         <div class="stat-card">
-          <div class="stat-value">{{ stats.completed }}</div>
+          <div class="stat-value">{{ stats().completed }}</div>
           <div class="stat-label">Completed</div>
         </div>
 
         <div class="stat-card">
-          <div class="stat-value">{{ stats.cancelled }}</div>
+          <div class="stat-value">{{ stats().cancelled }}</div>
           <div class="stat-label">Cancelled</div>
         </div>
 
         <div class="stat-card">
-          <div class="stat-value">{{ stats.active }}</div>
+          <div class="stat-value">{{ stats().active }}</div>
           <div class="stat-label">Active</div>
         </div>
 
         <div class="stat-card revenue">
-          <div class="stat-value">\${{ stats.revenue.toFixed(2) }}</div>
+          <div class="stat-value">\${{ stats().revenue.toFixed(2) }}</div>
           <div class="stat-label">Revenue</div>
         </div>
       </div>
 
       <div class="ovens">
-        @for (oven of ovens; track oven.id) {
+        @for (oven of ovens(); track oven.id) {
           <div class="oven" [class.active]="oven.order">
             <div class="oven-header">{{ oven.id }}</div>
 
@@ -69,11 +67,11 @@ import {
         }
       </div>
 
-      @if (isRunning && cancellableOrders.length > 0) {
+      @if (isRunning() && cancellableOrders().length > 0) {
         <div class="cancel-panel">
           <span>Cancel order:</span>
 
-          @for (order of cancellableOrders; track order.id) {
+          @for (order of cancellableOrders(); track order.id) {
             <button (click)="cancelOrder(order.id)">
               Cancel {{ order.customer }}'s {{ order.item }}
             </button>
@@ -85,12 +83,12 @@ import {
         <div class="log-header">Event Log</div>
 
         <div class="log-entries">
-          @for (entry of logEntries; track $index) {
+          @for (entry of logEntries(); track $index) {
             <div
               class="log-entry"
-              [class]="entryClass(entry)"
+              [class]="entry.kind"
             >
-              {{ entry }}
+              {{ entry.text }}
             </div>
           }
         </div>
@@ -353,17 +351,12 @@ import {
     }
   `],
 })
-export class KitchenComponent implements OnInit, OnDestroy {
-  ovens: OvenState[] = [];
-  cancellableOrders: Order[] = [];
-  stats: KitchenStats = {
-    completed: 0,
-    cancelled: 0,
-    revenue: 0,
-    active: 0,
-  };
-  logEntries: string[] = [];
-  isRunning = false;
+export class KitchenComponent implements OnDestroy {
+  readonly ovens = this.kitchen.ovens;
+  readonly cancellableOrders = this.kitchen.cancellableOrders;
+  readonly stats = this.kitchen.stats;
+  readonly logEntries = this.kitchen.logEntries;
+  readonly isRunning = this.kitchen.isProcessing;
 
   morningOrders: Order[] = [
     { id: 'M1', item: 'Margherita', customer: 'John' },
@@ -391,115 +384,26 @@ export class KitchenComponent implements OnInit, OnDestroy {
     { id: 'E5', item: 'Hawaiian', customer: 'Roberto' },
   ];
 
-  private readonly cleanups: Array<() => void> = [];
-  private runningInterval: ReturnType<typeof setInterval> | null = null;
+  constructor(private readonly kitchen: KitchenService) {}
 
-  constructor(private kitchen: KitchenService, private cdr: ChangeDetectorRef) {}
-
-  ngOnInit() {
-    this.cleanups.push(
-      this.kitchen.ovens$.subscribe((ovens: OvenState[]) => {
-        this.ovens = ovens;
-        this.cdr.detectChanges();
-      }),
-    );
-
-    this.cleanups.push(
-      this.kitchen.cancellableOrders$.subscribe((orders: Order[]) => {
-        this.cancellableOrders = orders;
-        this.cdr.detectChanges();
-      }),
-    );
-
-    this.cleanups.push(
-      this.kitchen.stats$.subscribe((stats: KitchenStats) => {
-        this.stats = stats;
-        this.cdr.detectChanges();
-      }),
-    );
-
-    this.cleanups.push(
-      this.kitchen.log$.subscribe((entry) => {
-        if (!entry) {
-          return;
-        }
-        this.logEntries.push(entry);
-
-        if (this.logEntries.length > 200) {
-          this.logEntries.shift();
-        }
-        this.cdr.detectChanges();
-      }),
-    );
-
-    this.updateRunningState();
-
-    this.runningInterval = setInterval(() => {
-      this.updateRunningState();
-      this.cdr.detectChanges();
-    }, 250);
-    this.cleanups.push(() => {
-      if (this.runningInterval) {
-        clearInterval(this.runningInterval);
-        this.runningInterval = null;
-      }
-    });
-
-
-  }
-
-  ngOnDestroy() {
-    while (this.cleanups.length > 0) {
-      this.cleanups.pop()!();
-    }
+  ngOnDestroy(): void {
     void this.kitchen.destroy();
   }
 
-  async runShift(orders: Order[]) {
-    this.kitchen.resetState();
-    this.logEntries = [];
-    this.cdr.detectChanges();
-
+  async runShift(orders: Order[]): Promise<void> {
     await this.kitchen.runShift(orders);
-
-    this.updateRunningState();
-    this.cdr.detectChanges();
   }
 
-  async runFullDay() {
-    this.kitchen.resetState();
-    this.logEntries = [];
-    this.cdr.detectChanges();
-
+  async runFullDay(): Promise<void> {
     await this.kitchen.runFullDay();
-
-    this.updateRunningState();
-    this.cdr.detectChanges();
   }
 
-  cancelOrder(orderId: string) {
+  cancelOrder(orderId: string): void {
     this.kitchen.cancelOrder(orderId);
-    this.cdr.detectChanges();
   }
 
-  closeKitchen() {
+  closeKitchen(): void {
     this.kitchen.closeKitchen();
-    this.cdr.detectChanges();
   }
 
-  private updateRunningState() {
-    this.isRunning = this.kitchen.isRunning();
-  }
-
-  entryClass(entry: string): string {
-    if (entry.includes('🍳 Started')) return 'started';
-    if (entry.includes('✅ READY')) return 'ready';
-    if (entry.includes('❌ CANCELLED')) return 'cancelled';
-    if (entry.includes('⏰ TIMEOUT')) return 'timeout';
-    if (entry.includes('🏁 Shift closed')) return 'closed';
-    if (entry.includes('🚨 Kitchen closing')) return 'cancelled';
-    if (entry.includes('🚫 Cancellation requested')) return 'cancelled';
-
-    return '';
-  }
 }

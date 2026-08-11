@@ -8,7 +8,7 @@ Fractal renderer using `swiftly` coroutine workers.
 - **`group`** - bounds concurrent row batches explicitly
 - **Progressive rendering** - row batches draw to canvas as workers complete
 - **Interactive parameters** - presets, c (Re/Im), color palette
-- **Reactive UI** - `ChangeDetectorRef.detectChanges()` for smooth progress updates
+- **Reactive UI** - Angular signals update rendering progress without manual change detection
 
 ## Run
 

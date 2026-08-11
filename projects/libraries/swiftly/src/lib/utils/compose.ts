@@ -1,5 +1,26 @@
 import { buildCoroutineWorkerRuntime, buildWorkerScript, createTaskRunner, serializeScript } from "../worker";
 import type { Coroutine, CoroutineScript, TaskRunner } from "../worker/types";
+
+type Composable<I = any, O = any> = CoroutineScript<I, O> | TaskRunner<I, O>;
+type InputOf<T> = T extends CoroutineScript<infer I, any>
+  ? I
+  : T extends TaskRunner<infer I, any>
+    ? I
+    : never;
+type OutputOf<T> = T extends CoroutineScript<any, infer O>
+  ? O
+  : T extends TaskRunner<any, infer O>
+    ? O
+    : never;
+type Last<T extends readonly unknown[]> = T extends readonly [...unknown[], infer L] ? L : never;
+type IsComposableChain<T extends readonly Composable[]> =
+  T extends readonly [infer A extends Composable, infer B extends Composable, ...infer Rest extends Composable[]]
+    ? [OutputOf<A>] extends [InputOf<B>]
+      ? IsComposableChain<readonly [B, ...Rest]>
+      : false
+    : true;
+type ValidComposableChain<T extends readonly [Composable, ...Composable[]]> =
+  IsComposableChain<T> extends true ? T : never;
 import type { TaskRunControl } from "./transfer";
 import { normalizeTaskRunControl } from "../worker/control";
 
@@ -89,10 +110,10 @@ ${depsSection ? '  ' + depsSection.replace(/\n/g, '\n  ') + '\n' : ''}  return (
  * `TaskRunner` inputs are chained in the main thread after the worker
  * stage completes.
  */
-export function compose<A, B>(...scripts: [CoroutineScript<A, B>]): Coroutine<A, B>;
-export function compose<A, B, C>(...scripts: [CoroutineScript<A, B>, CoroutineScript<B, C>]): Coroutine<A, C>;
-export function compose<A, B, C, D>(...scripts: [CoroutineScript<A, B>, CoroutineScript<B, C>, CoroutineScript<C, D>]): Coroutine<A, D>;
-export function compose<T = any, R = any>(...scripts: Array<CoroutineScript<any, any> | TaskRunner<any, any>>): Coroutine<T, R>;
+export function compose(): Coroutine<any, any>;
+export function compose<const S extends readonly [Composable, ...Composable[]]>(
+  ...scripts: ValidComposableChain<S>
+): Coroutine<InputOf<S[0]>, OutputOf<Last<S>>>;
 
 export function compose<T = any, R = any>(
   ...scripts: Array<CoroutineScript<any, any> | TaskRunner<any, any>>

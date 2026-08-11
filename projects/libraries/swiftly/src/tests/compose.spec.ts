@@ -1,6 +1,20 @@
 import { compose, coroutine, type TaskRunControl } from "../public-api";
 
 describe("compose coroutines", () => {
+  it("preserves types across more than three composed stages", async () => {
+    const c1 = coroutine((value: number) => String(value));
+    const c2 = coroutine((value: string) => value.length);
+    const c3 = coroutine((value: number) => value > 0);
+    const c4 = coroutine((value: boolean) => (value ? 1 : 0));
+    const c5 = coroutine((value: number) => `result:${value}`);
+
+    const pipeline = compose(c1, c2, c3, c4, c5);
+    const result: string = await pipeline.run(42);
+
+    expect(result).toBe("result:1");
+    await pipeline.dispose();
+  });
+
   it("should process tasks sequentially via run", async () => {
     const c1 = coroutine((x: number) => x + 1);
     const c2 = coroutine((x: number) => x * 2);

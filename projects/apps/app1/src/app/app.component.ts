@@ -1,5 +1,5 @@
 import { DecimalPipe } from '@angular/common';
-import { AfterViewInit, ChangeDetectorRef, Component, ElementRef, OnDestroy, ViewChild } from '@angular/core';
+import { AfterViewInit, Component, ElementRef, OnDestroy, ViewChild, signal } from '@angular/core';
 import { FormsModule } from '@angular/forms';
 import { coroutine, group } from '@epikodelabs/swiftly';
 
@@ -162,20 +162,20 @@ const juliaBatchWorker = (params: BatchParams): Pixel[] => {
           <p class="tooltip">Canvas rows are rendered through a reusable worker coroutine.</p>
 
           <div class="julia-controls">
-            <button (click)="drawJulia()" [disabled]="generating">{{ generating ? 'Rendering…' : 'Generate' }}</button>
-            @if (elapsed > 0) {
-              <span class="julia-meta">Elapsed: {{ elapsed | number:'1.0-0' }} ms</span>
+            <button (click)="drawJulia()" [disabled]="generating()">{{ generating() ? 'Rendering…' : 'Generate' }}</button>
+            @if (elapsed() > 0) {
+              <span class="julia-meta">Elapsed: {{ elapsed() | number:'1.0-0' }} ms</span>
             }
           </div>
 
           <div class="julia-canvas-wrap">
             <canvas #juliaCanvas width="1000" height="1000"></canvas>
-            @if (generating) {
+            @if (generating()) {
               <div class="julia-overlay">
                 <div class="julia-progress-bar">
-                  <div class="julia-progress-fill" [style.width.%]="progress"></div>
+                  <div class="julia-progress-fill" [style.width.%]="progress()"></div>
                 </div>
-                <span class="julia-progress-text">{{ progress | number:'1.0-0' }}%</span>
+                <span class="julia-progress-text">{{ progress() | number:'1.0-0' }}%</span>
               </div>
             }
           </div>
@@ -324,8 +324,6 @@ const juliaBatchWorker = (params: BatchParams): Pixel[] => {
   `],
 })
 export class AppComponent implements AfterViewInit, OnDestroy {
-  constructor(private cdr: ChangeDetectorRef) {}
-
   @ViewChild('juliaCanvas') juliaCanvas!: ElementRef<HTMLCanvasElement>;
 
   presets = PRESETS;
@@ -338,9 +336,9 @@ export class AppComponent implements AfterViewInit, OnDestroy {
   maxIterations = 80;
   palette: Palette = 'Electric';
 
-  generating = false;
-  progress = 0;
-  elapsed = 0;
+  readonly generating = signal(false);
+  readonly progress = signal(0);
+  readonly elapsed = signal(0);
 
   private runner = coroutine<BatchParams, Pixel[]>(juliaBatchWorker);
   private abortController: AbortController | null = null;
@@ -387,9 +385,9 @@ export class AppComponent implements AfterViewInit, OnDestroy {
     const imageData = ctx.createImageData(w, h);
     const data = imageData.data;
 
-    this.generating = true;
-    this.progress = 0;
-    this.elapsed = 0;
+    this.generating.set(true);
+    this.progress.set(0);
+    this.elapsed.set(0);
     const start = performance.now();
 
     const batchHeight = 30;
@@ -434,8 +432,7 @@ export class AppComponent implements AfterViewInit, OnDestroy {
           if (signal.aborted || generation !== this.renderGeneration) return;
 
           completed++;
-          this.progress = (completed / totalBatches) * 100;
-          this.cdr.detectChanges();
+          this.progress.set((completed / totalBatches) * 100);
           ctx.putImageData(imageData, 0, 0);
         })
       );
@@ -445,9 +442,8 @@ export class AppComponent implements AfterViewInit, OnDestroy {
     }
 
     if (!signal.aborted && generation === this.renderGeneration) {
-      this.elapsed = performance.now() - start;
-      this.generating = false;
-      this.cdr.detectChanges();
+      this.elapsed.set(performance.now() - start);
+      this.generating.set(false);
     }
   }
 }

@@ -1,22 +1,21 @@
 /**
- * Kitchen Simulation Service — Actor-based Pizza Bakery Demo
+ * Kitchen Simulation Service — structured concurrency + actor routing demo.
  *
- * Architecture:
- *   • Cashier actor  : receives orders, forwards to chef via actor bus
- *   • Chef actor     : receives orders from cashier, requests recipes and
- *                      oven bakes from main thread, emits lifecycle events
- *   • Oven coroutines: worker-backed baking operations
- *
- * Communication flow:
- *   UI → Cashier : main.outbox.send(cashier, 'runShift' | 'cancel' | 'close', payload)
- *   Cashier → Chef : utils.outbox.send('chef', 'cook' | 'cancel', ...)
- *   Chef → Main    : utils.outbox.request('main', 'recipe', item) fetches recipe
- *                    utils.outbox.request('main', 'bake', { order, recipe }) dispatches to oven
- *                    utils.outbox.send('main', topic, event) pushes live events
+ * The cashier actor only routes commands. The Angular service owns every cook
+ * operation through a bounded `group()`, and each oven coroutine owns worker
+ * execution. No actor behavior launches detached asynchronous work.
  */
-import { Injectable } from '@angular/core';
-import { ActorBusMessage, actor, coroutine, main, registerActorRequestHandler, sleep, WorkerUtils } from '@epikodelabs/swiftly';
-import { atom } from '../../../shared/simple-atom';
+import { Injectable, computed, signal } from '@angular/core';
+import {
+  Actor,
+  ActorBusMessage,
+  TaskGroup,
+  actor,
+  coroutine,
+  group,
+  main,
+  WorkerUtils,
+} from '@epikodelabs/swiftly';
 
 export type Order = { id: string; item: string; customer: string };
 
@@ -26,17 +25,11 @@ export type Recipe = {
   bakeMs: number;
 };
 
-export type KitchenMessage =
-  | { type: 'runShift'; orders: Order[] }
-  | { type: 'cancel'; orderId: string }
-  | { type: 'close'; cancelQueued?: boolean };
-
 export type KitchenEvent =
   | { type: 'started'; order: Order; oven: string }
   | { type: 'stage'; order: Order; stage: string; oven: string }
   | { type: 'ready'; order: Order; oven: string; price: number }
   | { type: 'cancelled'; order: Order; reason: string; oven: string }
-  | { type: 'timeout'; order: Order; oven: string }
   | { type: 'closed'; completed: number; cancelled: number; totalRevenue: number };
 
 export type OvenState = {
@@ -52,7 +45,21 @@ export type KitchenStats = {
   active: number;
 };
 
-const recipes = new Map<string, Recipe>([
+export type KitchenLogEntry = {
+  text: string;
+  kind: 'normal' | 'started' | 'ready' | 'cancelled' | 'closed';
+};
+
+function createOvenCoroutine() {
+  return coroutine(ovenBakeTask);
+}
+
+type OvenWorker = {
+  id: string;
+  worker: ReturnType<typeof createOvenCoroutine>;
+};
+
+const RECIPES = new Map<string, Recipe>([
   ['Margherita', { item: 'Margherita', ingredients: ['tomato', 'mozzarella', 'basil'], bakeMs: 3000 }],
   ['Pepperoni', { item: 'Pepperoni', ingredients: ['tomato', 'mozzarella', 'pepperoni'], bakeMs: 3500 }],
   ['Hawaiian', { item: 'Hawaiian', ingredients: ['tomato', 'mozzarella', 'ham', 'pineapple'], bakeMs: 3200 }],
@@ -60,7 +67,7 @@ const recipes = new Map<string, Recipe>([
   ['Diavola', { item: 'Diavola', ingredients: ['tomato', 'mozzarella', 'spicy salami', 'chili'], bakeMs: 3800 }],
 ]);
 
-const prices = new Map<string, number>([
+const PRICES = new Map<string, number>([
   ['Margherita', 12.99],
   ['Pepperoni', 14.99],
   ['Hawaiian', 13.99],
@@ -68,595 +75,312 @@ const prices = new Map<string, number>([
   ['Diavola', 16.99],
 ]);
 
-// ===== OVEN COROUTINES =====
 async function ovenBakeTask(task: { order: Order; recipe: Recipe }) {
-  await new Promise(r => setTimeout(r, task.recipe.bakeMs));
+  await new Promise<void>((resolve) => setTimeout(resolve, task.recipe.bakeMs));
   return task;
 }
 
-const ovens = [
-  { id: 'Oven #1', worker: coroutine(ovenBakeTask), busy: false },
-  { id: 'Oven #2', worker: coroutine(ovenBakeTask), busy: false },
-  { id: 'Oven #3', worker: coroutine(ovenBakeTask), busy: false },
+function cashierBehavior(
+  msg: any,
+  state: { routed: number },
+  utils: WorkerUtils<any, any, any, any>,
+) {
+  if (msg.kind !== 'actor-bus') return state;
+
+  if (msg.topic === 'runShift') {
+    const orders = (msg.payload as { orders: Order[] }).orders;
+    for (const order of orders) {
+      utils.outbox.send('main', 'cook', order);
+      state.routed++;
+    }
+    utils.outbox.send('main', 'shift-routed', { count: orders.length });
+  }
+
+  if (msg.topic === 'cancel') {
+    utils.outbox.send('main', 'cancel', msg.payload as string);
+  }
+
+  if (msg.topic === 'close') {
+    utils.outbox.send('main', 'close', msg.payload ?? { cancelQueued: true });
+  }
+
+  return state;
+}
+
+const EMPTY_OVENS = (): OvenState[] => [
+  { id: 'Oven #1', order: null, stage: null },
+  { id: 'Oven #2', order: null, stage: null },
+  { id: 'Oven #3', order: null, stage: null },
 ];
-
-type OvenSlot = (typeof ovens)[number];
-type OvenReservation = { ovenId: string };
-type BakeRequest = { ovenId: string; order: Order; recipe: Recipe };
-type BakeResult = { ovenId: string; price: number };
-
-const reservedOvens = new Map<string, OvenSlot>();
-const ovenWaitQueue: Array<(oven: OvenSlot) => void> = [];
-
-function emitKitchenEvent(
-  utils: WorkerUtils<any, any, any, KitchenEvent>,
-  event: KitchenEvent
-) {
-  utils.outbox.send('main', event.type, event);
-}
-
-function releaseOvenSlot(oven: OvenSlot) {
-  const next = ovenWaitQueue.shift();
-  if (next) {
-    next(oven);
-    return;
-  }
-
-  oven.busy = false;
-}
-
-async function reserveOven(): Promise<OvenReservation> {
-  const idleOven = ovens.find((oven) => !oven.busy);
-  const oven = idleOven
-    ? idleOven
-    : await new Promise<OvenSlot>((resolve) => {
-        ovenWaitQueue.push(resolve);
-      });
-
-  oven.busy = true;
-  reservedOvens.set(oven.id, oven);
-  return { ovenId: oven.id };
-}
-
-function releaseReservedOven(ovenId: string) {
-  const oven = reservedOvens.get(ovenId);
-  if (!oven) {
-    return false;
-  }
-
-  reservedOvens.delete(ovenId);
-  releaseOvenSlot(oven);
-  return true;
-}
-
-async function bakeOnReservedOven(request: BakeRequest): Promise<BakeResult> {
-  const oven = reservedOvens.get(request.ovenId);
-  if (!oven) {
-    throw new Error(`Oven "${request.ovenId}" is not reserved`);
-  }
-
-  try {
-    await oven.worker.run({ order: request.order, recipe: request.recipe });
-    return { ovenId: oven.id, price: prices.get(request.order.item) ?? 10 };
-  } finally {
-    reservedOvens.delete(oven.id);
-    releaseOvenSlot(oven);
-  }
-}
-
-// ===== CHEF ACTOR =====
-interface ChefState {
-  activeTasks: number;
-  completedCount: number;
-  cancelledCount: number;
-  totalRevenue: number;
-  closing: boolean;
-  cancelQueued: boolean;
-  closedSent: boolean;
-  cancelledIds: Set<string>;
-}
-
-function checkClosed(state: ChefState, utils: WorkerUtils<any, any, any, KitchenEvent>) {
-  if (state.closing && state.activeTasks === 0 && !state.closedSent) {
-    state.closedSent = true;
-    emitKitchenEvent(utils, {
-      type: 'closed',
-      completed: state.completedCount,
-      cancelled: state.cancelledCount,
-      totalRevenue: state.totalRevenue,
-    } as KitchenEvent);
-  }
-}
-
-async function chefBehavior(
-  msg: any,
-  state: ChefState,
-  utils: WorkerUtils<any, any, any, KitchenEvent>
-) {
-  // Handle bus messages from cashier
-  if (msg.kind === 'actor-bus') {
-    if (msg.topic === 'cook') {
-      const order = msg.payload as Order;
-      state.activeTasks++;
-
-      // Fire-and-forget cooking task
-      (async () => {
-        let reservedOvenId: string | null = null;
-        const cancelOrder = async (reason: string, oven = 'N/A') => {
-          if (reservedOvenId) {
-            await utils.outbox.request('main', 'release-oven', { ovenId: reservedOvenId });
-            reservedOvenId = null;
-          }
-
-          state.activeTasks--;
-          state.cancelledCount++;
-          emitKitchenEvent(utils, {
-            type: 'cancelled',
-            order,
-            reason,
-            oven,
-          } as KitchenEvent);
-          checkClosed(state, utils);
-        };
-
-        try {
-          if (state.cancelledIds.has(order.id)) {
-            await cancelOrder('Cancelled before start');
-            return;
-          }
-
-          if (state.cancelQueued) {
-            await cancelOrder('Cancelled because the kitchen is closing');
-            return;
-          }
-
-          const recipe = await utils.outbox.request('main', 'recipe', order.item) as Recipe | undefined;
-          if (!recipe) throw new Error(`No recipe for ${order.item}`);
-
-          if (state.cancelledIds.has(order.id)) {
-            await cancelOrder('Cancelled before oven assignment');
-            return;
-          }
-
-          if (state.cancelQueued) {
-            await cancelOrder('Cancelled because the kitchen is closing');
-            return;
-          }
-
-          const reservation = await utils.outbox.request('main', 'reserve-oven', { order }) as OvenReservation;
-          reservedOvenId = reservation.ovenId;
-
-          if (state.cancelledIds.has(order.id)) {
-            await cancelOrder('Cancelled while waiting for an oven', reservedOvenId);
-            return;
-          }
-
-          if (state.cancelQueued) {
-            await cancelOrder('Cancelled because the kitchen is closing', reservedOvenId);
-            return;
-          }
-
-          emitKitchenEvent(utils, {
-            type: 'started',
-            order,
-            oven: reservedOvenId,
-          } as KitchenEvent);
-          emitKitchenEvent(utils, {
-            type: 'stage',
-            order,
-            stage: 'Baking...',
-            oven: reservedOvenId,
-          } as KitchenEvent);
-
-          const bakeResult = await utils.outbox.request('main', 'bake', {
-            ovenId: reservedOvenId,
-            order,
-            recipe,
-          }) as BakeResult;
-          reservedOvenId = null;
-          state.activeTasks--;
-          state.completedCount++;
-          state.totalRevenue += bakeResult.price;
-          emitKitchenEvent(utils, {
-            type: 'ready',
-            order,
-            oven: bakeResult.ovenId,
-            price: bakeResult.price,
-          } as KitchenEvent);
-          checkClosed(state, utils);
-        } catch (err: any) {
-          await cancelOrder(err?.message ?? String(err), reservedOvenId ?? 'N/A');
-        }
-      })();
-    }
-
-    if (msg.topic === 'cancel') {
-      state.cancelledIds.add(msg.payload as string);
-    }
-
-    if (msg.topic === 'close') {
-      state.closing = true;
-      state.cancelQueued = Boolean(msg.payload?.cancelQueued);
-      state.closedSent = false;
-      checkClosed(state, utils);
-    }
-
-    return state;
-  }
-
-  return state;
-}
-
-const chef = actor('chef', chefBehavior, {
-  activeTasks: 0,
-  completedCount: 0,
-  cancelledCount: 0,
-  totalRevenue: 0,
-  closing: false,
-  cancelQueued: false,
-  closedSent: false,
-  cancelledIds: new Set<string>(),
-}, emitKitchenEvent, checkClosed);
-
-const unregisterKitchenRequests = registerActorRequestHandler('main', async (topic: string, payload: unknown) => {
-  if (topic === 'recipe' && typeof payload === 'string') {
-    return recipes.get(payload);
-  }
-  if (topic === 'reserve-oven') {
-    return reserveOven();
-  }
-  if (topic === 'release-oven') {
-    const request = payload as { ovenId: string };
-    return { released: releaseReservedOven(request.ovenId) };
-  }
-  const bakeTask = payload as BakeRequest;
-  if (topic === 'bake') {
-    return bakeOnReservedOven(bakeTask);
-  }
-  throw new Error(`Unknown request payload: ${JSON.stringify(payload)}`);
-});
-
-// ===== CASHIER ACTOR =====
-const cashier = actor('cashier', async function cashier(
-  msg: any,
-  state: { closing: boolean },
-  utils: WorkerUtils<any, any, any, any>
-) {
-  if (msg.kind === 'actor-bus' && msg.topic === 'runShift') {
-    const payload = msg.payload as { orders: Order[] };
-    for (const order of payload.orders) {
-      utils.outbox.send('chef', 'cook', order);
-    }
-    utils.outbox.send('chef', 'close', { cancelQueued: false });
-  }
-
-  if (msg.kind === 'actor-bus' && msg.topic === 'cancel') {
-    utils.outbox.send('chef', 'cancel', msg.payload as string);
-  }
-
-  if (msg.kind === 'actor-bus' && msg.topic === 'close') {
-    utils.outbox.send('chef', 'close', { cancelQueued: (msg.payload as any)?.cancelQueued ?? true });
-  }
-
-  return state;
-}, { closing: false });
 
 @Injectable({ providedIn: 'root' })
 export class KitchenService {
-  private events = atom<KitchenEvent>();
-  events$ = this.events;
+  readonly ovens = signal<OvenState[]>(EMPTY_OVENS());
+  readonly cancellableOrders = signal<Order[]>([]);
+  readonly stats = signal<KitchenStats>({ completed: 0, cancelled: 0, revenue: 0, active: 0 });
+  readonly logEntries = signal<KitchenLogEntry[]>([]);
+  readonly running = signal(false);
+  readonly isProcessing = computed(() => this.running() || this.stats().active > 0);
 
-  private ovens = atom<OvenState[]>([
-    { id: 'Oven #1', order: null, stage: null },
-    { id: 'Oven #2', order: null, stage: null },
-    { id: 'Oven #3', order: null, stage: null },
-  ]);
-  ovens$ = this.ovens;
+  private readonly ovenWorkers: OvenWorker[] = [
+    { id: 'Oven #1', worker: createOvenCoroutine() },
+    { id: 'Oven #2', worker: createOvenCoroutine() },
+    { id: 'Oven #3', worker: createOvenCoroutine() },
+  ];
+  private readonly freeOvens: OvenWorker[] = [...this.ovenWorkers];
+  private readonly orderControllers = new Map<string, AbortController>();
+  private readonly startedOrders = new Set<string>();
 
-  private cancellableOrders = atom<Order[]>([]);
-  cancellableOrders$ = this.cancellableOrders;
-
-  private stats = atom<KitchenStats>({
-    completed: 0,
-    cancelled: 0,
-    revenue: 0,
-    active: 0,
-  });
-  stats$ = this.stats;
-
-  private log = atom<string>();
-  log$ = this.log;
-
-  private running = false;
-  private fullDayClosing = false;
-  private inFullDay = false;
+  private cashier: Actor;
+  private currentWork: TaskGroup | null = null;
+  private routedResolve: (() => void) | null = null;
   private onMessageUnsubscribe: (() => void) | null = null;
+  private fullDayClosing = false;
   private destroyed = false;
 
   constructor() {
+    this.cashier = actor('cashier', cashierBehavior, { routed: 0 });
     this.onMessageUnsubscribe = main.inbox.subscribe((message: ActorBusMessage<any>) => {
-      if (message.from !== 'chef') {
-        return;
+      if (message.from !== 'cashier') return;
+
+      if (message.topic === 'cook') {
+        this.enqueueOrder(message.payload as Order);
+      } else if (message.topic === 'cancel') {
+        this.cancelOrderNow(message.payload as string);
+      } else if (message.topic === 'close') {
+        this.closeQueuedOrders(Boolean(message.payload?.cancelQueued ?? true));
+      } else if (message.topic === 'shift-routed') {
+        this.routedResolve?.();
+        this.routedResolve = null;
       }
-
-      const event = message.payload as KitchenEvent;
-      this.events.next(event);
-      this.handleEvent(event);
     });
-  }
-
-  private handleEvent(event: KitchenEvent) {
-    const ovens = [...this.ovens.value];
-    const stats = this.stats.value;
-    const time = new Date().toLocaleTimeString();
-
-    const oven = 'oven' in event
-      ? ovens.find(entry => entry.id === event.oven)
-      : undefined;
-
-    switch (event.type) {
-      case 'started':
-        if (oven) {
-          oven.order = event.order;
-          oven.stage = 'Preparing...';
-        }
-        this.log.next(
-          `[${time}] 🍳 Started: ${event.order.item} for ${event.order.customer} (${event.oven})`
-        );
-        this.stats.next({ ...stats, active: stats.active + 1 });
-        break;
-
-      case 'stage':
-        if (oven) oven.stage = event.stage;
-        this.log.next(
-          `[${time}] 📍 ${event.stage} - ${event.order.item} (${event.oven})`
-        );
-        break;
-
-      case 'ready':
-        if (oven) {
-          oven.order = null;
-          oven.stage = null;
-        }
-        this.removeCancellableOrder(event.order.id);
-        this.log.next(
-          `[${time}] ✅ READY! ${event.order.item} for ${event.order.customer} (${event.oven})`
-        );
-        this.stats.next({
-          ...stats,
-          completed: stats.completed + 1,
-          revenue: stats.revenue + event.price,
-          active: Math.max(0, stats.active - 1),
-        });
-        break;
-
-      case 'cancelled':
-        if (oven) {
-          oven.order = null;
-          oven.stage = null;
-        }
-        this.removeCancellableOrder(event.order.id);
-        this.log.next(
-          `[${time}] ❌ CANCELLED: ${event.order.item} for ${event.order.customer} - ${event.reason} (${event.oven})`
-        );
-        this.stats.next({
-          ...stats,
-          cancelled: stats.cancelled + 1,
-          active: oven ? Math.max(0, stats.active - 1) : stats.active,
-        });
-        break;
-
-      case 'timeout':
-        if (oven) {
-          oven.order = null;
-          oven.stage = null;
-        }
-        this.removeCancellableOrder(event.order.id);
-        this.log.next(
-          `[${time}] ⏰ TIMEOUT: ${event.order.item} got burnt! (${event.oven})`
-        );
-        this.stats.next({
-          ...stats,
-          cancelled: stats.cancelled + 1,
-          active: Math.max(0, stats.active - 1),
-        });
-        break;
-
-      case 'closed':
-        this.cancellableOrders.next([]);
-        this.log.next(
-          `[${time}] 🏁 Shift closed! Completed: ${event.completed}, Cancelled: ${event.cancelled}, Revenue: $${event.totalRevenue.toFixed(2)}`
-        );
-        this.stats.next({ ...this.stats.value, active: 0 });
-        if (!this.inFullDay) {
-          this.running = false;
-        }
-        break;
-    }
-
-    this.ovens.next(ovens);
   }
 
   async runShift(
     orders: Order[],
-    options: { accumulate?: boolean; internal?: boolean } = {}
+    options: { accumulate?: boolean; internal?: boolean } = {},
   ): Promise<{ completed: number; cancelled: number; revenue: number } | undefined> {
-    if (!options.internal && this.running) return;
+    if (this.destroyed || (!options.internal && this.running())) return;
 
-    if (!options.internal) {
-      this.running = true;
-    }
+    if (!options.internal) this.running.set(true);
+    if (options.accumulate) this.resetOvens();
+    else this.resetState();
 
-    if (options.accumulate) {
-      this.resetOvens();
-    } else {
-      this.resetState();
-    }
+    if (!options.internal) this.fullDayClosing = false;
+    this.cancellableOrders.set([...orders]);
+    this.appendLog(`--- Starting shift with ${orders.length} orders ---`);
 
-    this.cancellableOrders.next([...orders]);
+    const work = group({ concurrency: this.ovenWorkers.length });
+    this.currentWork = work;
 
-    this.log.next(`--- Starting shift with ${orders.length} orders ---`);
-
-    return new Promise((resolve) => {
-      let resolved = false;
-
-      const unsub = main.inbox.subscribe((message: ActorBusMessage<any>) => {
-        if (message.from !== 'chef') {
-          return;
-        }
-
-        const event = message.payload as KitchenEvent;
-        if (event.type === 'closed' && !resolved) {
-          resolved = true;
-          unsub();
-          if (!options.internal) {
-            this.running = false;
-          }
-          resolve({
-            completed: event.completed,
-            cancelled: event.cancelled,
-            revenue: event.totalRevenue,
-          });
-        }
-      });
-
-      main.outbox.send(cashier, 'runShift', { orders });
+    const routed = new Promise<void>((resolve) => {
+      this.routedResolve = resolve;
     });
+    main.outbox.send(this.cashier, 'runShift', { orders });
+    await routed;
+
+    const report = await work.settle();
+    if (this.currentWork === work) this.currentWork = null;
+
+    const stats = this.stats();
+    this.cancellableOrders.set([]);
+    this.appendLog(
+      `🏁 Shift closed! Completed: ${stats.completed}, Cancelled: ${stats.cancelled}, Revenue: $${stats.revenue.toFixed(2)}`,
+      'closed',
+    );
+
+    if (!options.internal) this.running.set(false);
+    if (report.error && !this.fullDayClosing) throw report.error;
+
+    return { completed: stats.completed, cancelled: stats.cancelled, revenue: stats.revenue };
   }
 
   async runFullDay(): Promise<void> {
-    if (this.running) return;
+    if (this.destroyed || this.running()) return;
 
-    const shifts = [
-      {
-        name: '🌅 Morning Shift',
-        orders: [
-          { id: 'M1', item: 'Margherita', customer: 'John' },
-          { id: 'M2', item: 'Pepperoni', customer: 'Sarah' },
-          { id: 'M3', item: 'Hawaiian', customer: 'Mike' },
-        ],
-      },
-      {
-        name: '🌞 Lunch Rush',
-        orders: [
-          { id: 'L1', item: 'Quattro Formaggi', customer: 'Emma' },
-          { id: 'L2', item: 'Diavola', customer: 'Luca' },
-          { id: 'L3', item: 'Margherita', customer: 'Sophia' },
-          { id: 'L4', item: 'Pepperoni', customer: 'Oliver' },
-        ],
-      },
-      {
-        name: '🌤️ Afternoon',
-        orders: [
-          { id: 'A1', item: 'Hawaiian', customer: 'Isabella' },
-          { id: 'A2', item: 'Diavola', customer: 'Ethan' },
-        ],
-      },
-      {
-        name: '🌙 Evening Rush',
-        orders: [
-          { id: 'E1', item: 'Diavola', customer: 'Marco' },
-          { id: 'E2', item: 'Quattro Formaggi', customer: 'Giulia' },
-          { id: 'E3', item: 'Pepperoni', customer: 'Antonio' },
-          { id: 'E4', item: 'Margherita', customer: 'Francesca' },
-          { id: 'E5', item: 'Hawaiian', customer: 'Roberto' },
-        ],
-      },
+    const shifts: Array<{ name: string; orders: Order[] }> = [
+      { name: '🌅 Morning Shift', orders: [
+        { id: 'M1', item: 'Margherita', customer: 'John' },
+        { id: 'M2', item: 'Pepperoni', customer: 'Sarah' },
+        { id: 'M3', item: 'Hawaiian', customer: 'Mike' },
+      ] },
+      { name: '🌞 Lunch Rush', orders: [
+        { id: 'L1', item: 'Quattro Formaggi', customer: 'Emma' },
+        { id: 'L2', item: 'Diavola', customer: 'Luca' },
+        { id: 'L3', item: 'Margherita', customer: 'Sophia' },
+        { id: 'L4', item: 'Pepperoni', customer: 'Oliver' },
+      ] },
+      { name: '🌤️ Afternoon', orders: [
+        { id: 'A1', item: 'Hawaiian', customer: 'Isabella' },
+        { id: 'A2', item: 'Diavola', customer: 'Ethan' },
+      ] },
+      { name: '🌙 Evening Rush', orders: [
+        { id: 'E1', item: 'Diavola', customer: 'Marco' },
+        { id: 'E2', item: 'Quattro Formaggi', customer: 'Giulia' },
+        { id: 'E3', item: 'Pepperoni', customer: 'Antonio' },
+        { id: 'E4', item: 'Margherita', customer: 'Francesca' },
+        { id: 'E5', item: 'Hawaiian', customer: 'Roberto' },
+      ] },
     ];
 
+    this.running.set(true);
     this.fullDayClosing = false;
-    this.inFullDay = true;
-    this.running = true;
     this.resetState();
+    this.appendLog('=== Full Day Started ===');
 
-    this.log.next('\n=== Full Day Started ===');
-
-    for (const shift of shifts) {
-      if (this.fullDayClosing) break;
-
-      this.log.next(`\n=== ${shift.name} ===`);
-
-      await this.runShift(shift.orders, { accumulate: true, internal: true });
-
-      if (this.fullDayClosing) break;
-
-      await sleep(1000);
+    try {
+      for (const shift of shifts) {
+        if (this.fullDayClosing) break;
+        this.appendLog(`=== ${shift.name} ===`);
+        await this.runShift(shift.orders, { accumulate: true, internal: true });
+      }
+    } finally {
+      this.cancellableOrders.set([]);
+      this.running.set(false);
     }
 
-    this.cancellableOrders.next([]);
-
-    this.log.next('\n=== Full Day Complete ===');
-
-    this.inFullDay = false;
-    this.running = false;
-
-    const stats = this.stats.value;
-
-    this.log.next(
-      `📊 FULL DAY SUMMARY: ✅ ${stats.completed} completed, ❌ ${stats.cancelled} cancelled, 💰 $${stats.revenue.toFixed(2)}`
+    const stats = this.stats();
+    this.appendLog(
+      `📊 FULL DAY SUMMARY: ✅ ${stats.completed} completed, ❌ ${stats.cancelled} cancelled, 💰 $${stats.revenue.toFixed(2)}`,
     );
   }
 
-  cancelOrder(orderId: string) {
-    if (!this.running) return;
-
-    main.outbox.send(cashier, 'cancel', orderId);
-    this.log.next(`🚫 Cancellation requested for order ${orderId}`);
+  cancelOrder(orderId: string): void {
+    if (!this.running()) return;
+    main.outbox.send(this.cashier, 'cancel', orderId);
+    this.appendLog(`🚫 Cancellation requested for order ${orderId}`, 'cancelled');
   }
 
-  closeKitchen() {
-    if (!this.running) return;
-
+  closeKitchen(): void {
+    if (!this.running()) return;
     this.fullDayClosing = true;
-    main.outbox.send(cashier, 'close', undefined);
-    this.log.next('🚨 Kitchen closing requested — active ovens finish, queued orders are cancelled');
+    main.outbox.send(this.cashier, 'close', { cancelQueued: true });
+    this.appendLog('🚨 Kitchen closing requested — active ovens finish, queued orders are cancelled', 'cancelled');
   }
 
-  resetOvens() {
-    this.ovens.next([
-      { id: 'Oven #1', order: null, stage: null },
-      { id: 'Oven #2', order: null, stage: null },
-      { id: 'Oven #3', order: null, stage: null },
-    ]);
-  }
-
-  resetState() {
+  resetState(): void {
     this.resetOvens();
-    this.cancellableOrders.next([]);
-    this.stats.next({
-      completed: 0,
-      cancelled: 0,
-      revenue: 0,
-      active: 0,
-    });
+    this.cancellableOrders.set([]);
+    this.stats.set({ completed: 0, cancelled: 0, revenue: 0, active: 0 });
+    this.logEntries.set([]);
   }
 
-  private removeCancellableOrder(orderId: string) {
-    this.cancellableOrders.next(
-      this.cancellableOrders.value.filter(order => order.id !== orderId)
-    );
-  }
-
-  async destroy() {
+  async destroy(): Promise<void> {
     if (this.destroyed) return;
-
     this.destroyed = true;
+
+    this.currentWork?.cancel(new Error('Kitchen service destroyed'));
+    await this.currentWork?.settle();
+    this.currentWork = null;
+
+    for (const controller of this.orderControllers.values()) controller.abort('Kitchen service destroyed');
+    this.orderControllers.clear();
+
     this.onMessageUnsubscribe?.();
     this.onMessageUnsubscribe = null;
-    unregisterKitchenRequests();
 
     await Promise.all([
-      main.outbox.stop(cashier),
-      main.outbox.stop(chef),
-      ...ovens.map(o => o.worker.dispose()),
+      main.outbox.stop(this.cashier),
+      ...this.ovenWorkers.map(({ worker }) => worker.dispose()),
     ]);
   }
 
-  isRunning() {
-    return this.running;
+  private enqueueOrder(order: Order): void {
+    const work = this.currentWork;
+    if (!work || !work.accepting) return;
+
+    const controller = new AbortController();
+    this.orderControllers.set(order.id, controller);
+
+    void work.spawn((groupSignal) => {
+      const signal = AbortSignal.any([groupSignal, controller.signal]);
+      return this.processOrder(order, signal);
+    }).catch(() => undefined);
   }
 
-  isDestroyed() {
-    return this.destroyed;
+  private async processOrder(order: Order, signal: AbortSignal): Promise<void> {
+    if (signal.aborted) {
+      this.finishCancelled(order, 'Cancelled before start');
+      return;
+    }
+
+    const oven = this.freeOvens.shift();
+    if (!oven) throw new Error('No oven slot available for admitted kitchen work');
+
+    this.startedOrders.add(order.id);
+    this.updateOven(oven.id, order, 'Preparing...');
+    this.stats.update((stats) => ({ ...stats, active: stats.active + 1 }));
+    this.appendLog(`🍳 Started: ${order.item} for ${order.customer} (${oven.id})`, 'started');
+
+    try {
+      const recipe = RECIPES.get(order.item);
+      if (!recipe) throw new Error(`No recipe for ${order.item}`);
+
+      this.updateOven(oven.id, order, 'Baking...');
+      this.appendLog(`📍 Baking... - ${order.item} (${oven.id})`);
+
+      await oven.worker.run({ order, recipe }, signal);
+      const price = PRICES.get(order.item) ?? 10;
+
+      this.stats.update((stats) => ({
+        ...stats,
+        completed: stats.completed + 1,
+        revenue: stats.revenue + price,
+        active: Math.max(0, stats.active - 1),
+      }));
+      this.appendLog(`✅ READY! ${order.item} for ${order.customer} (${oven.id})`, 'ready');
+      this.removeCancellableOrder(order.id);
+    } catch (error) {
+      const reason = signal.aborted
+        ? 'Cancelled'
+        : error instanceof Error ? error.message : String(error);
+      this.stats.update((stats) => ({
+        ...stats,
+        cancelled: stats.cancelled + 1,
+        active: Math.max(0, stats.active - 1),
+      }));
+      this.appendLog(`❌ CANCELLED: ${order.item} for ${order.customer} - ${reason} (${oven.id})`, 'cancelled');
+      this.removeCancellableOrder(order.id);
+    } finally {
+      this.updateOven(oven.id, null, null);
+      this.freeOvens.push(oven);
+      this.startedOrders.delete(order.id);
+      this.orderControllers.delete(order.id);
+    }
+  }
+
+  private cancelOrderNow(orderId: string): void {
+    this.orderControllers.get(orderId)?.abort(`Order ${orderId} cancelled`);
+  }
+
+  private closeQueuedOrders(cancelQueued: boolean): void {
+    if (!cancelQueued) return;
+    for (const [orderId, controller] of this.orderControllers) {
+      if (!this.startedOrders.has(orderId)) controller.abort('Kitchen is closing');
+    }
+  }
+
+  private finishCancelled(order: Order, reason: string): void {
+    this.stats.update((stats) => ({ ...stats, cancelled: stats.cancelled + 1 }));
+    this.appendLog(`❌ CANCELLED: ${order.item} for ${order.customer} - ${reason} (N/A)`, 'cancelled');
+    this.removeCancellableOrder(order.id);
+    this.orderControllers.delete(order.id);
+  }
+
+  private updateOven(id: string, order: Order | null, stage: string | null): void {
+    this.ovens.update((ovens) => ovens.map((oven) => oven.id === id ? { ...oven, order, stage } : oven));
+  }
+
+  private resetOvens(): void {
+    this.ovens.set(EMPTY_OVENS());
+  }
+
+  private removeCancellableOrder(orderId: string): void {
+    this.cancellableOrders.update((orders) => orders.filter((order) => order.id !== orderId));
+  }
+
+  private appendLog(text: string, kind: KitchenLogEntry['kind'] = 'normal'): void {
+    const time = new Date().toLocaleTimeString();
+    this.logEntries.update((entries) => [...entries.slice(-199), { text: `[${time}] ${text}`, kind }]);
   }
 }

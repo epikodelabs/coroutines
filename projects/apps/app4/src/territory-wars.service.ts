@@ -1,6 +1,5 @@
-import { Injectable } from '@angular/core';
+import { Injectable, signal } from '@angular/core';
 import { ActorBusMessage, actor, main, WorkerUtils } from '@epikodelabs/swiftly';
-import { atom } from '../../shared/simple-atom';
 
 export type PlayerId = 'user' | 'rival';
 
@@ -839,112 +838,99 @@ async function gameActorBehavior(
   return state;
 }
 
-const userActor = actor(
-  'territory-user',
-  userActorBehavior,
-  { forwarded: 0 }
-);
-
-const rivalActor = actor(
-  'territory-rival',
-  rivalActorBehavior,
-  { decisions: 0 },
-  chooseRivalMove,
-  evaluateMove,
-  simulateOpponentResponse,
-  tryPlaceStone,
-  collectGroup,
-  groupKey,
-  cloneBoard,
-  neighbors,
-  playerToStone,
-  otherPlayer,
-  inBounds,
-  removeGroup,
-  countLibertiesOfMove,
-  getPositionBonus,
-  getConnectionScore,
-  getEnclosureScore
-);
-
-const gameActor = actor(
-  'territory-game',
-  gameActorBehavior,
-  createInternalState(11),
-  createBoard,
-  cloneBoard,
-  createInternalState,
-  playerToStone,
-  otherPlayer,
-  inBounds,
-  neighbors,
-  groupKey,
-  collectGroup,
-  removeGroup,
-  boardHash,
-  tryPlaceStone,
-  countStones,
-  computeTerritory,
-  countTerritory,
-  countLegalMoves,
-  computeLegalMovesList,
-  scoreBoard,
-  determineWinner,
-  createPublicState,
-  emitState,
-  finishGame,
-  maybeFinishGame,
-  scheduleRival
-);
-
 @Injectable({ providedIn: 'root' })
 export class TerritoryWarsService {
-  private readonly state = atom<TerritoryWarsState>();
-  readonly state$ = this.state;
+  readonly state = signal<TerritoryWarsState | null>(null);
+
+  private readonly userActor = actor(
+    'territory-user',
+    userActorBehavior,
+    { forwarded: 0 },
+  );
+  private readonly rivalActor = actor(
+    'territory-rival',
+    rivalActorBehavior,
+    { decisions: 0 },
+    chooseRivalMove,
+    evaluateMove,
+    simulateOpponentResponse,
+    tryPlaceStone,
+    collectGroup,
+    groupKey,
+    cloneBoard,
+    neighbors,
+    playerToStone,
+    otherPlayer,
+    inBounds,
+    removeGroup,
+    countLibertiesOfMove,
+    getPositionBonus,
+    getConnectionScore,
+    getEnclosureScore,
+  );
+  private readonly gameActor = actor(
+    'territory-game',
+    gameActorBehavior,
+    createInternalState(11),
+    createBoard,
+    cloneBoard,
+    createInternalState,
+    playerToStone,
+    otherPlayer,
+    inBounds,
+    neighbors,
+    groupKey,
+    collectGroup,
+    removeGroup,
+    boardHash,
+    tryPlaceStone,
+    countStones,
+    computeTerritory,
+    countTerritory,
+    countLegalMoves,
+    computeLegalMovesList,
+    scoreBoard,
+    determineWinner,
+    createPublicState,
+    emitState,
+    finishGame,
+    maybeFinishGame,
+    scheduleRival,
+  );
 
   private readonly unsubscribeInbox: () => void;
   private destroyed = false;
 
   constructor() {
     this.unsubscribeInbox = main.inbox.subscribe((message: ActorBusMessage<any>) => {
-      if (message.from !== 'territory-game' || message.topic !== 'state') {
-        return;
-      }
-      this.state.next(message.payload as TerritoryWarsState);
+      if (message.from !== 'territory-game' || message.topic !== 'state') return;
+      this.state.set(message.payload as TerritoryWarsState);
     });
   }
 
   start(size: number): void {
-    if (this.destroyed) {
-      return;
-    }
-    main.outbox.send(gameActor, 'init', { size });
+    if (this.destroyed) return;
+    main.outbox.send(this.gameActor, 'init', { size });
   }
 
   place(row: number, col: number): void {
-    if (this.destroyed) {
-      return;
-    }
-    main.outbox.send(userActor, 'place', { row, col });
+    if (this.destroyed) return;
+    main.outbox.send(this.userActor, 'place', { row, col });
   }
 
   pass(): void {
-    if (this.destroyed) {
-      return;
-    }
-    main.outbox.send(userActor, 'pass', null);
+    if (this.destroyed) return;
+    main.outbox.send(this.userActor, 'pass', null);
   }
 
   async destroy(): Promise<void> {
-    if (this.destroyed) {
-      return;
-    }
+    if (this.destroyed) return;
     this.destroyed = true;
     this.unsubscribeInbox();
     await Promise.all([
-      main.outbox.stop(userActor),
-      main.outbox.stop(rivalActor),
-      main.outbox.stop(gameActor),
+      main.outbox.stop(this.userActor),
+      main.outbox.stop(this.rivalActor),
+      main.outbox.stop(this.gameActor),
     ]);
   }
 }
