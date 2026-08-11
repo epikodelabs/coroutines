@@ -305,8 +305,8 @@ await worker.close();
 `close()` means **stop accepting, drain, release**. It is idempotent and is the
 normal lifecycle boundary when submitted work must not be lost.
 
-`dispose()` means **terminate now**. Active and queued work is rejected and
-worker resources are released immediately. Worker-script blob URLs are acquired
+`dispose()` means **terminate now**. Active work is rejected and worker resources
+are released immediately. Worker-script blob URLs are acquired
 lazily on first execution, so constructing an unused coroutine
 does not reserve browser worker resources.
 
@@ -387,9 +387,9 @@ const output = await transform.run(input, { transfer: [input] });
 
 The transfer wrapper is worker-internal: callers receive `output` directly, not
 a wrapper object. Duplicate entries in a transfer list are rejected before the
-post where Swiftly owns the list, and queued submissions do not transfer their
-objects until they actually acquire a worker. Cancelling queued work therefore
-leaves its transferables owned by the caller.
+post where Swiftly owns the list. A submission transfers its objects only when
+it is posted to a worker, so cancellation before worker execution leaves its
+transferables owned by the caller.
 
 `compose()` applies an input transfer list to the first worker-backed stage only;
 it is never reused for later stages after ownership has moved. Transfer between
@@ -525,10 +525,9 @@ observation is attached before buffered ingress is flushed, so a transport
 failure during restart delivery cannot leave the supervisor watching a dead
 generation incorrectly.
 
-Coroutine workers are regression-tested for lifecycle
-pressure: worker failure during graceful close must continue draining admitted
-queued work, while `dispose()` may escalate an in-progress close and settle the
-close promise without stranding callers.
+Coroutine workers are regression-tested for lifecycle pressure: graceful close
+allows already-admitted active work to finish, while `dispose()` may escalate an
+in-progress close and settle the close promise without stranding callers.
 
 
 ## Actor generation isolation
@@ -578,8 +577,8 @@ worker release still occurs when an elapsed callback throws, and one failing
 timer failure callback cannot prevent the remaining pending timers from being
 notified.
 
-Stress coverage exercises repeated select cancellation, context-value chaining,
-and mass timer cancellation to verify that cancellation leaves no channel
+Stress coverage exercises repeated select cancellation, context cancellation
+chains, and mass timer cancellation to verify that cancellation leaves no channel
 waiters or timer workers behind.
 
 
