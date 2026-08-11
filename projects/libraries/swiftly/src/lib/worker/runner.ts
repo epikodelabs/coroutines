@@ -123,8 +123,7 @@ export function createTaskRunner<T, R>({
     new Error(`${name} finalized before the worker task completed`);
   const createFinalizedQueuedError = () =>
     new Error(`${name} finalized before a worker became available`);
-  const createRunClosedError = () =>
-    new Error(lifecycle === "closing" ? `${name} is closed` : `${name} is finalizing`);
+  const createRunClosedError = () => new Error(`${name} is closed`);
 
   const finalizeGracefulClose = (): void => {
     if (lifecycle !== "closing" || isFinalized || admittedRuns > 0) return;
@@ -265,7 +264,10 @@ export function createTaskRunner<T, R>({
   const run = async (value: T, control?: TaskRunControl): Promise<R> => {
     const { signal, transfer } = normalizeTaskRunControl(control);
 
-    if (lifecycle !== "open") throw createRunClosedError();
+    if (lifecycle === "closing") throw createRunClosedError();
+    if (lifecycle === "finalizing" || isFinalized) {
+      throw createFinalizedQueuedError();
+    }
 
     admittedRuns += 1;
     try {
