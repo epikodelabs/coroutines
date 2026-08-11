@@ -28,6 +28,19 @@ idescribe("actor", () => {
 
   const nextActorName = () => `actor-${++actorCounter}`;
   const pause = (ms = 20) => new Promise((resolve) => setTimeout(resolve, ms));
+  const waitFor = async (
+    predicate: () => boolean,
+    timeoutMs = 200,
+    stepMs = 5,
+  ) => {
+    const deadline = Date.now() + timeoutMs;
+    while (!predicate()) {
+      if (Date.now() >= deadline) {
+        throw new Error(`Timed out waiting for condition after ${timeoutMs}ms`);
+      }
+      await pause(stepMs);
+    }
+  };
   const waitForMainMessage = (
     predicate: (message: ActorBusMessage<any>) => boolean,
     timeoutMs = 200
@@ -1559,7 +1572,9 @@ idescribe("actor", () => {
     const unregister = registerActorRequestHandler("main", handler);
 
     main.outbox.send(a, "lookup", "value");
-    await pause(10);
+    await waitFor(
+      () => handler.calls.count() > 0 && worker.pendingWorkerRequestCount === 1,
+    );
 
     expect(handler).toHaveBeenCalled();
     expect(worker.pendingWorkerRequestCount).toBe(1);
