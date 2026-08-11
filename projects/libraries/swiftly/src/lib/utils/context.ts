@@ -11,10 +11,11 @@ export class ContextCancelledError extends Error {
 }
 
 /**
- * A cancellation context inspired by Go's `context.Context`.
+ * Cancellation scope used by Swiftly coordination primitives.
  *
- * Carries an `AbortSignal`, a `done` promise, cancellation reason,
- * and an optional key/value bag for request-scoped data.
+ * A context carries only lifecycle state: its `AbortSignal`, completion promise,
+ * and terminal reason. Application data should be passed explicitly through
+ * ordinary JavaScript values rather than hidden in the cancellation tree.
  */
 export type Context = {
   /** Abort signal that becomes aborted when the context is cancelled. */
@@ -23,10 +24,6 @@ export type Context = {
   readonly done: Promise<void>;
   /** The cancellation reason, if any. */
   readonly reason: unknown;
-  /** Retrieves a value stored in the context by key. */
-  value<T = unknown>(key: unknown): T | undefined;
-  /** Returns a child context with an additional key/value pair. */
-  withValue<T = unknown>(key: unknown, value: T): Context;
 };
 
 /**
@@ -34,18 +31,17 @@ export type Context = {
  */
 export type Cancel = (reason?: unknown) => void;
 
-type ContextState = {
-  controller: AbortController;
-  values: Map<unknown, unknown>;
-  parent?: Context;
+/**
+ * Creates an abort error from an `AbortSignal`'s reason.
+ */
+export const createAbortError = (signal?: AbortSignal): Error => {
+  const reason = signal?.reason;
+  if (reason instanceof Error) return reason;
+  return new ContextCancelledError(reason ? String(reason) : undefined);
 };
 
-const contextDoneBySignal = new WeakMap<AbortSignal, Promise<void>>();
-
-const getContextDone = (signal: AbortSignal): Promise<void> => {
-  const existing = contextDoneBySignal.get(signal);
-  if (existing) return existing;
-
+const createContext = (controller: AbortController): Context => {
+  const signal = controller.signal;
   const done = new Promise<void>((resolve) => {
     if (signal.aborted) {
       resolve();
@@ -54,68 +50,35 @@ const getContextDone = (signal: AbortSignal): Promise<void> => {
     }
   });
 
-  contextDoneBySignal.set(signal, done);
-  return done;
-};
-
-/**
- * Creates an abort error from an `AbortSignal`'s reason.
- *
- * @param signal The abort signal to extract the reason from.
- * @returns An `Error` instance representing the abort reason.
- */
-export const createAbortError = (signal?: AbortSignal): Error => {
-  const reason = signal?.reason;
-  if (reason instanceof Error) return reason;
-  return new ContextCancelledError(reason ? String(reason) : undefined);
-};
-
-const createContextFromState = (state: ContextState): Context => {
-  const done = getContextDone(state.controller.signal);
-
   return {
-    get signal() {
-      return state.controller.signal;
-    },
+    signal,
     done,
     get reason() {
-      return state.controller.signal.reason;
-    },
-    value<T = unknown>(key: unknown): T | undefined {
-      if (state.values.has(key)) return state.values.get(key) as T;
-      return state.parent?.value<T>(key);
-    },
-    withValue<T = unknown>(key: unknown, value: T): Context {
-      const values = new Map<unknown, unknown>();
-      values.set(key, value);
-      return createContextFromState({
-        controller: state.controller,
-        values,
-        parent: this,
-      });
+      return signal.reason;
     },
   };
 };
 
+const backgroundContext = createContext(new AbortController());
+
 /**
- * Creates a root context that is not derived from any parent.
+ * Returns Swiftly's immutable root cancellation context.
  *
- * @returns A new background `Context`.
+ * The background context never cancels, so one shared instance avoids creating
+ * an AbortController and never-settling completion promise for every default
+ * coordination call.
  */
-export const background = (): Context =>
-  createContextFromState({ controller: new AbortController(), values: new Map() });
+export const background = (): Context => backgroundContext;
 
 /**
  * Derives a cancellable child context from a parent.
  *
  * The child is automatically cancelled when the parent is cancelled.
- *
- * @param parent The parent context. Defaults to `background()`.
- * @returns A tuple of `[childContext, cancel]`.
  */
 export function withCancel(parent: Context = background()): [Context, Cancel] {
   const controller = new AbortController();
-  const onParentAbort = () => controller.abort(parent.reason ?? new ContextCancelledError());
+  const onParentAbort = () =>
+    controller.abort(parent.reason ?? new ContextCancelledError());
 
   if (parent.signal.aborted) {
     onParentAbort();
@@ -123,20 +86,17 @@ export function withCancel(parent: Context = background()): [Context, Cancel] {
     parent.signal.addEventListener("abort", onParentAbort, { once: true });
   }
 
-  const ctx = createContextFromState({ controller, values: new Map(), parent });
+  const ctx = createContext(controller);
   const cancel: Cancel = (reason = new ContextCancelledError()) => {
     parent.signal.removeEventListener("abort", onParentAbort);
     if (!controller.signal.aborted) controller.abort(reason);
   };
+
   return [ctx, cancel];
 }
 
 /**
  * Derives a child context that automatically cancels after a timeout.
- *
- * @param parent The parent context.
- * @param ms Timeout in milliseconds.
- * @returns A tuple of `[childContext, cancel]`.
  */
 export function withTimeout(parent: Context, ms: number): [Context, Cancel] {
   if (!Number.isFinite(ms) || ms < 0) {
@@ -154,8 +114,6 @@ export function withTimeout(parent: Context, ms: number): [Context, Cancel] {
     ctx.done.finally(() => timer.cancel());
     return [ctx, cancel];
   } catch (error) {
-    // Timer construction can fail (for example when Worker is unavailable).
-    // Cancel the derived context first so its parent listener is detached.
     cancel(error);
     throw error;
   }
@@ -163,12 +121,11 @@ export function withTimeout(parent: Context, ms: number): [Context, Cancel] {
 
 /**
  * Derives a child context that automatically cancels at a specific deadline.
- *
- * @param parent The parent context.
- * @param deadline A `Date` or timestamp (in milliseconds) when the context should cancel.
- * @returns A tuple of `[childContext, cancel]`.
  */
-export function withDeadline(parent: Context, deadline: Date | number): [Context, Cancel] {
+export function withDeadline(
+  parent: Context,
+  deadline: Date | number,
+): [Context, Cancel] {
   const time = typeof deadline === "number" ? deadline : deadline.getTime();
   const remaining = time - Date.now();
 

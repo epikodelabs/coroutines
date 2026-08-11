@@ -517,10 +517,14 @@ The same invariants are embedded in actor-worker channels.
 
 ## Cancellation teardown invariants
 
-Cancellation state is shared rather than duplicated. Contexts created with
-`withValue()` reuse the same `signal` and `done` completion as the source
-context, so adding request-scoped values does not add another abort listener for
-every value layer.
+`Context` is cancellation-only: it carries a signal, a completion promise, and a
+terminal reason. Application data is passed explicitly rather than stored in
+the cancellation tree.
+
+`background()` is a shared immutable root context. Because it never cancels,
+default coordination calls such as `select()` do not allocate a fresh
+`AbortController` and never-settling `done` promise on every invocation.
+
 
 The shared timer worker also treats callback execution as cleanup-sensitive:
 worker release still occurs when an elapsed callback throws, and one failing

@@ -710,12 +710,8 @@ const __streamixChannel = (capacity = 0) => {
   };
 };
 
-const __streamixContextDoneBySignal = new WeakMap();
-
-const __streamixGetContextDone = (signal) => {
-  const existing = __streamixContextDoneBySignal.get(signal);
-  if (existing) return existing;
-
+const __streamixCreateContext = (controller) => {
+  const signal = controller.signal;
   const done = new Promise((resolve) => {
     if (signal.aborted) {
       resolve();
@@ -724,43 +720,23 @@ const __streamixGetContextDone = (signal) => {
     }
   });
 
-  __streamixContextDoneBySignal.set(signal, done);
-  return done;
-};
-
-const __streamixCreateContextFromState = (state) => {
-  const done = __streamixGetContextDone(state.controller.signal);
-
   return {
-    get signal() {
-      return state.controller.signal;
-    },
+    signal,
     done,
     get reason() {
-      return state.controller.signal.reason;
-    },
-    value(key) {
-      if (state.values.has(key)) return state.values.get(key);
-      return state.parent?.value(key);
-    },
-    withValue(key, value) {
-      const values = new Map();
-      values.set(key, value);
-      return __streamixCreateContextFromState({
-        controller: state.controller,
-        values,
-        parent: this,
-      });
+      return signal.reason;
     },
   };
 };
 
-const __streamixBackground = () =>
-  __streamixCreateContextFromState({ controller: new AbortController(), values: new Map() });
+const __streamixBackgroundContext =
+  __streamixCreateContext(new AbortController());
+const __streamixBackground = () => __streamixBackgroundContext;
 
 const __streamixWithCancel = (parent = __streamixBackground()) => {
   const controller = new AbortController();
-  const onParentAbort = () => controller.abort(parent.reason ?? new __streamixContextCancelledError());
+  const onParentAbort = () =>
+    controller.abort(parent.reason ?? new __streamixContextCancelledError());
 
   if (parent.signal.aborted) {
     onParentAbort();
@@ -768,7 +744,7 @@ const __streamixWithCancel = (parent = __streamixBackground()) => {
     parent.signal.addEventListener("abort", onParentAbort, { once: true });
   }
 
-  const ctx = __streamixCreateContextFromState({ controller, values: new Map(), parent });
+  const ctx = __streamixCreateContext(controller);
   const cancel = (reason = new __streamixContextCancelledError()) => {
     parent.signal.removeEventListener("abort", onParentAbort);
     if (!controller.signal.aborted) controller.abort(reason);
