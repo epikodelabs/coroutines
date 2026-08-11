@@ -269,6 +269,21 @@ describe("compose coroutines", () => {
     await second.dispose();
   });
 
+  it("supports arrow-function helpers inside merged coroutine stages", async () => {
+    const addOne = (value: number) => value + 1;
+    const double = (value: number) => value * 2;
+
+    const first = coroutine((value: number) => addOne(value), addOne);
+    const second = coroutine((value: number) => double(value), double);
+    const composed = compose(first, second);
+
+    await expectAsync(composed.run(3)).toBeResolvedTo(8);
+
+    await composed.dispose();
+    await first.dispose();
+    await second.dispose();
+  });
+
 
   it("close drains the entire admitted pipeline before closing any stage", async () => {
     const lifecycle: string[] = [];

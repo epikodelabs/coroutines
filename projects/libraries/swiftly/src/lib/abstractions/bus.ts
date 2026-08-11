@@ -148,7 +148,7 @@ export const tryActorInternals = (
   actor: Actor,
 ): ActorInternals | undefined => actorInternalsMap.get(actor);
 
-const warnAsyncActorBusFailure = (scope: string, error: unknown) => {
+export const warnAsyncActorBusFailure = (scope: string, error: unknown) => {
   console.warn(`${scope} failed:`, error);
 };
 

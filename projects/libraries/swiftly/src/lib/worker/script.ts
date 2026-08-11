@@ -77,7 +77,9 @@ export function serializeScript<T, R>(script: CoroutineScript<T, R>): {
 } {
   return {
     code: script.main.toString(),
-    deps: (script.functions || []).map((f) => f.toString()),
+    deps: (script.functions || []).map((f, index) =>
+      serializeDependencyFunction(f, index),
+    ),
   };
 }
 

@@ -15,7 +15,7 @@
  *                    utils.outbox.send('main', topic, event) pushes live events
  */
 import { Injectable } from '@angular/core';
-import { ActorBusMessage, actor, coroutine, main, registerActorRequestHandler, WorkerUtils } from '@epikodelabs/swiftly';
+import { ActorBusMessage, actor, coroutine, main, registerActorRequestHandler, sleep, WorkerUtils } from '@epikodelabs/swiftly';
 import { atom } from '../../../shared/simple-atom';
 
 export type Order = { id: string; item: string; customer: string };
@@ -51,8 +51,6 @@ export type KitchenStats = {
   revenue: number;
   active: number;
 };
-
-const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 const recipes = new Map<string, Recipe>([
   ['Margherita', { item: 'Margherita', ingredients: ['tomato', 'mozzarella', 'basil'], bakeMs: 3000 }],
@@ -582,7 +580,7 @@ export class KitchenService {
 
       if (this.fullDayClosing) break;
 
-      await delay(1000);
+      await sleep(1000);
     }
 
     this.cancellableOrders.next([]);

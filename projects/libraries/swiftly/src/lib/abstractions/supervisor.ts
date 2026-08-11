@@ -6,11 +6,8 @@ import {
   setActorInternals,
   tryActorInternals,
   unregisterActorBusTarget,
+  warnAsyncActorBusFailure,
 } from "./bus";
-
-const warnAsyncActorBusFailure = (scope: string, error: unknown) => {
-  console.warn(`${scope} failed:`, error);
-};
 
 /**
  * Supervises an actor factory behind one stable addressable handle.
