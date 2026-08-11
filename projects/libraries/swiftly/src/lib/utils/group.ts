@@ -1,5 +1,4 @@
 import { createAbortError, ContextCancelledError } from "./context";
-import { semaphore, type Semaphore } from "./semaphore";
 
 /**
  * One unit of structured asynchronous work owned by a task group.
@@ -37,32 +36,41 @@ export interface GroupReport {
 /**
  * Structured owner for a dynamic set of concurrent operations.
  *
- * A group has fail-fast semantics: the first child failure aborts all siblings.
- * `wait()` and `settle()` both close the group to new children and wait until
- * every started child has settled.
+ * Every accepted child is owned immediately. With bounded concurrency, excess
+ * children wait in the group's FIFO queue and their operation does not start
+ * until an execution slot becomes free.
+ *
+ * A group has fail-fast semantics: the first child failure aborts running
+ * siblings and cancels queued children before they start. `wait()` and
+ * `settle()` both close the group to new children and wait until every accepted
+ * child has settled.
  */
 export interface TaskGroup {
   /** Signal shared by all children and aborted when the group is cancelled. */
   readonly signal: AbortSignal;
-  /** Number of children that have been started but have not settled yet. */
+  /**
+   * Number of accepted children that have not settled yet.
+   *
+   * This includes both actively executing and queued children.
+   */
   readonly running: number;
-  /** Whether new child operations may still be started. */
+  /** Whether new child operations may still be accepted. */
   readonly accepting: boolean;
 
-  /** Starts one child operation owned by this group. */
+  /** Accepts one child operation owned by this group. */
   spawn<T>(operation: GroupOperation<T>): Promise<T>;
 
   /** Cancels this group and every cooperative child operation. */
   cancel(reason?: unknown): void;
 
   /**
-   * Closes the group and waits until every started child settles.
+   * Closes the group and waits until every accepted child settles.
    * Rejects with the group-level failure/cancellation reason.
    */
   wait(): Promise<void>;
 
   /**
-   * Closes the group and waits until every started child settles without
+   * Closes the group and waits until every accepted child settles without
    * throwing. Outcomes are returned in spawn order.
    */
   settle(): Promise<GroupReport>;
@@ -70,6 +78,13 @@ export interface TaskGroup {
 
 type GroupWaiter = {
   resolve: (report: GroupReport) => void;
+};
+
+type QueuedChild = {
+  operation: GroupOperation<any>;
+  outcomeIndex: number;
+  resolve: (value: any) => void;
+  reject: (error: Error) => void;
 };
 
 const normalizeError = (reason: unknown): Error => {
@@ -82,8 +97,8 @@ const normalizeError = (reason: unknown): Error => {
  * Creates a structured task group.
  *
  * This is intentionally different from `Promise.all()`: the group owns child
- * lifetime, propagates cancellation, cancels siblings on failure, can bound
- * execution, and can report the terminal state of every owned child.
+ * lifetime, propagates cancellation, cancels siblings on failure, queues excess
+ * bounded work itself, and can report the terminal state of every owned child.
  */
 export function group(options: GroupOptions = {}): TaskGroup {
   const { concurrency, signal: parentSignal } = options;
@@ -93,10 +108,12 @@ export function group(options: GroupOptions = {}): TaskGroup {
   }
 
   const controller = new AbortController();
-  const gate: Semaphore | undefined = concurrency === undefined ? undefined : semaphore(concurrency);
+  const limit = concurrency ?? Number.POSITIVE_INFINITY;
+  const queue: QueuedChild[] = [];
   const waiters: GroupWaiter[] = [];
   const outcomes: Array<GroupOutcome | undefined> = [];
 
+  let active = 0;
   let running = 0;
   let accepting = true;
   let settlementRequested = false;
@@ -131,19 +148,40 @@ export function group(options: GroupOptions = {}): TaskGroup {
     for (const waiter of settled) waiter.resolve(report);
   };
 
-  const cancel = (reason: unknown = new ContextCancelledError("task group cancelled")): void => {
-    accepting = false;
-    if (!controller.signal.aborted) controller.abort(reason);
-    if (running === 0) detachParent();
-    settleWaiters();
-  };
-
   const onParentAbort = (): void => cancel(parentSignal?.reason);
   let parentListenerAttached = false;
   const detachParent = (): void => {
     if (!parentListenerAttached) return;
     parentSignal?.removeEventListener("abort", onParentAbort);
     parentListenerAttached = false;
+  };
+
+  const finishOwnedChild = (): void => {
+    running -= 1;
+    if (!accepting && running === 0) detachParent();
+    settleWaiters();
+  };
+
+  const cancelQueued = (): void => {
+    if (queue.length === 0) return;
+
+    const reason = normalizeError(controller.signal.reason);
+    const cancelled = queue.splice(0, queue.length);
+    for (const child of cancelled) {
+      outcomes[child.outcomeIndex] = { status: "cancelled", reason };
+      child.reject(reason);
+      finishOwnedChild();
+    }
+  };
+
+  const cancel = (
+    reason: unknown = new ContextCancelledError("task group cancelled"),
+  ): void => {
+    accepting = false;
+    if (!controller.signal.aborted) controller.abort(reason);
+    cancelQueued();
+    if (running === 0) detachParent();
+    settleWaiters();
   };
 
   if (parentSignal?.aborted) {
@@ -153,10 +191,54 @@ export function group(options: GroupOptions = {}): TaskGroup {
     parentListenerAttached = true;
   }
 
-  const finishChild = (): void => {
-    running -= 1;
-    if (!accepting && running === 0) detachParent();
-    settleWaiters();
+  const fail = (error: Error, outcomeIndex: number): void => {
+    if (firstError || controller.signal.aborted) return;
+
+    firstError = error;
+    accepting = false;
+    outcomes[outcomeIndex] = { status: "rejected", error };
+    controller.abort(error);
+    cancelQueued();
+  };
+
+  const pump = (): void => {
+    while (
+      active < limit &&
+      queue.length > 0 &&
+      !controller.signal.aborted
+    ) {
+      const child = queue.shift()!;
+      active += 1;
+
+      void (async () => {
+        try {
+          const value = await child.operation(controller.signal);
+          outcomes[child.outcomeIndex] = { status: "fulfilled", value };
+          child.resolve(value);
+        } catch (reason) {
+          const error = normalizeError(reason);
+          const alreadyCancelled = controller.signal.aborted;
+
+          if (!firstError && !alreadyCancelled) {
+            fail(error, child.outcomeIndex);
+          } else {
+            const cancellationReason = normalizeError(
+              controller.signal.reason ?? error,
+            );
+            outcomes[child.outcomeIndex] = {
+              status: "cancelled",
+              reason: cancellationReason,
+            };
+          }
+
+          child.reject(error);
+        } finally {
+          active -= 1;
+          finishOwnedChild();
+          pump();
+        }
+      })();
+    }
   };
 
   const spawn = <T>(operation: GroupOperation<T>): Promise<T> => {
@@ -174,42 +256,18 @@ export function group(options: GroupOptions = {}): TaskGroup {
     }
 
     const outcomeIndex = outcomes.length;
-    // Reserve the slot so completion order can never affect report ordering.
     outcomes.push(undefined);
     running += 1;
 
-    const child = (async () => {
-      let release: (() => void) | undefined;
-      try {
-        if (gate) release = await gate.acquire(controller.signal);
-        if (controller.signal.aborted) throw createAbortError(controller.signal);
-
-        const value = await operation(controller.signal);
-        outcomes[outcomeIndex] = { status: "fulfilled", value };
-        return value;
-      } catch (reason) {
-        const error = normalizeError(reason);
-        const alreadyCancelled = controller.signal.aborted;
-
-        if (!firstError && !alreadyCancelled) {
-          firstError = error;
-          accepting = false;
-          outcomes[outcomeIndex] = { status: "rejected", error };
-          controller.abort(error);
-        } else {
-          const cancellationReason = normalizeError(controller.signal.reason ?? error);
-          outcomes[outcomeIndex] = {
-            status: "cancelled",
-            reason: cancellationReason,
-          };
-        }
-
-        throw error;
-      } finally {
-        release?.();
-        finishChild();
-      }
-    })();
+    const child = new Promise<T>((resolve, reject) => {
+      queue.push({
+        operation,
+        outcomeIndex,
+        resolve,
+        reject,
+      });
+      pump();
+    });
 
     // The group owns child failures even when callers choose to observe only
     // wait()/settle(). The returned promise still preserves the child result.

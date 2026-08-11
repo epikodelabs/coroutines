@@ -79,6 +79,73 @@ describe("task group", () => {
     expect(peak).toBe(2);
   });
 
+  it("starts bounded work in FIFO order as group slots become free", async () => {
+    const work = group({ concurrency: 2 });
+    const started: number[] = [];
+    const releases: Array<() => void> = [];
+
+    const children = Array.from({ length: 5 }, (_, index) =>
+      work.spawn(async () => {
+        started.push(index);
+        await new Promise<void>((resolve) => releases.push(resolve));
+        return index;
+      }),
+    );
+
+    expect(started).toEqual([0, 1]);
+    expect(work.running).toBe(5);
+
+    releases.shift()!();
+    await pause(0);
+    expect(started).toEqual([0, 1, 2]);
+
+    releases.shift()!();
+    await pause(0);
+    expect(started).toEqual([0, 1, 2, 3]);
+
+    releases.shift()!();
+    releases.shift()!();
+    await pause(0);
+    expect(started).toEqual([0, 1, 2, 3, 4]);
+
+    releases.shift()!();
+
+    await work.wait();
+    expect(await Promise.all(children)).toEqual([0, 1, 2, 3, 4]);
+  });
+
+  it("cancels queued children without starting their operations", async () => {
+    const work = group({ concurrency: 1 });
+    let queuedStarted = false;
+
+    const running = work.spawn(
+      (signal) =>
+        new Promise<void>((_resolve, reject) => {
+          signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+        }),
+    );
+
+    const queued = work.spawn(async () => {
+      queuedStarted = true;
+      return 2;
+    });
+
+    expect(queuedStarted).toBeFalse();
+
+    work.cancel(new ContextCancelledError("cancel queued"));
+
+    await expectAsync(running).toBeRejectedWithError(
+      ContextCancelledError,
+      "cancel queued",
+    );
+    await expectAsync(queued).toBeRejectedWithError(
+      ContextCancelledError,
+      "cancel queued",
+    );
+    expect(queuedStarted).toBeFalse();
+    expect(work.running).toBe(0);
+  });
+
   it("propagates parent cancellation into queued and running children", async () => {
     const parent = new AbortController();
     const work = group({ concurrency: 1, signal: parent.signal });

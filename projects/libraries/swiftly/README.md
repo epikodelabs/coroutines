@@ -23,7 +23,14 @@ workers as needed. `group()` owns the structured lifetime and concurrency policy
 ```ts
 import { coroutine, group } from '@epikodelabs/swiftly';
 
-const hash = coroutine<string, string>((value) => expensiveHash(value));
+function expensiveHash(value: string): string {
+  return value;
+}
+
+const hash = coroutine<string, string>(
+  (value) => expensiveHash(value),
+  expensiveHash,
+);
 const work = group({ concurrency: 4 });
 
 const results = inputs.map((input) =>
@@ -51,12 +58,20 @@ This keeps worker count out of the execution primitive itself. If several groups
 share the same coroutine, each group can apply its own concurrency policy while
 the coroutine reuses the same idle worker list.
 
+Referenced outer-scope functions are not captured automatically. A coroutine
+worker only receives the serialized task body plus any helper functions passed
+after it, as shown with `expensiveHash` above.
+
 ## Cancellable worker submissions
 
 `Coroutine.run()` accepts either an `AbortSignal` or per-run execution options:
 
 ```ts
-const parse = coroutine((text: string) => parseLargeDocument(text));
+function parseLargeDocument(text: string): unknown {
+  return text;
+}
+
+const parse = coroutine(parseLargeDocument);
 const controller = new AbortController();
 
 const result = parse.run(source, controller.signal);
@@ -165,9 +180,11 @@ inventing a separate timeout/retry API.
 A coroutine is a reusable stateless worker-backed operation:
 
 ```ts
-const hash = coroutine(
-  (value: string) => expensiveHash(value),
-);
+function expensiveHash(value: string): string {
+  return value;
+}
+
+const hash = coroutine((value: string) => expensiveHash(value), expensiveHash);
 ```
 
 The worker script is baked once. When `hash.run()` is called, Swiftly reuses an
