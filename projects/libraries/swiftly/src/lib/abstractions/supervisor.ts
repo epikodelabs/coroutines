@@ -6,7 +6,7 @@ import {
   setActorInternals,
   tryActorInternals,
   unregisterActorBusTarget,
-} from "./actor-bus";
+} from "./bus";
 
 const warnAsyncActorBusFailure = (scope: string, error: unknown) => {
   console.warn(`${scope} failed:`, error);

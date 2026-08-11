@@ -18,7 +18,7 @@ import { acquireBlobUrl, releaseBlobUrl } from "../worker/blob";
 import type { WorkerProtocolMessage } from "../worker/messages";
 import { createModuleWorker } from "../worker/module";
 import { buildActorWorkerRuntime } from "../worker/runtimes";
-import { ACTOR_CONCURRENCY_RUNTIME } from "../worker/actor-concurrency";
+import { ACTOR_CONCURRENCY_RUNTIME } from "../worker/concurrency";
 import { buildWorkerScript } from "../worker/script";
 import type { Actor, ActorExit, ActorOptions, Supervisor, SupervisorOptions } from "../worker/types";
 import {
@@ -36,13 +36,13 @@ import {
   subscribeActorBus,
   tryActorInternals,
   unregisterActorBusTarget,
-} from "./actor-bus";
+} from "./bus";
 import type {
   ActorBusDispatchOptions,
   ActorBusHandler,
   ActorBusMessage,
   ActorBusTarget,
-} from "./actor-bus";
+} from "./bus";
 export type { Actor, ActorExit, ActorOptions, Supervisor, SupervisorOptions } from "../worker/types";
 export { supervisor } from "./supervisor";
 export {
@@ -50,7 +50,7 @@ export {
   isActorBusMessage,
   registerActorRequestHandler,
   unregisterActorRequestHandler,
-} from "./actor-bus";
+} from "./bus";
 export type {
   ActorBus,
   ActorBusDispatchOptions,
@@ -60,7 +60,7 @@ export type {
   ActorBusTarget,
   ActorMessageContext,
   ActorRequestHandler,
-} from "./actor-bus";
+} from "./bus";
 
 /**
  * Concurrency utils injected into actor workers.
