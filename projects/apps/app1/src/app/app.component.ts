@@ -118,7 +118,7 @@ const juliaBatchWorker = (params: BatchParams): Pixel[] => {
             <h2>Settings</h2>
             <span class="badge">coroutine worker</span>
           </div>
-          <p class="tooltip">Choose a preset or adjust c manually. Rendering is offloaded to a dedicated Web Worker coroutine.</p>
+          <p class="tooltip">Choose a preset or adjust c manually. Rendering is offloaded to reusable coroutine workers with group-bounded concurrency.</p>
 
           <div class="settings-body">
             <div class="preset-row">

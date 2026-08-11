@@ -42,7 +42,7 @@ onmessage = async (event) => {
  * Actor worker runtime.
  *
  * Supports persistent behavior loop via `init`, `notify`, `request`,
- * and `stop` messages. Uses `__streamixConcurrency` helpers injected
+ * and `stop` messages. Uses `__swiftlyConcurrency` helpers injected
  * by the build script.
  */
 export const buildActorWorkerRuntime = (mailboxCapacity?: number): string => `
@@ -85,7 +85,7 @@ const __requestMain = (workerId, taskId, to, topic, payload) => {
   });
 };
 
-const __workerInbox = __streamixConcurrency.channel();
+const __workerInbox = __swiftlyConcurrency.channel();
 
 const __enqueueActorInbox = (payload, scope) => {
   __workerInbox.send(payload).catch((error) => {
@@ -113,14 +113,14 @@ const __createWorkerUtils = (workerId, taskId) => {
         return result.ok ? result.value : undefined;
       },
     },
-    concurrency: __streamixConcurrency,
+    concurrency: __swiftlyConcurrency,
   };
 };
 
 const __actorMailboxCapacity = ${mailboxCapacity === undefined ? "undefined" : mailboxCapacity};
 const __actorMailbox = __actorMailboxCapacity === undefined
-  ? __streamixConcurrency.channel()
-  : __streamixConcurrency.channel(__actorMailboxCapacity);
+  ? __swiftlyConcurrency.channel()
+  : __swiftlyConcurrency.channel(__actorMailboxCapacity);
 
 const __enqueueActorMessage = (value, requestId) => {
   if (__actorMailboxCapacity === undefined) {

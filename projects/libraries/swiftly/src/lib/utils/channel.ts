@@ -32,7 +32,7 @@ export type ReceiveResult<T> =
  *
  * @internal
  */
-export const CHANNEL_INTERNALS = Symbol("streamix.channelInternals");
+export const CHANNEL_INTERNALS = Symbol("swiftly.channelInternals");
 
 type WaitingReceiver<T> = {
   resolve: (result: ReceiveResult<T>) => void;
