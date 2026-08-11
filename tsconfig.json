@@ -45,6 +45,24 @@
       "path": "./projects/apps/app1/tsconfig.spec.json"
     },
     {
+      "path": "./projects/apps/app2/tsconfig.app.json"
+    },
+    {
+      "path": "./projects/apps/app2/tsconfig.spec.json"
+    },
+    {
+      "path": "./projects/apps/app3/tsconfig.app.json"
+    },
+    {
+      "path": "./projects/apps/app3/tsconfig.spec.json"
+    },
+    {
+      "path": "./projects/apps/app4/tsconfig.app.json"
+    },
+    {
+      "path": "./projects/apps/app4/tsconfig.spec.json"
+    },
+    {
       "path": "./projects/libraries/swiftly/tsconfig.lib.json"
     },
     {
