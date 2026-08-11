@@ -52,7 +52,7 @@ type InternalGameState = {
   message: string;
   lastMove: { row: number; col: number; player: PlayerId } | null;
   turnId: number;
-  koHash: string | null;
+  boardHistory: Set<string>;
 };
 
 type PlacementResult =
@@ -84,8 +84,9 @@ function cloneBoard(board: number[][]): number[][] {
 }
 
 function createInternalState(size: number): InternalGameState {
+  const board = createBoard(size);
   return {
-    board: createBoard(size),
+    board,
     size,
     currentPlayer: 'user',
     pendingRival: false,
@@ -100,7 +101,7 @@ function createInternalState(size: number): InternalGameState {
     message: 'Your move. Surround rival groups to capture them.',
     lastMove: null,
     turnId: 0,
-    koHash: null,
+    boardHistory: new Set<string>([boardHash(board)]),
   };
 }
 
@@ -183,7 +184,7 @@ function tryPlaceStone(
   row: number,
   col: number,
   player: PlayerId,
-  koHash?: string | null
+  boardHistory?: ReadonlySet<string>
 ): PlacementResult {
   const size = board.length;
   if (!inBounds(size, row, col)) {
@@ -231,13 +232,13 @@ function tryPlaceStone(
     };
   }
 
-  if (koHash) {
+  if (boardHistory) {
     const newHash = boardHash(nextBoard);
-    if (newHash === koHash) {
+    if (boardHistory.has(newHash)) {
       return {
         ok: false,
         board,
-        reason: 'Ko — repeating the immediate board position is not allowed.',
+        reason: 'Superko — repeating any previous board position is not allowed.',
       };
     }
   }
@@ -349,7 +350,11 @@ function countTerritory(territory: number[][]): Record<PlayerId, number> {
   return { user, rival };
 }
 
-function countLegalMoves(board: number[][], player: PlayerId): number {
+function countLegalMoves(
+  board: number[][],
+  player: PlayerId,
+  boardHistory?: ReadonlySet<string>,
+): number {
   let total = 0;
   const size = board.length;
 
@@ -358,7 +363,7 @@ function countLegalMoves(board: number[][], player: PlayerId): number {
       if (board[row][col] !== 0) {
         continue;
       }
-      if (tryPlaceStone(board, row, col, player).ok) {
+      if (tryPlaceStone(board, row, col, player, boardHistory).ok) {
         total++;
       }
     }
@@ -367,7 +372,11 @@ function countLegalMoves(board: number[][], player: PlayerId): number {
   return total;
 }
 
-function computeLegalMovesList(board: number[][], player: PlayerId, koHash: string | null): MovePayload[] {
+function computeLegalMovesList(
+  board: number[][],
+  player: PlayerId,
+  boardHistory: ReadonlySet<string>,
+): MovePayload[] {
   const size = board.length;
   const moves: MovePayload[] = [];
 
@@ -376,7 +385,7 @@ function computeLegalMovesList(board: number[][], player: PlayerId, koHash: stri
       if (board[r][c] !== 0) {
         continue;
       }
-      if (tryPlaceStone(board, r, c, player, koHash).ok) {
+      if (tryPlaceStone(board, r, c, player, boardHistory).ok) {
         moves.push({ row: r, col: c });
       }
     }
@@ -385,7 +394,11 @@ function computeLegalMovesList(board: number[][], player: PlayerId, koHash: stri
   return moves;
 }
 
-function scoreBoard(board: number[][], captures: Record<PlayerId, number>) {
+function scoreBoard(
+  board: number[][],
+  captures: Record<PlayerId, number>,
+  boardHistory?: ReadonlySet<string>,
+) {
   const stones = countStones(board);
   const territory = computeTerritory(board);
   const territoryCount = countTerritory(territory);
@@ -398,8 +411,8 @@ function scoreBoard(board: number[][], captures: Record<PlayerId, number>) {
       rival: stones.rival + territoryCount.rival,
     },
     legalMoves: {
-      user: countLegalMoves(board, 'user'),
-      rival: countLegalMoves(board, 'rival'),
+      user: countLegalMoves(board, 'user', boardHistory),
+      rival: countLegalMoves(board, 'rival', boardHistory),
     },
     captures: {
       user: captures.user,
@@ -422,7 +435,7 @@ function determineWinner(
 }
 
 function createPublicState(state: InternalGameState): TerritoryWarsState {
-  const scored = scoreBoard(state.board, state.captures);
+  const scored = scoreBoard(state.board, state.captures, state.boardHistory);
 
   return {
     board: state.board,
@@ -485,7 +498,7 @@ function scheduleRival(
   utils: WorkerUtils<any, any, any, any>,
   state: InternalGameState
 ): void {
-  const legalMoves = computeLegalMovesList(state.board, 'rival', state.koHash);
+  const legalMoves = computeLegalMovesList(state.board, 'rival', state.boardHistory);
   utils.outbox.send('territory-rival', 'think', {
     board: cloneBoard(state.board),
     size: state.size,
@@ -690,7 +703,7 @@ async function gameActorBehavior(
     }
 
     const payload = message.payload as MovePayload;
-    const placed = tryPlaceStone(state.board, payload.row, payload.col, 'user', state.koHash);
+    const placed = tryPlaceStone(state.board, payload.row, payload.col, 'user', state.boardHistory);
     if (!placed.ok) {
       const nextState = {
         ...state,
@@ -700,9 +713,13 @@ async function gameActorBehavior(
       return nextState;
     }
 
+    const nextBoardHistory = new Set(state.boardHistory);
+    nextBoardHistory.add(boardHash(placed.board));
+
     let nextState: InternalGameState = {
       ...state,
       board: placed.board,
+      boardHistory: nextBoardHistory,
       currentPlayer: 'rival',
       pendingRival: true,
       moveCount: state.moveCount + 1,
@@ -718,7 +735,6 @@ async function gameActorBehavior(
         player: 'user',
       },
       turnId: state.turnId + 1,
-      koHash: boardHash(state.board),
     };
 
     nextState = maybeFinishGame(nextState);
@@ -775,7 +791,7 @@ async function gameActorBehavior(
       return nextState;
     }
 
-    const placed = tryPlaceStone(state.board, payload.move.row, payload.move.col, 'rival', state.koHash);
+    const placed = tryPlaceStone(state.board, payload.move.row, payload.move.col, 'rival', state.boardHistory);
     if (!placed.ok) {
       let nextState: InternalGameState = {
         ...state,
@@ -792,9 +808,13 @@ async function gameActorBehavior(
       return nextState;
     }
 
+    const nextBoardHistory = new Set(state.boardHistory);
+    nextBoardHistory.add(boardHash(placed.board));
+
     let nextState: InternalGameState = {
       ...state,
       board: placed.board,
+      boardHistory: nextBoardHistory,
       currentPlayer: 'user',
       pendingRival: false,
       moveCount: state.moveCount + 1,
@@ -809,7 +829,6 @@ async function gameActorBehavior(
         col: payload.move.col,
         player: 'rival',
       },
-      koHash: boardHash(state.board),
     };
 
     nextState = maybeFinishGame(nextState);

@@ -54,4 +54,22 @@ describe("worker-backed timer", () => {
     await expectAsync(sleep(-1)).toBeRejectedWithError(RangeError);
     await expectAsync(sleep(Number.NaN)).toBeRejectedWithError(RangeError);
   });
+
+  it("falls back to host timers when Worker is unavailable", async () => {
+    const originalWorker = (globalThis as any).Worker;
+    (globalThis as any).Worker = undefined;
+
+    try {
+      const started = performance.now();
+      await sleep(10);
+      expect(performance.now() - started).toBeGreaterThanOrEqual(5);
+
+      const [ctx, cancel] = withTimeout(background(), 10);
+      await ctx.done;
+      expect(ctx.signal.aborted).toBeTrue();
+      cancel();
+    } finally {
+      (globalThis as any).Worker = originalWorker;
+    }
+  });
 });

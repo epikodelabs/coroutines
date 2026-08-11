@@ -298,7 +298,7 @@ const chef = actor('chef', chefBehavior, {
   cancelledIds: new Set<string>(),
 }, emitKitchenEvent, checkClosed);
 
-registerActorRequestHandler('main', async (topic: string, payload: unknown) => {
+const unregisterKitchenRequests = registerActorRequestHandler('main', async (topic: string, payload: unknown) => {
   if (topic === 'recipe' && typeof payload === 'string') {
     return recipes.get(payload);
   }
@@ -643,6 +643,7 @@ export class KitchenService {
     this.destroyed = true;
     this.onMessageUnsubscribe?.();
     this.onMessageUnsubscribe = null;
+    unregisterKitchenRequests();
 
     await Promise.all([
       main.outbox.stop(cashier),

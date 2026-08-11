@@ -378,41 +378,39 @@ Composition is for worker-stage fusion, not for streaming dataflow.
 For streaming pipelines, compose the primitives directly:
 
 ```ts
-const input = channel<Job>(8);
-const output = channel<Result>(8);
-const workers = group();
-const consume = (async () => {
-  const results: Result[] = [];
+import { coroutine, group } from '@epikodelabs/swiftly';
 
-  for await (const result of output) {
-    results.push(result);
-  }
+type Job = {
+  id: string;
+  value: number;
+};
 
-  return results;
-})();
+type Result = {
+  id: string;
+  value: number;
+};
 
-for (let i = 0; i < 4; i++) {
-  workers.spawn(async (signal) => {
-    while (true) {
-      const next = await input.receive(signal);
-      if (!next.ok) return;
+const process = coroutine<Job, Result>((job) => {
+  return {
+    id: job.id,
+    value: job.value * 2,
+  };
+});
 
-      const result = await process(next.value, signal);
-      await output.send(result, signal);
-    }
-  });
-}
+const work = group({ concurrency: 4 });
 
-await Promise.all(inputs.map((job) => input.send(job)));
-input.close();
+const pending = inputs.map((job) =>
+  work.spawn((signal) => process.run(job, signal)),
+);
 
 try {
-  await workers.wait();
-} finally {
-  output.close();
-}
+  await work.wait();
 
-const results = await consume;
+  const results = await Promise.all(pending);
+  console.log(results);
+} finally {
+  await process.dispose();
+}
 ```
 
 Here the channel owns backpressure, the number of spawned workers bounds
@@ -432,11 +430,18 @@ const output = await transform.run(input, {
 Worker task utilities can transfer the result back:
 
 ```ts
+function mutate(bytes: Uint8Array): void {
+  for (let i = 0; i < bytes.length; i++) {
+    bytes[i] ^= 0xff;
+  }
+}
+
 const transform = coroutine<ArrayBuffer, ArrayBuffer>(
-  (buffer, { transfer }) => {
+  (buffer) => {
     mutate(new Uint8Array(buffer));
     return transfer(buffer, buffer);
   },
+  mutate,
 );
 ```
 

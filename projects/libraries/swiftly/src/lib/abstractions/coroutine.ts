@@ -17,6 +17,8 @@ export type CoroutineTask<T = any, R = any> = (data: T, utils: WorkerTaskUtils) 
 export type CoroutineOptions = {
   /** Raw helper snippets injected into the worker before task code. */
   helpers?: string[];
+  /** Maximum number of workers this coroutine may own concurrently. */
+  maxWorkers?: number;
 };
 
 type CoroutineDefinitionRest = Function[] | [...Function[], CoroutineOptions];
@@ -24,11 +26,12 @@ type CoroutineDefinitionRest = Function[] | [...Function[], CoroutineOptions];
 function createCoroutineImpl<T, R>(
   main: CoroutineTask<T, R>,
   functions: Function[],
-  helpers: string[]
+  options: CoroutineOptions,
 ): Coroutine<T, R> & CoroutineScript<T, R> {
   const runner = createTaskRunner<T, R>({
     name: "coroutine",
-    config: helpers.length > 0 ? { helpers } : undefined,
+    maxWorkers: options.maxWorkers,
+    config: options.helpers && options.helpers.length > 0 ? { helpers: options.helpers } : undefined,
     main,
     functions,
     generateWorkerScript: (task, dependencies, workerConfig) =>
@@ -44,7 +47,7 @@ function createCoroutineImpl<T, R>(
     run: runner.run,
     close: runner.close,
     dispose: runner.dispose,
-    helpers,
+    helpers: options.helpers || [],
     main,
     functions,
   } as Coroutine<T, R> & CoroutineScript<T, R>;
@@ -77,7 +80,7 @@ export function coroutine<T, R>(
   const options = (hasOptions ? last : undefined) as CoroutineOptions | undefined;
   const functions = (hasOptions ? rest.slice(0, -1) : rest) as Function[];
 
-  return createCoroutineImpl(main, functions, options?.helpers || []);
+  return createCoroutineImpl(main, functions, options || {});
 }
 
 export type { CoroutineScript } from "../worker/types";

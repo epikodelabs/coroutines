@@ -37,6 +37,27 @@ let workerConstructor: typeof Worker | undefined;
 let nextTimerId = 0;
 const pending = new Map<number, PendingTimer>();
 
+const createHostTimer = (
+  ms: number,
+  elapsed: () => void,
+): WorkerTimer => {
+  let pending = true;
+  const handle = setTimeout(() => {
+    if (!pending) return;
+    pending = false;
+    elapsed();
+  }, ms);
+
+  return {
+    cancel(): boolean {
+      if (!pending) return false;
+      pending = false;
+      clearTimeout(handle);
+      return true;
+    },
+  };
+};
+
 const normalizeWorkerError = (event: ErrorEvent): Error =>
   event.error instanceof Error
     ? event.error
@@ -152,6 +173,10 @@ export function scheduleWorkerTimer(
 ): WorkerTimer {
   if (!Number.isFinite(ms) || ms < 0) {
     throw new RangeError("timer duration must be a finite non-negative number");
+  }
+
+  if (typeof Worker === "undefined") {
+    return createHostTimer(ms, elapsed);
   }
 
   const timerWorker = ensureTimerWorker();

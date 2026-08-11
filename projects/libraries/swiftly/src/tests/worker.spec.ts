@@ -307,6 +307,37 @@ idescribe("worker helpers", () => {
       await runner.dispose();
     });
 
+    it("queues submissions when maxWorkers is reached", async () => {
+      const runner = createTaskRunner<number, number>({
+        name: "bounded-runner",
+        maxWorkers: 1,
+        main: (value: number) => value,
+        functions: [],
+        generateWorkerScript: () => "runner-worker-script",
+      });
+
+      const first = runner.run(1);
+      const second = runner.run(2);
+      await flush();
+
+      expect(MockWorker.instances.length).toBe(1);
+      const worker = MockWorker.instances[0];
+      expect(worker.sentMessages.length).toBe(1);
+
+      const firstMessage = worker.sentMessages[0];
+      worker.dispatch({ ...firstMessage, type: "response", payload: 10 });
+      await expectAsync(first).toBeResolvedTo(10);
+
+      await flush();
+      expect(worker.sentMessages.length).toBe(2);
+
+      const secondMessage = worker.sentMessages[1];
+      worker.dispatch({ ...secondMessage, type: "response", payload: 20 });
+      await expectAsync(second).toBeResolvedTo(20);
+
+      await runner.dispose();
+    });
+
     it("isolates worker failure from concurrent submissions", async () => {
       const runner = createRunner("failure-runner");
       const failed = runner.run(1);

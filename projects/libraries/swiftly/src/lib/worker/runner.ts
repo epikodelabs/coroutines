@@ -14,6 +14,7 @@ export type WorkerScriptConfig = {
 
 export type TaskRunnerOptions = {
   name: string;
+  maxWorkers?: number;
   config?: WorkerScriptConfig;
   main: Function;
   functions: Function[];
@@ -40,12 +41,20 @@ const toError = (error: unknown, fallback: string): Error =>
  */
 export function createTaskRunner<T, R>({
   name,
+  maxWorkers,
   config,
   main,
   functions,
   generateWorkerScript,
   createMessageHandler,
 }: TaskRunnerOptions): TaskRunner<T, R> {
+  if (
+    maxWorkers !== undefined &&
+    (!Number.isInteger(maxWorkers) || maxWorkers <= 0)
+  ) {
+    throw new RangeError("maxWorkers must be a positive integer");
+  }
+
   const idleWorkers: Worker[] = [];
   const workers = new Map<number, Worker>();
   const workerMessageHandlers = new Map<
@@ -64,6 +73,12 @@ export function createTaskRunner<T, R>({
   let resolveClose: (() => void) | null = null;
   let nextWorkerId = 0;
   let hasReleasedBlobUrl = false;
+  const workerWaiters: Array<{
+    signal?: AbortSignal;
+    abort?: () => void;
+    resolve: (worker: Worker) => void;
+    reject: (error: Error) => void;
+  }> = [];
 
   const getWorkerScriptUrl = (): string => {
     if (blobUrl) return blobUrl;
@@ -84,6 +99,36 @@ export function createTaskRunner<T, R>({
   const removeFromIdleWorkers = (worker: Worker): void => {
     const index = idleWorkers.indexOf(worker);
     if (index >= 0) idleWorkers.splice(index, 1);
+  };
+
+  const cleanupWorkerWaiter = (
+    waiter: (typeof workerWaiters)[number],
+  ): void => {
+    if (waiter.signal && waiter.abort) {
+      waiter.signal.removeEventListener("abort", waiter.abort);
+    }
+  };
+
+  const rejectWorkerWaiters = (error: Error): void => {
+    while (workerWaiters.length > 0) {
+      const waiter = workerWaiters.shift()!;
+      cleanupWorkerWaiter(waiter);
+      waiter.reject(error);
+    }
+  };
+
+  const takeNextWorkerWaiter = () => {
+    while (workerWaiters.length > 0) {
+      const waiter = workerWaiters.shift()!;
+      cleanupWorkerWaiter(waiter);
+      if (waiter.signal?.aborted) {
+        waiter.reject(createAbortError(waiter.signal));
+        continue;
+      }
+      return waiter;
+    }
+
+    return undefined;
   };
 
   const rejectWorkerTasks = (workerId: number, error: Error): void => {
@@ -158,6 +203,7 @@ export function createTaskRunner<T, R>({
 
     terminateWorkerNow(worker);
     if (error) rejectWorkerTasks(workerId, error);
+    serviceWorkerWaiters();
     finalizeGracefulClose();
   };
 
@@ -184,13 +230,69 @@ export function createTaskRunner<T, R>({
     return worker;
   };
 
-  const checkoutWorker = (signal?: AbortSignal): Worker => {
+  const serviceWorkerWaiters = (): void => {
+    while (workerWaiters.length > 0) {
+      const waiter = takeNextWorkerWaiter();
+      if (!waiter) return;
+
+      const idleWorker = idleWorkers.shift();
+      if (idleWorker) {
+        waiter.resolve(idleWorker);
+        continue;
+      }
+
+      if (maxWorkers === undefined || workers.size < maxWorkers) {
+        try {
+          waiter.resolve(createWorker());
+        } catch (error) {
+          waiter.reject(toError(error, `${name} worker creation failed`));
+        }
+        continue;
+      }
+
+      workerWaiters.unshift(waiter);
+      return;
+    }
+  };
+
+  const checkoutWorker = async (signal?: AbortSignal): Promise<Worker> => {
     if (signal?.aborted) throw createAbortError(signal);
     if (lifecycle === "finalizing" || isFinalized) {
       throw createFinalizedQueuedError();
     }
 
-    return idleWorkers.shift() ?? createWorker();
+    const idleWorker = idleWorkers.shift();
+    if (idleWorker) return idleWorker;
+    if (maxWorkers === undefined || workers.size < maxWorkers) {
+      return createWorker();
+    }
+
+    return new Promise<Worker>((resolve, reject) => {
+      const waiter = {
+        signal,
+        resolve: (worker: Worker) => {
+          cleanupWorkerWaiter(waiter);
+          resolve(worker);
+        },
+        reject: (error: Error) => {
+          cleanupWorkerWaiter(waiter);
+          reject(error);
+        },
+      } as (typeof workerWaiters)[number];
+
+      if (signal) {
+        waiter.abort = () => {
+          const index = workerWaiters.indexOf(waiter);
+          if (index < 0) return;
+          workerWaiters.splice(index, 1);
+          cleanupWorkerWaiter(waiter);
+          reject(createAbortError(signal));
+        };
+        signal.addEventListener("abort", waiter.abort, { once: true });
+      }
+
+      workerWaiters.push(waiter);
+    });
   };
 
   const checkinWorker = (worker: Worker): void => {
@@ -199,6 +301,12 @@ export function createTaskRunner<T, R>({
 
     if (lifecycle === "finalizing" || isFinalized) {
       retireWorker(worker);
+      return;
+    }
+
+    const waiter = takeNextWorkerWaiter();
+    if (waiter) {
+      waiter.resolve(worker);
       return;
     }
 
@@ -212,10 +320,17 @@ export function createTaskRunner<T, R>({
     transferables: Transferable[] = [],
   ): Promise<R> => {
     if (signal?.aborted) return Promise.reject(createAbortError(signal));
+    if (lifecycle === "finalizing" || isFinalized) {
+      return Promise.reject(createFinalizedActiveError());
+    }
 
     const workerId = getWorkerId(worker);
     if (workerId === undefined || !workers.has(workerId)) {
-      return Promise.reject(new Error("Worker not found or is not active"));
+      return Promise.reject(
+        isFinalized
+          ? createFinalizedActiveError()
+          : new Error("Worker not found or is not active"),
+      );
     }
 
     const taskId = generateTaskId();
@@ -271,7 +386,7 @@ export function createTaskRunner<T, R>({
 
     admittedRuns += 1;
     try {
-      const worker = checkoutWorker(signal);
+      const worker = await checkoutWorker(signal);
       try {
         return await submitTask(worker, value, signal, transfer);
       } finally {
@@ -305,6 +420,7 @@ export function createTaskRunner<T, R>({
       reject(createFinalizedActiveError());
     });
     pendingMessages.clear();
+    rejectWorkerWaiters(createFinalizedQueuedError());
 
     const owned = [...workers.values()];
     workers.clear();

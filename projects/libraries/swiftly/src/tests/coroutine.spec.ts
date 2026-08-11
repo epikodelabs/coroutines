@@ -355,6 +355,24 @@ idescribe('coroutine', () => {
     await co.dispose();
   });
 
+  it('should limit worker creation when maxWorkers is configured', async () => {
+    const mainTask = async (x: number) => {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      return x + 1;
+    };
+    (globalThis as any).currentMainTask = mainTask;
+
+    const co = coroutine(mainTask, { maxWorkers: 1 });
+    const first = co.run(1);
+    const second = co.run(2);
+
+    await expectAsync(first).toBeResolvedTo(2);
+    await expectAsync(second).toBeResolvedTo(3);
+    expect(mockWorkerCreations).toBe(1);
+
+    await co.dispose();
+  });
+
   it('should reject with "Unknown worker error" when worker error message is missing', async () => {
     const originalWorker = (globalThis as any).Worker;
 
