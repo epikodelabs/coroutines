@@ -9,7 +9,7 @@ import { RouterOutlet } from '@angular/router';
   template: `
     <div class="container">
       <header>
-        <h1>🍕 swiftly Kitchen</h1>
+        <h1>🍕 swinky Kitchen</h1>
         <p>Actor-based concurrency demo</p>
       </header>
       <main>

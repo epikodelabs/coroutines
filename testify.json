@@ -1,9 +1,9 @@
 {
   "srcDirs": [
-    "./projects/libraries/swiftly/src/lib"
+    "./projects/libraries/swinky/src/lib"
   ],
   "testDirs": [
-    "./projects/libraries/swiftly/src/tests"
+    "./projects/libraries/swinky/src/tests"
   ],
   "exclude": [
     "**/node_modules/**"

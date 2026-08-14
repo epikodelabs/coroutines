@@ -26,7 +26,7 @@ const __createAbortError = (signal) => {
   return new __contextCancelledError(reason ? String(reason) : undefined);
 };
 
-const __channelInternals = Symbol("swiftly.channelInternals");
+const __channelInternals = Symbol("swinky.channelInternals");
 
 const __channel = (capacity = 0) => {
   if (!Number.isInteger(capacity) || capacity < 0) {
@@ -568,7 +568,7 @@ const __select = async (cases, ctx = __background()) => {
     .map((item, i) => ({ item, i }))
     .filter(({ item }) => item.op !== "default");
   const randomOrder = __shuffledIndices(contenders.length).map((j) => contenders[j].i);
-  const selectId = Symbol("swiftly.select");
+  const selectId = Symbol("swinky.select");
   let settled = false;
   let winnerIndex = -1;
   const cleanupFns = [];

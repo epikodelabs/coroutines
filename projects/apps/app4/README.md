@@ -1,6 +1,6 @@
 # App 4 - Territory Wars
 
-Board game powered by `swiftly` actors and an Angular UI.
+Board game powered by `swinky` actors and an Angular UI.
 
 ## What it demonstrates
 

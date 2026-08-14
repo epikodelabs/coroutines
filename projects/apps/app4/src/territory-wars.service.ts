@@ -1,5 +1,5 @@
 import { Injectable, signal } from '@angular/core';
-import { ActorBusMessage, actor, main, WorkerUtils } from '@epikodelabs/swiftly';
+import { ActorBusMessage, actor, main, WorkerUtils } from '@epikodelabs/swinky';
 
 export type PlayerId = 'user' | 'rival';
 

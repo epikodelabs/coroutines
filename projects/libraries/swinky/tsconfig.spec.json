@@ -1,7 +1,7 @@
 {
   "extends": "./tsconfig.json",
   "compilerOptions": {
-    "outDir": "../../../out-tsc/swiftly-spec",
+    "outDir": "../../../out-tsc/swinky-spec",
     "types": [
       "jasmine"
     ]

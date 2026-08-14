@@ -295,23 +295,23 @@
         }
       }
     },
-    "swiftly": {
+    "swinky": {
       "projectType": "library",
-      "root": "projects/libraries/swiftly",
-      "sourceRoot": "projects/libraries/swiftly/src",
+      "root": "projects/libraries/swinky",
+      "sourceRoot": "projects/libraries/swinky/src",
       "prefix": "lib",
       "architect": {
         "build": {
           "builder": "@angular/build:ng-packagr",
           "options": {
-            "project": "projects/libraries/swiftly/ng-package.json"
+            "project": "projects/libraries/swinky/ng-package.json"
           },
           "configurations": {
             "production": {
-              "tsConfig": "projects/libraries/swiftly/tsconfig.lib.prod.json"
+              "tsConfig": "projects/libraries/swinky/tsconfig.lib.prod.json"
             },
             "development": {
-              "tsConfig": "projects/libraries/swiftly/tsconfig.lib.json"
+              "tsConfig": "projects/libraries/swinky/tsconfig.lib.json"
             }
           },
           "defaultConfiguration": "production"
@@ -319,7 +319,7 @@
         "test": {
           "builder": "@angular/build:unit-test",
           "options": {
-            "tsConfig": "projects/libraries/swiftly/tsconfig.spec.json"
+            "tsConfig": "projects/libraries/swinky/tsconfig.spec.json"
           }
         }
       }

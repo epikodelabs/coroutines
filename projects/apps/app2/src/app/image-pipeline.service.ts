@@ -1,5 +1,5 @@
 import { computed, Injectable, signal } from '@angular/core';
-import { coroutine, group } from '@epikodelabs/swiftly';
+import { coroutine, group } from '@epikodelabs/swinky';
 import { zipSync } from 'fflate';
 import {
   DEFAULT_SETTINGS,

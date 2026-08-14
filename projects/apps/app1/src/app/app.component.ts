@@ -1,7 +1,7 @@
 import { DecimalPipe } from '@angular/common';
 import { AfterViewInit, Component, ElementRef, OnDestroy, ViewChild, signal } from '@angular/core';
 import { FormsModule } from '@angular/forms';
-import { coroutine, group } from '@epikodelabs/swiftly';
+import { coroutine, group } from '@epikodelabs/swinky';
 
 interface JuliaPreset {
   name: string;
@@ -108,7 +108,7 @@ const juliaBatchWorker = (params: BatchParams): Pixel[] => {
     <div class="app">
       <header class="header">
         <h1>🔥 Julia Set Explorer</h1>
-        <p class="subtitle">Reactive fractal rendering with swiftly workers</p>
+        <p class="subtitle">Reactive fractal rendering with swinky workers</p>
       </header>
 
       <main class="grid">
@@ -183,7 +183,7 @@ const juliaBatchWorker = (params: BatchParams): Pixel[] => {
       </main>
 
       <footer class="footer">
-        <p>Powered by <strong>swiftly</strong> · Worker-first concurrency for TypeScript</p>
+        <p>Powered by <strong>swinky</strong> · Worker-first concurrency for TypeScript</p>
       </footer>
     </div>
   `,

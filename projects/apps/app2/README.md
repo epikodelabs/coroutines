@@ -1,6 +1,6 @@
 # App 2 - Image Processor
 
-Reactive image pipeline with `swiftly` workers and group-bounded concurrency.
+Reactive image pipeline with `swinky` workers and group-bounded concurrency.
 
 ## What it demonstrates
 

@@ -1,5 +1,5 @@
 {
-  "name": "@epikodelabs/swiftly",
+  "name": "@epikodelabs/swinky",
   "version": "1.0.1",
   "peerDependencies": {
     "@angular/common": ">=16.0.0",

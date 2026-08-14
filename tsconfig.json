@@ -5,8 +5,8 @@
     "strict": true,
     "forceConsistentCasingInFileNames": true,
     "paths": {
-      "@epikodelabs/swiftly": [
-        "./projects/libraries/swiftly/src/public-api.ts"
+      "@epikodelabs/swinky": [
+        "./projects/libraries/swinky/src/public-api.ts"
       ]
     },
     "noImplicitOverride": true,
@@ -63,10 +63,10 @@
       "path": "./projects/apps/app4/tsconfig.spec.json"
     },
     {
-      "path": "./projects/libraries/swiftly/tsconfig.lib.json"
+      "path": "./projects/libraries/swinky/tsconfig.lib.json"
     },
     {
-      "path": "./projects/libraries/swiftly/tsconfig.spec.json"
+      "path": "./projects/libraries/swinky/tsconfig.spec.json"
     }
   ]
 }

@@ -1,8 +1,8 @@
-# Swiftly
+# Swinky
 
 Concurrent JavaScript built around workers, structured task ownership, channels, actors, and cancellation.
 
-Swiftly treats concurrency as a programming model rather than exposing Web Workers as application infrastructure. Worker-backed computation, coordination, cancellation, and long-lived actors share one small set of primitives.
+Swinky treats concurrency as a programming model rather than exposing Web Workers as application infrastructure. Worker-backed computation, coordination, cancellation, and long-lived actors share one small set of primitives.
 
 For a concept-by-concept guide to ownership, boundaries, and when to use each primitive, see [`CONCEPTS.md`](./CONCEPTS.md).
 
@@ -23,7 +23,7 @@ concurrency limit: concurrent calls reuse idle workers or lazily create more
 workers as needed. `group()` owns the structured lifetime and concurrency policy.
 
 ```ts
-import { coroutine, group } from '@epikodelabs/swiftly';
+import { coroutine, group } from '@epikodelabs/swinky';
 
 function expensiveHash(value: string): string {
   return value;
@@ -88,7 +88,7 @@ otherController.abort();
 await otherResult.catch(() => undefined);
 ```
 
-A worker task cannot be pre-empted safely inside arbitrary JavaScript, so Swiftly cancels an active worker submission by terminating only the worker that owns it. Concurrent sibling submissions continue on their own workers. Work waiting behind a `group()` concurrency permit can be cancelled before a coroutine worker is needed.
+A worker task cannot be pre-empted safely inside arbitrary JavaScript, so Swinky cancels an active worker submission by terminating only the worker that owns it. Concurrent sibling submissions continue on their own workers. Work waiting behind a `group()` concurrency permit can be cancelled before a coroutine worker is needed.
 
 `compose()` forwards the same cancellation signal through every runner stage.
 
@@ -125,11 +125,11 @@ const exit = await counter.done;
 
 ## Timing
 
-Swiftly's main-thread timing operations use a shared timer worker. `sleep()`, `withTimeout()`, and `withDeadline()` therefore do not depend on the caller thread's timer queue. Inside an actor worker, `sleep()` uses that worker's own event loop rather than creating a nested worker.
+Swinky's main-thread timing operations use a shared timer worker. `sleep()`, `withTimeout()`, and `withDeadline()` therefore do not depend on the caller thread's timer queue. Inside an actor worker, `sleep()` uses that worker's own event loop rather than creating a nested worker.
 
 ## Design rule
 
-Swiftly keeps the core deliberately small. A public abstraction belongs here only when it contributes semantics that cannot be expressed cleanly by composing existing primitives. Convenience wrappers should stay outside the core.
+Swinky keeps the core deliberately small. A public abstraction belongs here only when it contributes semantics that cannot be expressed cleanly by composing existing primitives. Convenience wrappers should stay outside the core.
 
 
 ## Actor supervision
@@ -197,7 +197,7 @@ function expensiveHash(value: string): string {
 const hash = coroutine((value: string) => expensiveHash(value), expensiveHash);
 ```
 
-The worker script is baked once. When `hash.run()` is called, Swiftly reuses an
+The worker script is baked once. When `hash.run()` is called, Swinky reuses an
 idle worker if one exists; otherwise it lazily creates another worker for that
 concurrent invocation. Completed workers return to the coroutine's reusable
 worker list.
@@ -222,7 +222,7 @@ worker identity and state must survive across messages.
 
 ## Native module workers
 
-Every Swiftly-owned worker is created as a native ES module worker. This applies
+Every Swinky-owned worker is created as a native ES module worker. This applies
 to coroutine workers, actor workers, and the shared timer worker.
 
 Because coroutine task source is executed inside a module worker, ordinary
@@ -238,7 +238,7 @@ const normalize = coroutine(async (value: string) => {
 });
 ```
 
-Swiftly does not wrap or rewrite `import()`. CDN and other absolute module URLs
+Swinky does not wrap or rewrite `import()`. CDN and other absolute module URLs
 therefore use the browser's normal module loader, HTTP cache, CORS policy, and
 Content Security Policy.
 
@@ -272,7 +272,7 @@ same rule internally and stops only after an explicit closed result.
 
 ## Streaming work by composition
 
-Swiftly does not add a separate pipeline abstraction for bounded streaming work.
+Swinky does not add a separate pipeline abstraction for bounded streaming work.
 Channels provide backpressure, groups own lifetime and failure propagation, and
 coroutine owns worker execution:
 
@@ -418,7 +418,7 @@ const output = await transform.run(input, { transfer: [input] });
 
 The transfer wrapper is worker-internal: callers receive `output` directly, not
 a wrapper object. Duplicate entries in a transfer list are rejected before the
-post where Swiftly owns the list. A submission transfers its objects only when
+post where Swinky owns the list. A submission transfers its objects only when
 it is posted to a worker, so cancellation before worker execution leaves its
 transferables owned by the caller.
 
@@ -431,9 +431,9 @@ transfer is posted back to the caller.
 
 ## Shared memory
 
-Swiftly does not wrap `SharedArrayBuffer` or `Atomics`. Those platform primitives
+Swinky does not wrap `SharedArrayBuffer` or `Atomics`. Those platform primitives
 already express shared-memory ownership and atomic coordination directly and can
-be passed as ordinary task data. Swiftly adds abstractions only where it owns
+be passed as ordinary task data. Swinky adds abstractions only where it owns
 additional semantics such as scheduling, cancellation, worker lifetime, or
 transfer ownership.
 
@@ -456,7 +456,7 @@ currently executing. Omit it to preserve the unbounded mailbox behavior.
 
 Requests that arrive after a bounded mailbox is saturated reject with
 `Actor mailbox capacity exceeded`. One-way sends cannot return a rejection, so
-they are dropped and counted through `actor.dropped`; Swiftly also emits a
+they are dropped and counted through `actor.dropped`; Swinky also emits a
 warning. Saturation does **not** terminate the actor.
 
 ```ts
@@ -515,7 +515,7 @@ No separate task-collection or `allSettled` abstraction is introduced.
 
 ## Hardening invariants
 
-Swiftly treats cancellation cleanup as part of the concurrency contract:
+Swinky treats cancellation cleanup as part of the concurrency contract:
 
 - timer/context construction failures must not leave parent cancellation listeners attached;
 - completed or cancelled timer workers must not affect later worker generations;

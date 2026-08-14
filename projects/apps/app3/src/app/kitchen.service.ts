@@ -15,7 +15,7 @@ import {
   group,
   main,
   WorkerUtils,
-} from '@epikodelabs/swiftly';
+} from '@epikodelabs/swinky';
 
 export type Order = { id: string; item: string; customer: string };
 
