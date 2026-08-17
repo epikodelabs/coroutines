@@ -32,7 +32,7 @@ export type ReceiveResult<T> =
  *
  * @internal
  */
-export const CHANNEL_INTERNALS = Symbol("swinky.channelInternals");
+export const CHANNEL_INTERNALS = Symbol("coroutines.channelInternals");
 
 type WaitingReceiver<T> = {
   resolve: (result: ReceiveResult<T>) => void;

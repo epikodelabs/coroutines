@@ -15,7 +15,7 @@ import {
   group,
   main,
   WorkerUtils,
-} from '@epikodelabs/swinky';
+} from '@epikodelabs/coroutines';
 
 export type Order = { id: string; item: string; customer: string };
 

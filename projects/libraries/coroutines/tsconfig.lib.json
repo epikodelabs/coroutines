@@ -3,7 +3,7 @@
 {
   "extends": "./tsconfig.json",
   "compilerOptions": {
-    "outDir": "../../../dist/swinky",
+    "outDir": "../../../dist/coroutines",
     "declaration": true,
     "declarationMap": true,
     "inlineSources": true,

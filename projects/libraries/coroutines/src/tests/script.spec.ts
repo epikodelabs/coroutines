@@ -19,7 +19,7 @@ describe("worker module scripts", () => {
     );
   });
 
-  it("does not rewrite import expressions through a Swinky-specific loader", () => {
+  it("does not rewrite import expressions through a Coroutines-specific loader", () => {
     const task = new Function(
       'return import("https://cdn.example.invalid/math.js").then(module => module.default);',
     );

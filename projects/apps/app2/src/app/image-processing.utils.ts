@@ -1,4 +1,4 @@
-import type { WorkerTaskResult, WorkerTaskUtils } from '@epikodelabs/swinky';
+import type { WorkerTaskResult, WorkerTaskUtils } from '@epikodelabs/coroutines';
 
 export interface FileTask {
   file: File;

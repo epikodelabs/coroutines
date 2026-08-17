@@ -101,7 +101,7 @@ export type SelectDefaultCase = {
  * Represents a cancellable asynchronous operation that can participate in
  * `select(...)` alongside channel sends and receives.
  *
- * The operation receives an `AbortSignal`. When another case wins, Swinky
+ * The operation receives an `AbortSignal`. When another case wins, Coroutines
  * aborts this signal so cooperative work can stop promptly.
  */
 export type SelectOperationCase<T = any> = {
@@ -255,7 +255,7 @@ export async function select<T = any>(cases: SelectCase<T>[], ctx: Context = bac
     .map((item, i) => ({ item, i }))
     .filter(({ item }) => item.op !== "default");
   const randomOrder = shuffledIndices(contenders.length).map((j) => contenders[j].i);
-  const selectId = Symbol("swinky.select");
+  const selectId = Symbol("coroutines.select");
   let settled = false;
   let winnerIndex = -1;
   const cleanupFns: Array<() => void> = [];

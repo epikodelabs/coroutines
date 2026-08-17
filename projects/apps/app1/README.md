@@ -1,6 +1,6 @@
 # App 1 - Julia Set Explorer
 
-Fractal renderer using `swinky` coroutine workers.
+Fractal renderer using `coroutines` coroutine workers.
 
 ## What it demonstrates
 

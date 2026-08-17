@@ -231,7 +231,7 @@ idescribe("worker helpers", () => {
 
   describe("worker script ownership", () => {
     it("acquires blob URLs lazily and releases them only after worker use", async () => {
-      const createUrl = spyOn(URL, "createObjectURL").and.returnValue("blob:swinky-lazy");
+      const createUrl = spyOn(URL, "createObjectURL").and.returnValue("blob:coroutines-lazy");
       const revokeUrl = spyOn(URL, "revokeObjectURL");
 
       const unused = createTaskRunner<number, number>({
@@ -262,7 +262,7 @@ idescribe("worker helpers", () => {
       await expectAsync(pending).toBeResolvedTo(1);
       await used.close();
 
-      expect(revokeUrl).toHaveBeenCalledWith("blob:swinky-lazy");
+      expect(revokeUrl).toHaveBeenCalledWith("blob:coroutines-lazy");
     });
 
 ;

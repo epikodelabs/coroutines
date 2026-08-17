@@ -295,23 +295,23 @@
         }
       }
     },
-    "swinky": {
+    "coroutines": {
       "projectType": "library",
-      "root": "projects/libraries/swinky",
-      "sourceRoot": "projects/libraries/swinky/src",
+      "root": "projects/libraries/coroutines",
+      "sourceRoot": "projects/libraries/coroutines/src",
       "prefix": "lib",
       "architect": {
         "build": {
           "builder": "@angular/build:ng-packagr",
           "options": {
-            "project": "projects/libraries/swinky/ng-package.json"
+            "project": "projects/libraries/coroutines/ng-package.json"
           },
           "configurations": {
             "production": {
-              "tsConfig": "projects/libraries/swinky/tsconfig.lib.prod.json"
+              "tsConfig": "projects/libraries/coroutines/tsconfig.lib.prod.json"
             },
             "development": {
-              "tsConfig": "projects/libraries/swinky/tsconfig.lib.json"
+              "tsConfig": "projects/libraries/coroutines/tsconfig.lib.json"
             }
           },
           "defaultConfiguration": "production"
@@ -319,7 +319,7 @@
         "test": {
           "builder": "@angular/build:unit-test",
           "options": {
-            "tsConfig": "projects/libraries/swinky/tsconfig.spec.json"
+            "tsConfig": "projects/libraries/coroutines/tsconfig.spec.json"
           }
         }
       }

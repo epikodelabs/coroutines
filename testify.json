@@ -1,9 +1,9 @@
 {
   "srcDirs": [
-    "./projects/libraries/swinky/src/lib"
+    "./projects/libraries/coroutines/src/lib"
   ],
   "testDirs": [
-    "./projects/libraries/swinky/src/tests"
+    "./projects/libraries/coroutines/src/tests"
   ],
   "exclude": [
     "**/node_modules/**"

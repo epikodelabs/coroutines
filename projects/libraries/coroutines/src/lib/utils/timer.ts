@@ -2,10 +2,10 @@ import { scheduleWorkerTimer } from "../worker/timer";
 import { createAbortError } from "./context";
 
 /**
- * Suspends for at least `ms` milliseconds using Swinky's timer runtime.
+ * Suspends for at least `ms` milliseconds using Coroutines's timer runtime.
  *
  * When Web Workers are available the timeout is scheduled off the caller
- * thread. Otherwise Swinky falls back to the host timer queue.
+ * thread. Otherwise Coroutines falls back to the host timer queue.
  */
 export function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   if (signal?.aborted) {

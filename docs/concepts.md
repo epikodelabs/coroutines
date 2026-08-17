@@ -1,6 +1,6 @@
-# Swinky concepts
+# Coroutines concepts
 
-Swinky is a concurrency library built around a small set of ownership and coordination concepts. The primitives are intentionally separate: each one owns one kind of concurrency semantics and composes with the others instead of hiding them behind a larger framework.
+Coroutines is a concurrency library built around a small set of ownership and coordination concepts. The primitives are intentionally separate: each one owns one kind of concurrency semantics and composes with the others instead of hiding them behind a larger framework.
 
 This document explains **what each concept means, what it owns, what it does not own, and when to use it**.
 
@@ -31,7 +31,7 @@ The most important boundary is:
 A coroutine is a **stateless worker-backed operation**.
 
 ```ts
-import { coroutine } from '@epikodelabs/swinky';
+import { coroutine } from '@epikodelabs/coroutines';
 
 function expensiveHash(value: string): string {
   return value;
@@ -65,11 +65,11 @@ controller.abort();
 await result.catch(() => undefined);
 ```
 
-Cancelling active arbitrary JavaScript cannot safely pre-empt the function in place, so Swinky terminates the worker executing that submission. Other coroutine workers remain independent.
+Cancelling active arbitrary JavaScript cannot safely pre-empt the function in place, so Coroutines terminates the worker executing that submission. Other coroutine workers remain independent.
 
 ### Module workers
 
-Swinky workers are native ES module workers. Absolute dynamic imports therefore remain ordinary JavaScript:
+Coroutines workers are native ES module workers. Absolute dynamic imports therefore remain ordinary JavaScript:
 
 ```ts
 const normalize = coroutine(async (value: string) => {
@@ -81,7 +81,7 @@ const normalize = coroutine(async (value: string) => {
 });
 ```
 
-Swinky does not introduce a module-loading abstraction. Browser CORS, CSP, module caching, and URL resolution still apply.
+Coroutines does not introduce a module-loading abstraction. Browser CORS, CSP, module caching, and URL resolution still apply.
 
 Inline coroutine functions are serialized into a generated blob module, so a relative import such as `import('./helper.js')` does not retain the source TypeScript module as its base. Use an absolute module URL when serialized coroutine code needs to import another module.
 
@@ -90,7 +90,7 @@ Inline coroutine functions are serialized into a generated blob module, so a rel
 A group is the **structured owner of dynamic asynchronous work**.
 
 ```ts
-import { group } from '@epikodelabs/swinky';
+import { group } from '@epikodelabs/coroutines';
 
 const work = group({ concurrency: 4 });
 
@@ -288,11 +288,11 @@ Application values should be passed explicitly through normal JavaScript argumen
 await sleep(250, signal);
 ```
 
-Main-thread timing uses Swinky's shared timer worker, so the delay does not depend on the caller thread's timer queue. Actor-worker timing uses the actor worker's own event loop rather than nesting another worker.
+Main-thread timing uses Coroutines's shared timer worker, so the delay does not depend on the caller thread's timer queue. Actor-worker timing uses the actor worker's own event loop rather than nesting another worker.
 
 `withTimeout()` and `withDeadline()` use the same lifetime model to cancel a context after a duration or at an absolute deadline.
 
-Swinky intentionally does not turn timing into a scheduler. Repetition remains ordinary control flow:
+Coroutines intentionally does not turn timing into a scheduler. Repetition remains ordinary control flow:
 
 ```ts
 while (!signal.aborted) {
@@ -321,7 +321,7 @@ await main.outbox.stop(counter);
 
 Unlike a coroutine, an actor owns persistent worker identity and state across messages.
 
-Communication goes through Swinky's actor bus rather than exposing the raw `Worker`.
+Communication goes through Coroutines's actor bus rather than exposing the raw `Worker`.
 
 Use an actor when state belongs to a long-lived worker-side behavior rather than to one independent computation.
 
@@ -378,7 +378,7 @@ Composition is for worker-stage fusion, not for streaming dataflow.
 For streaming pipelines, compose the primitives directly:
 
 ```ts
-import { coroutine, group } from '@epikodelabs/swinky';
+import { coroutine, group } from '@epikodelabs/coroutines';
 
 type Job = {
   id: string;
@@ -449,7 +449,7 @@ Transfer is an ownership operation. Once posted successfully, the sender no long
 
 Because group admission happens before coroutine execution, transferables belonging to group-queued operations remain with the caller until that child is actually admitted and invokes the coroutine.
 
-Swinky does not wrap `SharedArrayBuffer` or `Atomics`; those platform primitives already provide shared-memory semantics.
+Coroutines does not wrap `SharedArrayBuffer` or `Atomics`; those platform primitives already provide shared-memory semantics.
 
 ## Choosing between neighboring concepts
 
@@ -491,9 +491,9 @@ Use **channels + groups** when values flow continuously and backpressure/lifetim
 
 ## Design principle
 
-Swinky's primitives are small because ownership stays explicit.
+Coroutines's primitives are small because ownership stays explicit.
 
-A useful way to read Swinky code is to ask:
+A useful way to read Coroutines code is to ask:
 
 1. **Who owns this work?** — usually a `group`, actor, or supervisor.
 2. **Where does it execute?** — a coroutine or actor worker.
@@ -501,4 +501,4 @@ A useful way to read Swinky code is to ask:
 4. **How is pressure bounded?** — group concurrency, channel capacity, semaphore permits, or mailbox capacity.
 5. **How does it stop?** — `AbortSignal`, `Context`, group cancellation, runner lifecycle, or actor lifecycle.
 
-If one primitive appears to answer several of those questions at once, it is worth checking whether two smaller Swinky concepts should be composed instead.
+If one primitive appears to answer several of those questions at once, it is worth checking whether two smaller Coroutines concepts should be composed instead.

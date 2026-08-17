@@ -46,7 +46,7 @@ function getHoshiSet(size: number): Set<string> {
     <div class="tw-shell">
       <header class="hero">
         <div class="hero-copy">
-          <p class="eyebrow">swinky Actors + Angular</p>
+          <p class="eyebrow">coroutines Actors + Angular</p>
           <h1>Territory Wars</h1>
           <p class="hero-text">
             @if (state(); as game) {

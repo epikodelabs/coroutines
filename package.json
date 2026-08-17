@@ -1,12 +1,12 @@
 {
-  "name": "swinky",
+  "name": "coroutines",
   "version": "1.0.1",
   "scripts": {
     "ng": "ng",
     "start": "ng serve app1",
-    "build": "ng build app1 && ng build swinky",
+    "build": "ng build app1 && ng build coroutines",
     "build:app": "ng build app1",
-    "build:lib": "ng build swinky",
+    "build:lib": "ng build coroutines",
     "watch": "ng build app1 --watch --configuration development",
     "test": "ng test app1",
     "test:app": "ng test app1",

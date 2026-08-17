@@ -161,7 +161,7 @@ export type WorkerTimer = {
 };
 
 /**
- * Schedules one timeout on Swinky's shared timer worker.
+ * Schedules one timeout on Coroutines's shared timer worker.
  *
  * Concurrent timers share one worker. The worker is terminated automatically
  * when the last outstanding timer settles or is cancelled.

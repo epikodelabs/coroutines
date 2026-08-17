@@ -11,7 +11,7 @@ export class ContextCancelledError extends Error {
 }
 
 /**
- * Cancellation scope used by Swinky coordination primitives.
+ * Cancellation scope used by Coroutines coordination primitives.
  *
  * A context carries only lifecycle state: its `AbortSignal`, completion promise,
  * and terminal reason. Application data should be passed explicitly through
@@ -62,7 +62,7 @@ const createContext = (controller: AbortController): Context => {
 const backgroundContext = createContext(new AbortController());
 
 /**
- * Returns Swinky's immutable root cancellation context.
+ * Returns Coroutines's immutable root cancellation context.
  *
  * The background context never cancels, so one shared instance avoids creating
  * an AbortController and never-settling completion promise for every default
