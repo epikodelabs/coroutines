@@ -57,12 +57,6 @@
       "path": "./projects/apps/app3/tsconfig.spec.json"
     },
     {
-      "path": "./projects/apps/app4/tsconfig.app.json"
-    },
-    {
-      "path": "./projects/apps/app4/tsconfig.spec.json"
-    },
-    {
       "path": "./projects/libraries/coroutines/tsconfig.lib.json"
     },
     {
