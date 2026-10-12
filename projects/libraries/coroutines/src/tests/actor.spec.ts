@@ -482,7 +482,7 @@ idescribe("actor", () => {
 
   it("actor worker select keeps same-registration send/receive cases from self-matching", async () => {
     async function behavior(msg: any, state: number, utils: any) {
-      if (msg !== "check") return state;
+      if (msg?.kind !== "actor-bus" || msg.topic !== "check") return state;
 
       const ch = utils.concurrency.channel();
       const [ctx, cancel] = utils.concurrency.withCancel();
@@ -529,9 +529,9 @@ idescribe("actor", () => {
   });
 
   it("should bound queued actor requests without terminating the actor", async () => {
-    async function behavior(msg: number, state: number) {
+    async function behavior(msg: any, state: number) {
       await new Promise((resolve) => setTimeout(resolve, 25));
-      return state + msg;
+      return state + msg.payload;
     }
 
     (globalThis as any).currentMainTask = behavior;
@@ -635,8 +635,8 @@ idescribe("actor", () => {
   });
 
   it("should request and receive updated state", async () => {
-    async function behavior(msg: number, state: number) {
-      return state + msg;
+    async function behavior(msg: any, state: number) {
+      return state + msg.payload;
     }
 
     (globalThis as any).currentMainTask = behavior;
@@ -811,8 +811,8 @@ idescribe("actor", () => {
   });
 
   it("should reject in-flight requests when stopped", async () => {
-    async function behavior(msg: string, state: number) {
-      if (msg === "wait") {
+    async function behavior(msg: any, state: number) {
+      if (msg.kind === "actor-bus" && msg.topic === "wait") {
         return new Promise<number>(() => {});
       }
       return state;
@@ -831,8 +831,8 @@ idescribe("actor", () => {
   });
 
   it("should support direct messages and requests", async () => {
-    async function behavior(msg: number, state: number) {
-      return state + msg;
+    async function behavior(msg: any, state: number) {
+      return state + msg.payload;
     }
 
     (globalThis as any).currentMainTask = behavior;
@@ -1478,9 +1478,9 @@ idescribe("actor", () => {
 
 
   it("ignores a response correlated to the right request but the wrong actor generation", async () => {
-    async function behavior(msg: number, state: number) {
+    async function behavior(msg: any, state: number) {
       await new Promise((resolve) => setTimeout(resolve, 25));
-      return state + msg;
+      return state + msg.payload;
     }
 
     (globalThis as any).currentMainTask = behavior;

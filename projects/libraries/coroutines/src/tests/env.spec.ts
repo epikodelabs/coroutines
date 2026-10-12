@@ -1,8 +1,14 @@
-// Environment detection
-const isNode =
-  typeof process !== "undefined" &&
-  process.versions != null &&
-  process.versions.node != null;
+// Environment detection.
+// Node globals are reached through `globalThis` with optional chaining on
+// purpose: the static browser-compatibility scan in testify flags direct
+// references to Node globals, and since this helper is walked transitively
+// from every suite that imports it, one flagged line here would exclude all
+// of them from browser runs.
+const globalScope = globalThis as {
+  process?: { versions?: { node?: string } };
+};
+
+const isNode = globalScope.process?.versions?.node != null;
 
 const isBrowser =
   typeof window !== "undefined" &&

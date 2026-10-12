@@ -58,16 +58,40 @@ idescribe("README samples", () => {
   let nameCounter = 0;
   const nextName = (prefix: string) => `${prefix}-readme-${++nameCounter}`;
 
+  // Fresh coroutine per call: each test owns and disposes its own workers.
+  const makeHashCoroutine = () => {
+    function expensiveHash(value: string): string {
+      return `${value}!`;
+    }
+
+    return coroutine<string, string>(
+      (value) => expensiveHash(value),
+      expensiveHash,
+    );
+  };
+
+  // Resolves with the payload of the next bus message matching any of the
+  // given topics, so tests synchronize on the round-trip instead of sleeping.
+  const waitForBusMessage = (...topics: string[]): Promise<any> =>
+    new Promise((resolve, reject) => {
+      let unsubscribe: () => void = () => {};
+      const timeoutId = setTimeout(() => {
+        unsubscribe();
+        reject(
+          new Error(`timed out waiting for bus message: ${topics.join(", ")}`),
+        );
+      }, 1_000);
+      unsubscribe = main.inbox.subscribe((message) => {
+        if (!topics.includes(message.topic)) return;
+        clearTimeout(timeoutId);
+        unsubscribe();
+        resolve(message.payload);
+      });
+    });
+
   describe("coroutine", () => {
     it("defines and runs a coroutine with serialized helpers", async () => {
-      function expensiveHash(value: string): string {
-        return `${value}!`;
-      }
-
-      const hash = coroutine<string, string>(
-        (value) => expensiveHash(value),
-        expensiveHash,
-      );
+      const hash = makeHashCoroutine();
 
       const result = await hash.run("hello");
       expect(result).toBe("hello!");
@@ -151,14 +175,7 @@ idescribe("README samples", () => {
 
   describe("group", () => {
     it("runs the structured concurrent work sample", async () => {
-      function expensiveHash(value: string): string {
-        return `${value}!`;
-      }
-
-      const hash = coroutine<string, string>(
-        (value) => expensiveHash(value),
-        expensiveHash,
-      );
+      const hash = makeHashCoroutine();
       const work = group({ concurrency: 4 });
 
       const inputs = ["a", "b", "c", "d", "e", "f"];
@@ -498,7 +515,8 @@ idescribe("README samples", () => {
       );
 
       main.outbox.send(name, "ping", "pong", { from: "main" });
-      await pause(20);
+      // Requests share the actor's FIFO mailbox with one-way sends, so this
+      // observes the post-"ping" state without a sleep.
       expect(await main.outbox.request(echo, "state", undefined)).toBe("pong");
 
       unsubscribe();
@@ -518,14 +536,7 @@ idescribe("README samples", () => {
           topic === "echo" ? payload * 2 : payload,
       );
 
-      const peeked = new Promise<any>((resolve) => {
-        const unsubscribe = main.inbox.subscribe((message) => {
-          if (message.topic === "result" || message.topic === "peeked") {
-            unsubscribe();
-            resolve(message.payload);
-          }
-        });
-      });
+      const peeked = waitForBusMessage("result", "peeked");
 
       async function utilsBehavior(message: any, state: number, utils: any) {
           if (message.kind === "actor-bus" && message.topic === "run-utils") {
@@ -561,19 +572,11 @@ idescribe("README samples", () => {
       );
 
       main.outbox.send(service, "run-utils", undefined);
-      await pause(20);
       expect(await peeked).toBe(83); // 41 * 2 + 1
 
-      const peekedNext = new Promise<any>((resolve) => {
-        const unsubscribe = main.inbox.subscribe((message) => {
-          if (message.topic === "peeked") {
-            unsubscribe();
-            resolve(message.payload);
-          }
-        });
-      });
+      const peekedNext = waitForBusMessage("peeked");
       main.outbox.send(service, "listen-next", undefined);
-      await pause(20);
+      await pause(20); // let the behavior reach utils.inbox.listen() first
       main.outbox.send(service, "second", "from-main");
       expect(await peekedNext).toBe("from-main");
 
@@ -611,7 +614,7 @@ idescribe("README samples", () => {
       );
 
       main.outbox.send(service, "m4", undefined); // one-way overflow
-      await pause(20);
+      await waitFor(() => service.dropped === 1);
       expect(service.dropped).toBe(1);
 
       await pause(150);
