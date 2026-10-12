@@ -1,4 +1,4 @@
-import type { Actor } from "../worker/types";
+import type { Actor, ActorStopOptions } from "../worker/types";
 
 export type ActorBusTarget = string | string[];
 export type ActorBusSender = string;
@@ -56,7 +56,7 @@ export type ActorRequestHandler<Q = any, D = any> = (
 ) => Promise<D> | D;
 
 export type ActorInternals = {
-  stop(): Promise<void>;
+  stop(options?: ActorStopOptions): Promise<void>;
   post(msg: any): void;
   request(topic: string, msg: any, signal?: AbortSignal): Promise<any>;
 };

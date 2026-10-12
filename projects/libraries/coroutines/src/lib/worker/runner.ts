@@ -16,6 +16,8 @@ export type WorkerScriptConfig = {
 export type TaskRunnerOptions = {
   name: string;
   maxWorkers?: number;
+  /** Terminates workers that stay idle longer than this many milliseconds. */
+  idleTimeout?: number;
   config?: WorkerScriptConfig;
   main: Function;
   functions: Function[];
@@ -43,6 +45,7 @@ const toError = (error: unknown, fallback: string): Error =>
 export function createTaskRunner<T, R>({
   name,
   maxWorkers,
+  idleTimeout,
   config,
   main,
   functions,
@@ -55,8 +58,15 @@ export function createTaskRunner<T, R>({
   ) {
     throw new RangeError("maxWorkers must be a positive integer");
   }
+  if (
+    idleTimeout !== undefined &&
+    (!Number.isFinite(idleTimeout) || idleTimeout <= 0)
+  ) {
+    throw new RangeError("idleTimeout must be a positive finite number");
+  }
 
   const idleWorkers: Worker[] = [];
+  const idleTimers = new Map<number, ReturnType<typeof setTimeout>>();
   const workers = new Map<number, Worker>();
   const workerMessageHandlers = new Map<
     number,
@@ -157,8 +167,32 @@ export function createTaskRunner<T, R>({
     }
   };
 
+  const disarmIdleReap = (workerId: number | undefined): void => {
+    if (workerId === undefined) return;
+    const timer = idleTimers.get(workerId);
+    if (timer === undefined) return;
+    clearTimeout(timer);
+    idleTimers.delete(workerId);
+  };
+
+  /** Arms the reap timer for a worker that just became idle. */
+  const armIdleReap = (worker: Worker): void => {
+    const workerId = getWorkerId(worker);
+    if (workerId === undefined || idleTimeout === undefined) return;
+
+    disarmIdleReap(workerId);
+    idleTimers.set(
+      workerId,
+      setTimeout(() => {
+        idleTimers.delete(workerId);
+        retireWorker(worker);
+      }, idleTimeout),
+    );
+  };
+
   const terminateWorkerNow = (worker: Worker): void => {
     const workerId = getWorkerId(worker);
+    disarmIdleReap(workerId);
     detachWorker(worker);
     removeFromIdleWorkers(worker);
     if (workerId !== undefined) workers.delete(workerId);
@@ -178,6 +212,8 @@ export function createTaskRunner<T, R>({
     const owned = [...workers.values()];
     workers.clear();
     idleWorkers.length = 0;
+    idleTimers.forEach((timer) => clearTimeout(timer));
+    idleTimers.clear();
 
     for (const worker of owned) {
       detachWorker(worker);
@@ -238,6 +274,7 @@ export function createTaskRunner<T, R>({
 
       const idleWorker = idleWorkers.shift();
       if (idleWorker) {
+        disarmIdleReap(getWorkerId(idleWorker));
         waiter.resolve(idleWorker);
         continue;
       }
@@ -263,7 +300,10 @@ export function createTaskRunner<T, R>({
     }
 
     const idleWorker = idleWorkers.shift();
-    if (idleWorker) return idleWorker;
+    if (idleWorker) {
+      disarmIdleReap(getWorkerId(idleWorker));
+      return idleWorker;
+    }
     if (maxWorkers === undefined || workers.size < maxWorkers) {
       return createWorker();
     }
@@ -312,6 +352,7 @@ export function createTaskRunner<T, R>({
     }
 
     idleWorkers.push(worker);
+    armIdleReap(worker);
   };
 
   const submitTask = (
@@ -426,6 +467,8 @@ export function createTaskRunner<T, R>({
     const owned = [...workers.values()];
     workers.clear();
     idleWorkers.length = 0;
+    idleTimers.forEach((timer) => clearTimeout(timer));
+    idleTimers.clear();
 
     for (const worker of owned) {
       detachWorker(worker);
@@ -441,6 +484,9 @@ export function createTaskRunner<T, R>({
   };
 
   return {
+    get size() {
+      return workers.size;
+    },
     run,
     close,
     dispose,

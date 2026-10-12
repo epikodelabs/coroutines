@@ -145,6 +145,21 @@ const __actorMailbox = __actorMailboxCapacity === undefined
   : __concurrency.channel(__actorMailboxCapacity);
 
 const __enqueueActorMessage = (value, requestId) => {
+  if (__actorStopping) {
+    // Once stopping begins, the mailbox is an admission boundary: drain runs
+    // refuse new traffic, requests get a typed rejection, one-way sends drop.
+    if (requestId) {
+      __postToMain({
+        workerId: __workerId,
+        taskId: __actorId,
+        requestId,
+        type: "error",
+        error: "Actor stopped",
+      });
+    }
+    return false;
+  }
+
   if (__actorMailboxCapacity === undefined) {
     __actorMailbox.send(value).catch((error) => {
       console.warn("Actor worker failed to enqueue message", error);
@@ -238,7 +253,7 @@ const __runBehaviorLoop = async (workerId, taskId) => {
 };
 
 onmessage = async (event) => {
-  const { workerId, taskId, payload, type, requestId, error, topic } = event.data;
+  const { workerId, taskId, payload, type, requestId, error, topic, drain } = event.data;
 
   if (
     type !== "init" &&
@@ -298,10 +313,18 @@ onmessage = async (event) => {
 
   if (type === "stop") {
     __actorStopping = true;
-    __actorRunning = false;
-    __rejectPendingWorkerRequests(new Error("Actor stopped"));
-    __actorMailbox.close();
-    __workerInbox.close();
+    if (drain) {
+      // Admission is refused once __actorStopping is set, and closing the
+      // mailbox still yields buffered values to the loop before resolving
+      // with { ok: false } — so the loop drains what was admitted and then
+      // wakes up to exit.
+      __actorMailbox.close();
+    } else {
+      __actorRunning = false;
+      __rejectPendingWorkerRequests(new Error("Actor stopped"));
+      __actorMailbox.close();
+      __workerInbox.close();
+    }
     return;
   }
 

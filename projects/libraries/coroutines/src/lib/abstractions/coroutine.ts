@@ -19,6 +19,8 @@ export type CoroutineOptions = {
   helpers?: string[];
   /** Maximum number of workers this coroutine may own concurrently. */
   maxWorkers?: number;
+  /** Terminates workers that stay idle longer than this many milliseconds. */
+  idleTimeout?: number;
 };
 
 type CoroutineDefinitionRest = Function[] | [...Function[], CoroutineOptions];
@@ -31,6 +33,7 @@ function createCoroutineImpl<T, R>(
   const runner = createTaskRunner<T, R>({
     name: "coroutine",
     maxWorkers: options.maxWorkers,
+    idleTimeout: options.idleTimeout,
     config: options.helpers && options.helpers.length > 0 ? { helpers: options.helpers } : undefined,
     main,
     functions,
@@ -44,6 +47,9 @@ function createCoroutineImpl<T, R>(
   });
 
   return {
+    get size() {
+      return runner.size;
+    },
     run: runner.run,
     close: runner.close,
     dispose: runner.dispose,

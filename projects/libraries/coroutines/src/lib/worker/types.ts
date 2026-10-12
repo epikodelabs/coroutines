@@ -19,6 +19,8 @@ export interface CoroutineScript<T = any, R = any> {
  * Base contract for anything that can process a task and be finalized.
  */
 export interface TaskRunner<T = any, R = any> {
+  /** Number of workers this runner currently owns (idle plus active). Built-in runners always provide it. */
+  readonly size?: number;
   /** Submits one value for worker-side processing. */
   run: (data: T, control?: TaskRunControl) => Promise<R>;
   /**
@@ -38,7 +40,10 @@ export interface TaskRunner<T = any, R = any> {
  *
  * Created by `coroutine(mainTask)` and accepted by `compose(...)`.
  */
-export interface Coroutine<T = any, R = T> extends TaskRunner<T, R> {}
+export interface Coroutine<T = any, R = T> extends TaskRunner<T, R> {
+  /** Number of workers this runner currently owns (idle plus active). */
+  readonly size: number;
+}
 
 /**
  * Thrown when a task runner refuses work because it was closed or disposed.
@@ -107,6 +112,22 @@ export type SupervisorOptions = {
    * Defaults to 0, preserving fail-fast behavior unless buffering is explicit.
    */
   readonly capacity?: number;
+};
+
+/** Options for stopping an actor. */
+export type ActorStopOptions = {
+  /**
+   * Lets the actor finish every already-admitted mailbox message before
+   * exiting. Messages that arrive during the drain are refused; requests
+   * receive `ActorStoppedError`.
+   */
+  readonly drain?: boolean;
+  /**
+   * Hard-terminate fallback in milliseconds. A stopping worker normally
+   * reports its own exit; this timer only bounds a stuck stop. Defaults
+   * to 100ms.
+   */
+  readonly graceMs?: number;
 };
 
 /**

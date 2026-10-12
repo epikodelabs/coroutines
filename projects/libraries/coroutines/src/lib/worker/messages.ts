@@ -31,6 +31,8 @@ export type WorkerProtocolMessage = {
   topic?: string;
   /** Internal actor mailbox capacity supplied during init. */
   mailboxCapacity?: number;
+  /** Stop flag: finish already-admitted mailbox messages before exiting. */
+  drain?: boolean;
 };
 
 /**

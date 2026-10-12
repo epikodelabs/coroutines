@@ -20,7 +20,7 @@ import { createModuleWorker } from "../worker/module";
 import { buildActorWorkerRuntime } from "../worker/runtimes";
 import { ACTOR_CONCURRENCY_RUNTIME } from "../worker/concurrency";
 import { buildWorkerScript } from "../worker/script";
-import type { Actor, ActorExit, ActorOptions, Supervisor, SupervisorOptions } from "../worker/types";
+import type { Actor, ActorExit, ActorOptions, ActorStopOptions, Supervisor, SupervisorOptions } from "../worker/types";
 import {
   clearActorBusListeners,
   createActorBusMessage,
@@ -139,7 +139,7 @@ export interface Initiator {
     request<Q = any, D = any>(to: Actor | string, topic: string, payload: Q, signal?: AbortSignal): Promise<D>;
 
     /** Stops the actor, terminates its worker, and releases resources. */
-    stop(actor: Actor | string): Promise<void>;
+    stop(actor: Actor | string, options?: ActorStopOptions): Promise<void>;
   };
 
   inbox: {
@@ -481,7 +481,11 @@ function createActor<S = any, Q = any, D = any, FromMain = any>(
     });
   };
 
-  const shutdown = (releaseBlobUrlOnExit: boolean, exit: ActorExit = { reason: "stopped" }) => {
+  const shutdown = (
+    releaseBlobUrlOnExit: boolean,
+    exit: ActorExit = { reason: "stopped" },
+    options?: ActorStopOptions,
+  ) => {
     shouldReleaseBlobUrl ||= releaseBlobUrlOnExit;
     if (!shutdown$) {
       requestedExit = exit;
@@ -492,8 +496,14 @@ function createActor<S = any, Q = any, D = any, FromMain = any>(
       return shutdown$;
     }
 
-    running = false;
-    rejectPendingRequests(exit.reason === "error" ? exit.error : ACTOR_STOPPED_ERROR_MESSAGE);
+    if (!options?.drain) {
+      // Draining keeps the actor live on the main side until the stop
+      // finalizes: behaviors still processing admitted messages may keep
+      // sending to main and resolving requests. Inbound admission is refused
+      // worker-side, and leftovers are rejected when the stop finalizes.
+      running = false;
+      rejectPendingRequests(exit.reason === "error" ? exit.error : ACTOR_STOPPED_ERROR_MESSAGE);
+    }
     unregisterActorBusTarget(actorRef);
 
     const activeWorker = worker;
@@ -513,6 +523,8 @@ function createActor<S = any, Q = any, D = any, FromMain = any>(
 
         settled = true;
         finishShutdown = null;
+        running = false;
+        rejectPendingRequests(exit.reason === "error" ? exit.error : ACTOR_STOPPED_ERROR_MESSAGE);
         activeWorker.removeEventListener("message", handleMessage);
         activeWorker.removeEventListener("error", handleError);
         activeWorker.terminate();
@@ -524,7 +536,10 @@ function createActor<S = any, Q = any, D = any, FromMain = any>(
         resolve();
       };
 
-      const timeoutId = setTimeout(finalizeShutdown, ACTOR_TERMINATION_TIMEOUT_MS);
+      const timeoutId = setTimeout(
+        finalizeShutdown,
+        options?.graceMs ?? ACTOR_TERMINATION_TIMEOUT_MS,
+      );
       finishShutdown = () => {
         clearTimeout(timeoutId);
         finalizeShutdown();
@@ -534,6 +549,7 @@ function createActor<S = any, Q = any, D = any, FromMain = any>(
         postToWorker(activeWorker, {
           taskId: actorTaskId,
           type: "stop",
+          drain: options?.drain === true,
         });
       } catch {
         finishShutdown();
@@ -653,8 +669,8 @@ function createActor<S = any, Q = any, D = any, FromMain = any>(
   registerActorBusTarget(name, actorRef);
 
   const internals = {
-    stop() {
-      return shutdown(true);
+    stop(options?: ActorStopOptions) {
+      return shutdown(true, { reason: "stopped" }, options);
     },
     post(msg: FromMain) {
       if (!worker || !running) {
@@ -766,13 +782,21 @@ export const main: Initiator = {
     },
 
     /** Stops the actor, terminates its worker, and releases resources. */
-    stop(actor: Actor | string): Promise<void> {
+    stop(actor: Actor | string, options?: ActorStopOptions): Promise<void> {
       const target = resolveActorTarget(actor);
       if (!target) {
         return Promise.reject(new Error(`Unknown actor target "${String(actor)}"`));
       }
+      if (
+        options?.graceMs !== undefined &&
+        (!Number.isFinite(options.graceMs) || options.graceMs < 0)
+      ) {
+        return Promise.reject(
+          new RangeError("actor stop graceMs must be a non-negative finite number"),
+        );
+      }
 
-      return getActorInternals(target).stop();
+      return getActorInternals(target).stop(options);
     },
   },
 

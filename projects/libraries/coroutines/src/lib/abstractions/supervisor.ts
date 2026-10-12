@@ -1,5 +1,5 @@
 import { ContextCancelledError, createAbortError, sleep } from "../utils";
-import type { Actor, ActorExit, Supervisor, SupervisorOptions } from "../worker/types";
+import type { Actor, ActorExit, ActorStopOptions, Supervisor, SupervisorOptions } from "../worker/types";
 import {
   getActorInternals,
   registerActorBusTarget,
@@ -259,14 +259,14 @@ export function supervisor(
   };
 
   setActorInternals(handle, {
-    stop: async () => {
+    stop: async (options?: ActorStopOptions) => {
       if (settled) return;
       stopping = true;
       restartController?.abort(new ContextCancelledError("supervisor stopped"));
       restartController = undefined;
       const active = current;
       if (active) {
-        await tryActorInternals(active)?.stop();
+        await tryActorInternals(active)?.stop(options);
       } else {
         settle({ reason: "stopped" });
       }
