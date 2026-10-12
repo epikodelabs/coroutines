@@ -41,6 +41,17 @@ export interface TaskRunner<T = any, R = any> {
 export interface Coroutine<T = any, R = T> extends TaskRunner<T, R> {}
 
 /**
+ * Thrown when a task runner refuses work because it was closed or disposed.
+ * Graceful `close()` and immediate `dispose()` share this failure type.
+ */
+export class RunnerClosedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "RunnerClosedError";
+  }
+}
+
+/**
  * Terminal state of a long-lived actor.
  */
 export type ActorExit =

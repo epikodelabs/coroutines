@@ -171,6 +171,28 @@ export interface ActorBehavior<S = any, Q = any, D = any, Incoming = any> {
 
 const ACTOR_TERMINATION_TIMEOUT_MS = 100;
 const ACTOR_STOPPED_ERROR_MESSAGE = "Actor stopped";
+
+/**
+ * Rejection carried when messaging an actor that has stopped, or when
+ * in-flight requests are rejected because the actor is stopping.
+ */
+export class ActorStoppedError extends Error {
+  constructor(message = ACTOR_STOPPED_ERROR_MESSAGE) {
+    super(message);
+    this.name = "ActorStoppedError";
+  }
+}
+
+/**
+ * Rejection carried by requests that arrive after a bounded actor mailbox is
+ * saturated. Saturation never terminates the actor.
+ */
+export class ActorMailboxOverflowError extends Error {
+  constructor(message = "Actor mailbox capacity exceeded") {
+    super(message);
+    this.name = "ActorMailboxOverflowError";
+  }
+}
 let actorGenerationCounter = 0;
 
 type PendingActorRequest<S> = {
@@ -183,6 +205,20 @@ const toErrorMessage = (
   error: unknown,
   fallback = "Actor request failed"
 ): string => (error instanceof Error ? error.message : error ? String(error) : fallback);
+
+/**
+ * Rebuilds typed rejections from error text that crossed the worker protocol,
+ * which carries messages as strings. Known failures regain their class so
+ * callers can branch with instanceof; anything else stays a plain Error.
+ */
+const toRequestRejection = (message: string | undefined): Error => {
+  const text = message ?? "Actor request failed";
+  if (text === ACTOR_STOPPED_ERROR_MESSAGE) return new ActorStoppedError(text);
+  if (text === "Actor mailbox capacity exceeded") {
+    return new ActorMailboxOverflowError(text);
+  }
+  return new Error(text);
+};
 
 function postActorResponse(
   sourceActor: Actor,
@@ -418,7 +454,7 @@ function createActor<S = any, Q = any, D = any, FromMain = any>(
       return;
     }
 
-    const error = typeof reason === "string" ? new Error(reason) : reason;
+    const error = typeof reason === "string" ? new ActorStoppedError(reason) : reason;
     for (const { reject, cleanup } of pendingRequests.values()) {
       cleanup?.();
       reject(error);
@@ -530,9 +566,7 @@ function createActor<S = any, Q = any, D = any, FromMain = any>(
     if (type === "response" && requestId) {
       takePendingRequest(requestId)?.resolve(payload);
     } else if (type === "error" && requestId) {
-      takePendingRequest(requestId)?.reject(
-        new Error(msg.error ?? "Actor request failed"),
-      );
+      takePendingRequest(requestId)?.reject(toRequestRejection(msg.error));
     } else if (type === "error" && !requestId) {
       failActor(new Error(msg.error ?? "Actor behavior failed"));
     } else if (type === "overflow") {
@@ -643,7 +677,7 @@ function createActor<S = any, Q = any, D = any, FromMain = any>(
 
     request(topic: string, msg: FromMain, signal?: AbortSignal): Promise<S> {
       if (!worker || !running) {
-        return Promise.reject(new Error("Actor stopped"));
+        return Promise.reject(new ActorStoppedError());
       }
       if (signal?.aborted) {
         return Promise.reject(createAbortError(signal));

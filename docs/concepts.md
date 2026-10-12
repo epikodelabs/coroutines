@@ -15,6 +15,7 @@ This document explains **what each concept means, what it owns, what it does not
 | `semaphore()` | Shared permit budget | Task ownership |
 | `barrier()` | Repeated rendezvous between a fixed number of participants | Data transport |
 | `event()` | Broadcast readiness state | Queued values |
+| `waitGroup()` | Dynamic completion counting across generations | Task ownership, value transport |
 | `Context` | Cancellation lifetime and deadlines | Application data |
 | `sleep()` | Cancellable delay | Repetition or scheduling policy |
 | `actor()` | Persistent worker identity, state, mailbox | Restart policy |
@@ -250,6 +251,23 @@ Use an event for state such as “initialization is ready” or “processing ma
 
 It is not a message queue. If every produced value matters, use a channel.
 
+## Wait group
+
+A wait group is a **dynamic completion counter** for work whose ownership lives elsewhere.
+
+```ts
+const downloads = waitGroup();
+
+downloads.add();
+const task = downloadOne().then(() => downloads.done());
+
+await downloads.wait(signal);
+```
+
+`add(n?)` registers outstanding work and `done()` completes one unit, throwing when nothing is outstanding. `wait()` resolves at zero; a cancelled signal withdraws only that waiter. After a generation completes, later `add()` calls begin a new one.
+
+Use a wait group when in-flight work is registered from places no single `group()` owns. Unlike a barrier, participants do not arrive together and the count may grow while a generation is active.
+
 ## Context
 
 A `Context` is a **cancellation lifetime**, not an application-data container.
@@ -458,6 +476,12 @@ Coroutines does not wrap `SharedArrayBuffer` or `Atomics`; those platform primit
 Use a **group** when the tasks belong to one structured scope and that scope should admit only N at once.
 
 Use a **semaphore** when many otherwise independent operations share one scarce resource.
+
+### Group or wait group?
+
+Use a **group** when one structured scope spawns the work and should own its lifetime and failure.
+
+Use a **wait group** when completion must be tracked across units of work started by different owners.
 
 ### Coroutine or actor?
 

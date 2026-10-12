@@ -5,6 +5,17 @@
  */
 export const buildCoroutineWorkerRuntime = (): string => `
 const __serializeWorkerError = (error) => {
+  if (error instanceof ReferenceError) {
+    const missing = /^([A-Za-z_$][\\w$]*) is not defined/.exec(error.message);
+    if (missing) {
+      return (
+        error.message +
+        " — referenced functions are not captured automatically; pass them as helper arguments so they are serialized into the worker (e.g. coroutine(task, " +
+        missing[1] +
+        "))"
+      );
+    }
+  }
   if (error instanceof Error) return error.message || error.name || "Error";
   if (error === undefined) return "Worker task threw undefined";
   if (error === null) return "Worker task threw null";
@@ -47,6 +58,17 @@ onmessage = async (event) => {
  */
 export const buildActorWorkerRuntime = (mailboxCapacity?: number): string => `
 const __serializeWorkerError = (error) => {
+  if (error instanceof ReferenceError) {
+    const missing = /^([A-Za-z_$][\\w$]*) is not defined/.exec(error.message);
+    if (missing) {
+      return (
+        error.message +
+        " — referenced functions are not captured automatically; pass them as helper arguments so they are serialized into the worker (e.g. coroutine(task, " +
+        missing[1] +
+        "))"
+      );
+    }
+  }
   if (error instanceof Error) return error.message || error.name || "Error";
   if (error === undefined) return "Worker task threw undefined";
   if (error === null) return "Worker task threw null";

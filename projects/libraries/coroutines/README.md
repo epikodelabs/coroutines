@@ -41,6 +41,7 @@ Each primitive keeps its own responsibility and composes with the others:
 | `semaphore()` | Shared permit budget | Task ownership |
 | `barrier()` | Repeated rendezvous between a fixed number of participants | Data transport |
 | `event()` | Broadcast readiness state | Queued values |
+| `waitGroup()` | Dynamic completion counting across generations | Task ownership, value transport |
 | `actor()` | Persistent worker identity, state, mailbox | Restart policy |
 | `supervisor()` | Stable actor identity across failed generations, restart policy | State persistence |
 | `compose()` | Fusing worker-backed stages behind one runner lifecycle | Streaming/backpressure |
@@ -66,6 +67,7 @@ Each primitive keeps its own responsibility and composes with the others:
   - [Semaphore](#semaphore)
   - [Barrier](#barrier)
   - [Event](#event)
+  - [Wait group](#wait-group)
 - [Actors](#actors)
   - [Messaging from the main thread](#messaging-from-the-main-thread)
   - [Inside the actor worker](#inside-the-actor-worker)
@@ -104,7 +106,7 @@ const result = await hash.run('hello');
 await hash.dispose();
 ```
 
-A coroutine worker only receives the serialized task body plus any helper functions passed after it. **Referenced outer-scope functions are not captured automatically** — `expensiveHash` must be listed explicitly so it is serialized into the worker script. Raw string snippets can be injected before the task code through the optional trailing options object (`{ helpers: string[] }`).
+A coroutine worker only receives the serialized task body plus any helper functions passed after it. **Referenced outer-scope functions are not captured automatically** — `expensiveHash` must be listed explicitly so it is serialized into the worker script. A body that references a function that was not passed fails fast inside the worker with a `ReferenceError` naming the missing helper. Raw string snippets can be injected before the task code through the optional trailing options object (`{ helpers: string[] }`).
 
 The task function receives a second argument with worker utilities (see [Transferable ownership](#transferable-ownership)) and may be `async`:
 
@@ -488,6 +490,27 @@ ready.set();
 
 Use an event for readiness conditions such as "initialization is ready" or "processing may continue". It is not a message queue — if every produced value matters, use a channel.
 
+### Wait group
+
+A wait group is a **dynamic completion counter** for work whose ownership lives elsewhere:
+
+```ts
+const downloads = waitGroup();
+
+for (const url of urls) {
+  downloads.add();
+  downloadOne(url).then(() => downloads.done());
+}
+
+await downloads.wait(signal);
+```
+
+- `add(n?)` registers outstanding work; `done()` completes one unit and **throws when nothing is outstanding**, so accounting bugs surface instead of hiding.
+- `wait()` resolves when the count reaches zero; cancelling withdraws only that waiter and leaves the count untouched.
+- After the count reaches zero and its waiters are released, later `add()` calls begin a new generation.
+
+Use a wait group when in-flight work is registered from places no single `group()` owns. Unlike a barrier, participants do not arrive together, and the count may grow while a generation is active.
+
 ## Actors
 
 An actor is a **long-lived stateful worker** with a stable name, a mailbox, and state that survives across messages. Unlike a coroutine, worker identity is persistent: creating an actor eagerly starts its dedicated worker and behavior loop.
@@ -736,6 +759,12 @@ The composition remains explicit: channel capacity bounds data in flight, the nu
 Use a **group** when the tasks belong to one structured scope and that scope should admit only N at once.
 
 Use a **semaphore** when many otherwise independent operations share one scarce resource.
+
+### Group or wait group?
+
+Use a **group** when one structured scope spawns the work and should own its lifetime and failure.
+
+Use a **wait group** when completion must be tracked across units of work started by different owners.
 
 ### Coroutine or actor?
 

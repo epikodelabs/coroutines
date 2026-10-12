@@ -3,6 +3,7 @@ import type { PendingTaskMap, WorkerProtocolMessage } from "./messages";
 import { createDefaultMessageHandler } from "./messages";
 import { createModuleWorker } from "./module";
 import type { TaskRunner } from "./types";
+import { RunnerClosedError } from "./types";
 import { generateTaskId } from "./utils";
 import { createAbortError } from "../utils/context";
 import type { TaskRunControl } from "../utils/transfer";
@@ -165,10 +166,10 @@ export function createTaskRunner<T, R>({
   };
 
   const createFinalizedActiveError = () =>
-    new Error(`${name} finalized before the worker task completed`);
+    new RunnerClosedError(`${name} finalized before the worker task completed`);
   const createFinalizedQueuedError = () =>
-    new Error(`${name} finalized before a worker became available`);
-  const createRunClosedError = () => new Error(`${name} is closed`);
+    new RunnerClosedError(`${name} finalized before a worker became available`);
+  const createRunClosedError = () => new RunnerClosedError(`${name} is closed`);
 
   const finalizeGracefulClose = (): void => {
     if (lifecycle !== "closing" || isFinalized || admittedRuns > 0) return;

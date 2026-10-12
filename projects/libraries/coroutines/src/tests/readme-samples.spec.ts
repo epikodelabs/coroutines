@@ -1,12 +1,15 @@
 import {
   Actor,
   ActorExit,
+  ActorMailboxOverflowError,
   Barrier,
   Channel,
   ChannelClosedError,
   ConcurrencyEvent,
   ContextCancelledError,
   CoroutineTask,
+  GroupClosedError,
+  RunnerClosedError,
   Semaphore,
   TaskGroup,
   WorkerTaskUtils,
@@ -32,6 +35,10 @@ import {
   withTimeout,
 } from "../public-api";
 import { idescribe } from "./env.spec";
+
+// Type-only declaration: erased at runtime, so a coroutine body that calls it
+// hits a genuine ReferenceError inside the worker.
+declare function missingHelper(value: string): string;
 
 idescribe("README samples", () => {
   const pause = (ms = 5) => new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -156,7 +163,7 @@ idescribe("README samples", () => {
       const admitted = slow.run(1);
       await slow.close();
       expect(await admitted).toBe(1);
-      await expectAsync(slow.run(2)).toBeRejected();
+      expect(await capture(slow.run(2))).toBeInstanceOf(RunnerClosedError);
       await slow.dispose();
     });
 
@@ -170,6 +177,16 @@ idescribe("README samples", () => {
 
       expect(await fix.run("readme")).toBe("README");
       await fix.dispose();
+    });
+
+    it("names the missing helper when a body references an unpassed function", async () => {
+      const broken = coroutine((value: string) => missingHelper(value));
+
+      const error = (await capture(broken.run("x"))) as Error;
+      expect(error.message).toContain("missingHelper");
+      expect(error.message).toContain("not captured automatically");
+
+      await broken.dispose();
     });
   });
 
@@ -228,6 +245,9 @@ idescribe("README samples", () => {
       expect(report.error).toBeInstanceOf(Error);
       expect(await capture(work.wait())).toBe(report.error);
       expect(await capture(spawned)).toBeInstanceOf(Error);
+      expect(
+        await capture(work.spawn(async () => "late")),
+      ).toBeInstanceOf(GroupClosedError);
     });
   });
 
@@ -609,6 +629,7 @@ idescribe("README samples", () => {
       const rejected = await capture(
         main.outbox.request(service, "m3", undefined),
       );
+      expect(rejected).toBeInstanceOf(ActorMailboxOverflowError);
       expect((rejected as Error).message).toBe(
         "Actor mailbox capacity exceeded",
       );

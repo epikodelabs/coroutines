@@ -9,3 +9,4 @@ export * from "./semaphore";
 
 export * from "./timer";
 export * from "./transfer";
+export * from "./wait-group";

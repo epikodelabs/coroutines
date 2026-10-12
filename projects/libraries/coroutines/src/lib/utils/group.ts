@@ -1,6 +1,17 @@
 import { createAbortError, ContextCancelledError } from "./context";
 
 /**
+ * Thrown when a group no longer accepts children: after `wait()`/`settle()`,
+ * explicit cancellation, or the first child failure.
+ */
+export class GroupClosedError extends Error {
+  constructor(message = "task group is closed") {
+    super(message);
+    this.name = "GroupClosedError";
+  }
+}
+
+/**
  * One unit of structured asynchronous work owned by a task group.
  *
  * The supplied signal is aborted when the group is cancelled or when a sibling
@@ -246,13 +257,13 @@ export function group(options: GroupOptions = {}): TaskGroup {
       return Promise.reject(new TypeError("group operation must be a function"));
     }
     if (settlementRequested) {
-      return Promise.reject(new Error("task group is closed"));
+      return Promise.reject(new GroupClosedError());
     }
     if (controller.signal.aborted) {
       return Promise.reject(createAbortError(controller.signal));
     }
     if (!accepting) {
-      return Promise.reject(new Error("task group is closed"));
+      return Promise.reject(new GroupClosedError());
     }
 
     const outcomeIndex = outcomes.length;
