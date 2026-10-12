@@ -129,6 +129,13 @@ const hash = coroutine(taskFn, { maxWorkers: 8 });
 
 When the cap is reached and no worker is idle, further submissions wait FIFO for the next worker to free up (cancellable through their signal). This is a resource cap on worker creation — not a scheduling policy. Structured admission still belongs to `group()`.
 
+Elasticity also works in reverse: an optional `idleTimeout` reaps workers that stay idle longer than the given number of milliseconds, and the next `run()` recreates one on demand. Without it, workers are kept for the lifetime of the coroutine. The runner exposes `size` — the number of workers it currently owns — for observability:
+
+```ts
+const hash = coroutine(taskFn, { idleTimeout: 30_000 });
+hash.size; // owned worker count right now
+```
+
 If several groups share the same coroutine, each group applies its own concurrency policy while the coroutine reuses the same idle worker list.
 
 Worker-script blob URLs are acquired lazily on first execution, so constructing an unused coroutine does not reserve browser worker resources.
@@ -561,7 +568,7 @@ type ActorExit =
 main.outbox.publish(topic, payload, { from?, includeSelf? }); // broadcast to every named actor
 main.outbox.send(to, topic, payload, { from? });              // one-way, one or many named targets
 main.outbox.request(to, topic, payload, signal?);             // awaits a response, one target
-main.outbox.stop(actorOrName);                                // stop, terminate, release resources
+main.outbox.stop(actorOrName, options?);                      // stop, terminate, release resources
 main.inbox.subscribe(handler);                                // returns an unsubscribe function
 main.inbox.clear();                                           // drop all bus listeners
 ```
@@ -569,6 +576,12 @@ main.inbox.clear();                                           // drop all bus li
 - `request()` requires exactly one target and a topic; an unknown target rejects.
 - `request()` accepts an `AbortSignal`. Cancelling withdraws **only that caller's pending response** — it does not terminate the actor generation. This composes actor request lifetimes with task groups and contexts without a separate timeout/retry API.
 - `stop()` sends a stop message, gives the worker a short grace period, then terminates it and rejects outstanding requests.
+
+**Graceful stop options:**
+
+- `stop(actor, { drain: true })` lets the actor finish every already-admitted mailbox message before exiting — the `close()` half of the runner lifecycle. Messages that arrive during the drain are refused; requests receive `ActorStoppedError`.
+- `stop(actor, { graceMs })` bounds the hard-terminate fallback (default 100ms). Extend it when a behavior legitimately runs longer; a stopping worker normally reports its own exit long before the timer.
+- Supervisor handles accept the same options and forward them to their live generation.
 
 ### Inside the actor worker
 

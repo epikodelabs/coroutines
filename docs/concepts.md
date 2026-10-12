@@ -358,6 +358,10 @@ const service = actor(
 
 Mailbox capacity is actor ingress pressure. It is separate from group concurrency and supervisor restart-window capacity.
 
+### Stopping
+
+`main.outbox.stop(actor)` finishes the current behavior, then terminates the worker. `stop(actor, { drain: true })` first processes every already-admitted mailbox message; `graceMs` bounds the hard-terminate fallback (default 100ms). Supervisor handles forward both options to the live generation.
+
 ## Supervisor
 
 A supervisor owns **recovery of an actor identity across failed generations**.

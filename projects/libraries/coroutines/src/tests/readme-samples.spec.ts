@@ -130,6 +130,23 @@ idescribe("README samples", () => {
       await hash.dispose();
     });
 
+    it("reaps idle workers after idleTimeout and recreates them on demand", async () => {
+      async function increment(value: number): Promise<number> {
+        return value + 1;
+      }
+      const counter = coroutine(increment, { idleTimeout: 15 });
+
+      expect(counter.size).toBe(0);
+      await Promise.all([counter.run(1), counter.run(2), counter.run(3)]);
+      expect(counter.size).toBe(3);
+
+      await waitFor(() => counter.size === 0);
+      expect(await counter.run(4)).toBe(5);
+      expect(counter.size).toBe(1);
+
+      await counter.dispose();
+    });
+
     it("cancels a submission by signal and by options", async () => {
       function parseLargeDocument(text: string): string {
         return text;
@@ -643,6 +660,52 @@ idescribe("README samples", () => {
       expect(await main.outbox.request(service, "ping", undefined)).toBeDefined();
 
       await main.outbox.stop(service);
+    });
+
+    it("lets long behaviors finish by extending the stop grace window", async () => {
+      async function slowBehavior(message: any, state: number) {
+        if (message?.kind === "actor-bus" && message.topic === "slow") {
+          await new Promise((resolve) => setTimeout(resolve, 150));
+          return state + (message.payload ?? 1);
+        }
+        return state;
+      }
+
+      const service = actor(nextName("grace"), slowBehavior, 0);
+      const pending = main.outbox.request(service, "slow", 41);
+
+      // Draining is what keeps an admitted request alive while the behavior
+      // finishes; graceMs bounds how long the stop may take.
+      await main.outbox.stop(service, { drain: true, graceMs: 600 });
+
+      expect(await pending).toBe(41);
+      expect(await service.done).toEqual({ reason: "stopped" });
+    });
+
+    it("drains admitted mailbox messages when stopping with drain", async () => {
+      const markers: number[] = [];
+      const unsubscribe = main.inbox.subscribe((message) => {
+        if (message.topic === "drained") markers.push(message.payload);
+      });
+
+      async function drainBehavior(message: any, state: number, utils: any) {
+        if (message?.kind === "actor-bus" && message.topic === "work") {
+          utils.outbox.send("main", "drained", message.payload);
+          return state + 1;
+        }
+        return state;
+      }
+
+      const service = actor(nextName("drain"), drainBehavior, 0);
+      main.outbox.send(service, "work", 1);
+      main.outbox.send(service, "work", 2);
+      main.outbox.send(service, "work", 3);
+
+      await main.outbox.stop(service, { drain: true });
+      await service.done;
+
+      expect(markers.sort()).toEqual([1, 2, 3]);
+      unsubscribe();
     });
   });
 
