@@ -104,16 +104,28 @@ export function withTimeout(parent: Context, ms: number): [Context, Cancel] {
   }
 
   const [ctx, cancel] = withCancel(parent);
+  let watchdog: ReturnType<typeof setTimeout> | undefined;
 
   try {
+    // The worker timer is the normal scheduling path. Keep a host-timer
+    // watchdog as a lifecycle backstop: a worker can be replaced by an
+    // isolated test host (or fail before it processes its first message),
+    // but a context deadline must still be terminal at its requested time.
+    watchdog = setTimeout(() => {
+      cancel(new ContextCancelledError(`context timeout after ${ms}ms`));
+    }, ms);
     const timer = scheduleWorkerTimer(
       ms,
       () => cancel(new ContextCancelledError(`context timeout after ${ms}ms`)),
       (error) => cancel(error),
     );
-    ctx.done.finally(() => timer.cancel());
+    ctx.done.finally(() => {
+      if (watchdog !== undefined) clearTimeout(watchdog);
+      timer.cancel();
+    });
     return [ctx, cancel];
   } catch (error) {
+    if (watchdog !== undefined) clearTimeout(watchdog);
     cancel(error);
     throw error;
   }
