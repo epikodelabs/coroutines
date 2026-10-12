@@ -168,10 +168,20 @@ const __runBehaviorLoop = async (workerId, taskId) => {
 
     let msg = envelope;
     let replyId = null;
+    let receivedFromNotify = true;
 
     if (envelope && typeof envelope === "object" && "requestId" in envelope) {
       replyId = envelope.requestId;
       msg = envelope.msg;
+      receivedFromNotify = false;
+    }
+
+    // Notifications are mirrored into the worker inbox so a behavior can
+    // await messages that arrive while it is suspended. The notification that
+    // started this behavior is not a *next* inbox message, so consume its
+    // mirror before invoking user code.
+    if (receivedFromNotify && msg && typeof msg === "object" && msg.kind === "actor-bus") {
+      __workerInbox.tryReceive();
     }
 
     try {

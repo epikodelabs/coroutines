@@ -664,7 +664,14 @@ function createActor<S = any, Q = any, D = any, FromMain = any>(
         try {
           postToWorker(worker!, {
             taskId: actorTaskId,
-            payload: msg,
+            // Behaviors always receive bus envelopes, regardless of whether a
+            // message arrived as a one-way send or a request.  Keeping this
+            // shape consistent is what lets a behavior branch on `kind` and
+            // `topic` for both forms of main-thread communication.
+            payload: createActorBusMessage(topic, msg, {
+              from: "main",
+              to: name,
+            }),
             requestId: id,
             type: "request",
             topic,
