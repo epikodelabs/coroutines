@@ -31,8 +31,9 @@ import {
   withDeadline,
   withTimeout,
 } from "../public-api";
+import { idescribe } from "./env.spec";
 
-describe("README samples", () => {
+idescribe("README samples", () => {
   const pause = (ms = 5) => new Promise<void>((resolve) => setTimeout(resolve, ms));
   const waitFor = async (
     predicate: () => boolean,

@@ -1,6 +1,7 @@
 import { compose, coroutine, type TaskRunControl } from "../public-api";
+import { idescribe } from "./env.spec";
 
-describe("compose coroutines", () => {
+idescribe("compose coroutines", () => {
   it("preserves types across more than three composed stages", async () => {
     const c1 = coroutine((value: number) => String(value));
     const c2 = coroutine((value: string) => value.length);
