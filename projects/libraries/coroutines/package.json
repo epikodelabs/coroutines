@@ -1,6 +1,16 @@
 {
   "name": "@epikodelabs/coroutines",
   "version": "1.0.2",
+  "keywords": [
+    "coroutines",
+    "concurrency",
+    "structured-concurrency",
+    "web-workers",
+    "actors",
+    "channels",
+    "typescript",
+    "angular"
+  ],
   "dependencies": {
     "tslib": "^2.8.1"
   },
