@@ -28,6 +28,100 @@ idescribe("compose coroutines", () => {
     await composed.dispose();
   });
 
+  it("runs task runners and coroutine stages in argument order", async () => {
+    const script = coroutine((x: number) => x + 1);
+    const runner = {
+      run: async (x: number) => x * 2,
+      close: async () => undefined,
+      dispose: async () => undefined,
+    };
+    const tail = coroutine((x: number) => x - 1);
+
+    const composed = compose(script, runner as any, tail);
+    // ((3+1)*2)-1; the old workers-first order would give (3+1-1)*2 = 6
+    await expectAsync(composed.run(3)).toBeResolvedTo(7);
+
+    await composed.dispose();
+    await script.dispose();
+    await tail.dispose();
+  });
+
+  it("interleaves fused segments and task runners in argument order", async () => {
+    const plusOne = coroutine((x: number) => x + 1);
+    const timesTwo = {
+      run: async (x: number) => x * 2,
+      close: async () => undefined,
+      dispose: async () => undefined,
+    };
+    const minusOne = coroutine((x: number) => x - 1);
+    const timesThree = {
+      run: async (x: number) => x * 3,
+      close: async () => undefined,
+      dispose: async () => undefined,
+    };
+
+    const composed = compose(plusOne, timesTwo as any, minusOne, timesThree as any);
+    // (((2+1)*2)-1)*3
+    await expectAsync(composed.run(2)).toBeResolvedTo(15);
+
+    await composed.dispose();
+    await plusOne.dispose();
+    await minusOne.dispose();
+  });
+
+  it("exposes size as the sum of owned runner sizes", async () => {
+    const script = coroutine((x: number) => x + 1);
+    const composed = compose(script);
+
+    expect(composed.size).toBe(0);
+    await composed.run(1);
+    expect(composed.size).toBeGreaterThanOrEqual(1);
+
+    await composed.dispose();
+    await script.dispose();
+  });
+
+  it("reports the size of plain task runners", async () => {
+    const runner = {
+      run: async (x: number) => x,
+      size: 3,
+      close: async () => undefined,
+      dispose: async () => undefined,
+    };
+    const composed = compose(runner as any);
+
+    expect(composed.size).toBe(3);
+    await composed.dispose();
+  });
+
+  it("reports a size of zero for an empty compose", () => {
+    expect(compose().size).toBe(0);
+  });
+
+  it("applies an input transfer list only to the first segment", async () => {
+    const controls: TaskRunControl[] = [];
+    const script = coroutine((value: ArrayBuffer) => value);
+    const tail = {
+      run: async (value: ArrayBuffer, control?: TaskRunControl) => {
+        controls.push(control);
+        return value.byteLength;
+      },
+      close: async () => undefined,
+      dispose: async () => undefined,
+    };
+
+    const controller = new AbortController();
+    const buffer = new ArrayBuffer(8);
+    const composed = compose(script, tail as any);
+    await expectAsync(
+      composed.run(buffer, { signal: controller.signal, transfer: [buffer] }),
+    ).toBeResolvedTo(8);
+
+    expect(controls[0]).toBe(controller.signal);
+    await composed.dispose();
+    await script.dispose();
+  });
+
   it("should process tasks sequentially in a stream", async () => {
     const c1 = coroutine((x: number) => x + 1);
     const c2 = coroutine((x: number) => x * 2);

@@ -104,11 +104,14 @@ ${depsSection ? '  ' + depsSection.replace(/\n/g, '\n  ') + '\n' : ''}  return (
 /**
  * Chains multiple coroutines sequentially into a single `Coroutine`.
  *
- * `CoroutineScript` inputs (created by `coroutine()`) are merged into one
- * worker script so the entire pipeline runs inside one worker task per concurrent invocation.
+ * Consecutive `CoroutineScript` inputs (created by `coroutine()`) are fused
+ * into one worker segment so the stages inside it run within a single worker
+ * task per concurrent invocation. Segments and `TaskRunner` inputs are
+ * executed strictly in the order they are passed, so interleaved chains such
+ * as `compose(runnerA, coroutineB)` run `runnerA` before `coroutineB`.
  *
- * `TaskRunner` inputs are chained in the main thread after the worker
- * stage completes.
+ * The input scripts and runners are not disposed by the composed coroutine —
+ * callers remain responsible for their lifecycle.
  */
 export function compose(): Coroutine<any, any>;
 export function compose<const S extends readonly [Composable, ...Composable[]]>(
@@ -118,30 +121,36 @@ export function compose<const S extends readonly [Composable, ...Composable[]]>(
 export function compose<T = any, R = any>(
   ...scripts: Array<CoroutineScript<any, any> | TaskRunner<any, any>>
 ): Coroutine<T, R> {
-  const workerScripts: CoroutineScript<any, any>[] = [];
-  const taskRunners: TaskRunner<any, any>[] = [];
+  const segments: Array<{ kind: "worker" | "task"; runner: TaskRunner<any, any> }> = [];
+  let scriptBuffer: CoroutineScript<any, any>[] = [];
+
+  const flushWorkerSegment = (): void => {
+    if (scriptBuffer.length === 0) return;
+
+    const merged = mergeCoroutineScripts(scriptBuffer);
+    segments.push({
+      kind: "worker",
+      runner: createTaskRunner<any, any>({
+        name: "compose",
+        config: merged.helpers.length > 0 ? { helpers: merged.helpers } : undefined,
+        main: merged.main,
+        functions: [],
+        generateWorkerScript: (task, _dependencies, workerConfig) =>
+          merged.generateScript(task, workerConfig?.helpers),
+      }),
+    });
+    scriptBuffer = [];
+  };
 
   for (const s of scripts) {
     if (isCoroutineScript(s)) {
-      workerScripts.push(s);
+      scriptBuffer.push(s);
     } else if (s && typeof (s as TaskRunner).run === "function") {
-      taskRunners.push(s as TaskRunner);
+      flushWorkerSegment();
+      segments.push({ kind: "task", runner: s as TaskRunner });
     }
   }
-
-  let workerRunner: TaskRunner<T, R> | null = null;
-
-  if (workerScripts.length > 0) {
-    const merged = mergeCoroutineScripts(workerScripts);
-    workerRunner = createTaskRunner<T, R>({
-      name: "compose",
-      config: merged.helpers.length > 0 ? { helpers: merged.helpers } : undefined,
-      main: merged.main,
-      functions: [],
-      generateWorkerScript: (task, _dependencies, workerConfig) =>
-        merged.generateScript(task, workerConfig?.helpers),
-    });
-  }
+  flushWorkerSegment();
 
   let lifecycle: "open" | "closing" | "finalizing" | "finalized" = "open";
   let activeRuns = 0;
@@ -151,10 +160,8 @@ export function compose<T = any, R = any>(
   let rejectClose: ((error: Error) => void) | null = null;
   let disposePromise: Promise<void> | null = null;
 
-  const ownedRunners = (): TaskRunner<any, any>[] => [
-    ...(workerRunner ? [workerRunner] : []),
-    ...taskRunners,
-  ];
+  const ownedRunners = (): TaskRunner<any, any>[] =>
+    segments.map((segment) => segment.runner);
 
   const closeOwnedRunners = async (): Promise<void> => {
     const errors: Error[] = [];
@@ -233,18 +240,8 @@ export function compose<T = any, R = any>(
       const { signal, transfer } = normalizeTaskRunControl(control);
       let transferPending = transfer.length > 0;
 
-      if (workerRunner) {
-        result = await workerRunner.run(
-          result,
-          transferPending
-            ? { signal, transfer }
-            : signal,
-        );
-        transferPending = false;
-      }
-
-      for (const runner of taskRunners) {
-        result = await runner.run(
+      for (const segment of segments) {
+        result = await segment.runner.run(
           result,
           transferPending
             ? { signal, transfer }
@@ -305,5 +302,8 @@ export function compose<T = any, R = any>(
     run,
     close,
     dispose,
+    get size(): number {
+      return ownedRunners().reduce((sum, runner) => sum + (runner.size ?? 0), 0);
+    },
   } as Coroutine<T, R>;
 }
