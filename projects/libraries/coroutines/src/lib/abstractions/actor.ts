@@ -44,7 +44,6 @@ import type {
   ActorBusTarget,
 } from "./bus";
 export type { Actor, ActorExit, ActorOptions, Supervisor, SupervisorOptions } from "../worker/types";
-export { supervisor } from "./supervisor";
 export {
   createActorBusMessage,
   isActorBusMessage,

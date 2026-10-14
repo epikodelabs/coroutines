@@ -1,5 +1,17 @@
 import { ContextCancelledError, createAbortError, sleep } from "../utils";
 import type { Actor, ActorExit, ActorStopOptions, Supervisor, SupervisorOptions } from "../worker/types";
+import { ActorStoppedError } from "./actor";
+
+/**
+ * Rejection carried by requests that reach a supervisor while it is
+ * restarting or its ingress buffer is saturated.
+ */
+export class SupervisorBusyError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "SupervisorBusyError";
+  }
+}
 import {
   getActorInternals,
   registerActorBusTarget,
@@ -86,7 +98,7 @@ export function supervisor(
     rejectIngress(
       exit.reason === "error"
         ? exit.error
-        : new ContextCancelledError("supervisor stopped")
+        : new ActorStoppedError("supervisor stopped")
     );
     resolveDone(exit);
   };
@@ -134,9 +146,9 @@ export function supervisor(
       }
 
       restarts += 1;
-      restartController = new AbortController();
 
       if (restartDelay > 0) {
+        restartController = new AbortController();
         try {
           await sleep(restartDelay, restartController.signal);
         } catch (error) {
@@ -160,14 +172,7 @@ export function supervisor(
       let next: Actor | undefined;
       try {
         next = factory();
-        if (next.name !== first.name) {
-          const error = new Error(
-            `supervisor replacement name must remain "${first.name}"; received "${next.name}"`,
-          );
-          await tryActorInternals(next)?.stop();
-          next = undefined;
-          throw error;
-        }
+        assertReplacementName(next);
 
         bindCurrent(next);
         return;
@@ -189,11 +194,7 @@ export function supervisor(
   };
 
   const bindCurrent = (next: Actor) => {
-    if (next.name !== first.name) {
-      throw new Error(
-        `supervisor replacement name must remain "${first.name}"; received "${next.name}"`,
-      );
-    }
+    assertReplacementName(next);
 
     // The generation registers itself during actor(); replace that public
     // registration with the stable supervisor handle before exposing it as
@@ -221,6 +222,14 @@ export function supervisor(
   };
 
   const first = factory();
+
+  const assertReplacementName = (next: Actor): void => {
+    if (next.name !== first.name) {
+      throw new Error(
+        `supervisor replacement name must remain "${first.name}"; received "${next.name}"`,
+      );
+    }
+  };
 
   const handle: Supervisor = {
     get name() {
@@ -257,6 +266,15 @@ export function supervisor(
     ingress.push(entry);
     return true;
   };
+
+  const requestRejectionError = (): Error =>
+    settled || stopping
+      ? new ActorStoppedError("Supervised actor is stopped")
+      : new SupervisorBusyError(
+          capacity === 0
+            ? "Supervised actor is restarting"
+            : "Supervisor ingress capacity exceeded"
+        );
 
   setActorInternals(handle, {
     stop: async (options?: ActorStopOptions) => {
@@ -298,16 +316,10 @@ export function supervisor(
         return Promise.reject(createAbortError(signal));
       }
       if (settled || stopping) {
-        return Promise.reject(new Error("Supervised actor is stopped"));
+        return Promise.reject(new ActorStoppedError("Supervised actor is stopped"));
       }
       if (capacity === 0 || ingress.length >= capacity) {
-        return Promise.reject(
-          new Error(
-            capacity === 0
-              ? "Supervised actor is restarting"
-              : "Supervisor ingress capacity exceeded"
-          )
-        );
+        return Promise.reject(requestRejectionError());
       }
 
       return new Promise((resolve, reject) => {
@@ -331,7 +343,10 @@ export function supervisor(
           signal.addEventListener("abort", entry.abort, { once: true });
         }
 
-        ingress.push(entry);
+        if (!enqueue(entry)) {
+          cleanupPendingRequest(entry);
+          reject(requestRejectionError());
+        }
       });
     },
   });

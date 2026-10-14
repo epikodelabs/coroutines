@@ -1,6 +1,7 @@
 import {
   actor,
   ActorBusMessage,
+  ActorStoppedError,
   background,
   channel,
   ContextCancelledError,
@@ -13,6 +14,7 @@ import {
   select,
   send,
   supervisor,
+  SupervisorBusyError,
   withCancel,
 } from "../public-api";
 import {
@@ -1740,6 +1742,76 @@ idescribe("actor", () => {
     expect(supervised.running).toBe(false);
   });
 
+  it("rejects requests to a stopped supervisor with ActorStoppedError", async () => {
+    async function behavior(_msg: any, state: number) {
+      return state;
+    }
+
+    (globalThis as any).currentMainTask = behavior;
+    const name = nextActorName();
+    const supervised = supervisor(
+      () => actor(name, behavior, 0),
+      { maxRestarts: 1 },
+    );
+
+    (globalThis as any).lastMockWorker.emitError(new Error("first failure"));
+    await pause(20);
+    (globalThis as any).lastMockWorker.emitError(new Error("terminal failure"));
+    await supervised.done;
+
+    await expectAsync(
+      main.outbox.request(supervised, "state", undefined),
+    ).toBeRejectedWithError(ActorStoppedError);
+  });
+
+  it("rejects restart-window requests with SupervisorBusyError when capacity is zero", async () => {
+    async function behavior(msg: any, state: number) {
+      if (msg?.kind === "actor-bus" && msg.topic === "crash") {
+        throw new Error("behavior crashed");
+      }
+      return state;
+    }
+
+    (globalThis as any).currentMainTask = behavior;
+    const name = nextActorName();
+    const supervised = supervisor(
+      () => actor(name, behavior, 0),
+      { maxRestarts: 1, restartDelay: 25 },
+    );
+
+    main.outbox.send(supervised, "crash", undefined);
+    await pause(5);
+    expect(supervised.running).toBeFalse();
+
+    await expectAsync(
+      main.outbox.request(supervised, "state", undefined),
+    ).toBeRejectedWithError(SupervisorBusyError, /restarting/);
+
+    await pause(35);
+    await main.outbox.stop(supervised);
+  });
+
+  it("completes a restart-then-stop cycle when restartDelay is zero", async () => {
+    async function behavior(_msg: any, state: number) {
+      return state;
+    }
+
+    (globalThis as any).currentMainTask = behavior;
+    const name = nextActorName();
+    const supervised = supervisor(
+      () => actor(name, behavior, 7),
+      { maxRestarts: 2, restartDelay: 0 },
+    );
+
+    (globalThis as any).lastMockWorker.emitError(new Error("restart generation"));
+    await pause(25);
+    expect(supervised.running).toBeTrue();
+    expect(await main.outbox.request(name, "state", "state")).toBe(7);
+
+    await main.outbox.stop(name);
+    expect((await supervised.done).reason).toBe("stopped");
+  });
+
 
 
   it("behavior failure terminates the actor generation", async () => {
@@ -1842,7 +1914,7 @@ idescribe("actor", () => {
     const first = main.outbox.request(supervised, "first", undefined);
     await expectAsync(
       main.outbox.request(supervised, "overflow", undefined)
-    ).toBeRejectedWithError(/capacity exceeded/);
+    ).toBeRejectedWithError(SupervisorBusyError, /capacity exceeded/);
 
     await expectAsync(first).toBeResolved();
     await main.outbox.stop(supervised);
