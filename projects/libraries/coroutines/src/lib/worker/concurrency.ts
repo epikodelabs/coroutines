@@ -466,9 +466,26 @@ const __withTimeout = (parent, ms) => {
   }
 
   const [ctx, cancel] = __withCancel(parent);
-  const timer = setTimeout(() => cancel(new __contextCancelledError("context timeout after " + ms + "ms")), ms);
-  ctx.done.finally(() => clearTimeout(timer));
-  return [ctx, cancel];
+  let watchdog;
+
+  try {
+    // Keep structural parity with the main-thread withTimeout: the worker's
+    // own timer is the primary scheduling path, and a host-timer watchdog
+    // acts as a lifecycle backstop. (There is deliberately no
+    // scheduleWorkerTimer here — this runtime already executes inside the
+    // actor worker, so both timers share its event loop.)
+    const timer = setTimeout(() => cancel(new __contextCancelledError("context timeout after " + ms + "ms")), ms);
+    watchdog = setTimeout(() => cancel(new __contextCancelledError("context timeout after " + ms + "ms")), ms);
+    ctx.done.finally(() => {
+      clearTimeout(timer);
+      if (watchdog !== undefined) clearTimeout(watchdog);
+    });
+    return [ctx, cancel];
+  } catch (error) {
+    if (watchdog !== undefined) clearTimeout(watchdog);
+    cancel(error);
+    throw error;
+  }
 };
 
 const __withDeadline = (parent, deadline) => {
@@ -638,7 +655,7 @@ const __select = async (cases, ctx = __background()) => {
 
         const internals = item.channel[__channelInternals];
         if (!internals) {
-          rejectSelection(new __contextCancelledError("channel does not support select"));
+          rejectSelection(new RangeError("channel does not support select"));
           break;
         }
 
@@ -653,42 +670,52 @@ const __select = async (cases, ctx = __background()) => {
 
       if (settled) return;
 
-      const startedOperations = operationStarts.map(({ index, item, controller }) => {
-        try {
-          return {
-            index,
-            item,
-            promise: Promise.resolve(item.run(controller.signal)),
-          };
-        } catch (error) {
-          return {
-            index,
-            item,
-            promise: Promise.reject(error),
-          };
+      void Promise.resolve().then(() => {
+        if (settled) {
+          return;
+        }
+        if (ctx.signal.aborted) {
+          rejectSelection(__createAbortError(ctx.signal));
+          return;
+        }
+
+        const startedOperations = operationStarts.map(({ index, item, controller }) => {
+          try {
+            return {
+              index,
+              item,
+              promise: Promise.resolve(item.run(controller.signal)),
+            };
+          } catch (error) {
+            return {
+              index,
+              item,
+              promise: Promise.reject(error),
+            };
+          }
+        });
+
+        for (const { index, item, promise } of startedOperations) {
+          promise.then(
+            (value) => {
+              settle({
+                index,
+                case: item,
+                op: item.op,
+                name: item.name,
+                value,
+                ok: true,
+              });
+            },
+            (error) => {
+              rejectSelection(
+                error instanceof Error ? error : new Error(error ? String(error) : "select operation failed"),
+                index
+              );
+            }
+          );
         }
       });
-
-      for (const { index, item, promise } of startedOperations) {
-        promise.then(
-          (value) => {
-            settle({
-              index,
-              case: item,
-              op: item.op,
-              name: item.name,
-              value,
-              ok: true,
-            });
-          },
-          (error) => {
-            rejectSelection(
-              error instanceof Error ? error : new Error(error ? String(error) : "select operation failed"),
-              index
-            );
-          }
-        );
-      }
     });
   } finally {
     while (cleanupFns.length > 0) {

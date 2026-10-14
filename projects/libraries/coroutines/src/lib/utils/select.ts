@@ -182,6 +182,18 @@ export const operation = <T>(
 ): SelectOperationCase<T> => ({ op: "operation", run, name });
 
 /**
+ * Fisher-Yates shuffle for randomizing select case evaluation order.
+ */
+function shuffledIndices(length: number): number[] {
+  const indices = Array.from({ length }, (_, i) => i);
+  for (let i = length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [indices[i], indices[j]] = [indices[j], indices[i]];
+  }
+  return indices;
+}
+
+/**
  * Waits on channel operations and cancellable async operations simultaneously,
  * returning the first contender that completes.
  *
@@ -194,18 +206,6 @@ export const operation = <T>(
  * @param ctx A cancellation context. Defaults to `background()`.
  * @returns A `SelectResult` describing which case was chosen and its value.
  */
-/**
- * Fisher-Yates shuffle for randomizing select case evaluation order.
- */
-function shuffledIndices(length: number): number[] {
-  const indices = Array.from({ length }, (_, i) => i);
-  for (let i = length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [indices[i], indices[j]] = [indices[j], indices[i]];
-  }
-  return indices;
-}
-
 export async function select<T = any>(cases: SelectCase<T>[], ctx: Context = background()): Promise<SelectResult<T>> {
   if (ctx.signal.aborted) throw createAbortError(ctx.signal);
   if (cases.length === 0) {
@@ -338,7 +338,7 @@ export async function select<T = any>(cases: SelectCase<T>[], ctx: Context = bac
         })[CHANNEL_INTERNALS];
 
         if (!internals) {
-          rejectSelection(new ContextCancelledError("channel does not support select"));
+          rejectSelection(new RangeError("channel does not support select"));
           break;
         }
 
