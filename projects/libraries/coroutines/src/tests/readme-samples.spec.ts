@@ -621,6 +621,36 @@ idescribe("README samples", () => {
       await main.outbox.stop(service);
     });
 
+    it("answers requests with utils.reply instead of the new state", async () => {
+      async function replyBehavior(message: any, state: number, utils: any) {
+        // Requests reach the behavior as bus envelopes: the payload lives
+        // under `message.payload`.
+        if (
+          message &&
+          typeof message === "object" &&
+          (message as any).payload?.wantReply === true
+        ) {
+          utils.reply({ count: state + 1 });
+        }
+        return state + 1;
+      }
+
+      const service = actor(nextName("reply"), replyBehavior, 0);
+
+      const reply = await main.outbox.request<any, { count: number }>(
+        service,
+        "count",
+        { wantReply: true },
+      );
+      expect(reply).toEqual({ count: 1 });
+
+      // Without utils.reply the response remains the new state.
+      const state = await main.outbox.request<any, number>(service, "count", {});
+      expect(state).toBe(2);
+
+      await main.outbox.stop(service);
+    });
+
     it("bounds the mailbox and reports pressure without terminating", async () => {
       async function mailboxBehavior(_message: any, state: number) {
           if (state === 0) {
@@ -638,9 +668,12 @@ idescribe("README samples", () => {
 
       expect(service.mailboxCapacity).toBe(1);
 
-      main.outbox.send(service, "m1", undefined); // occupies the behavior
+      // Requests queue in the mailbox; bus notifications use a separate
+      // bounded inbox with the same capacity, so they never crowd out
+      // request envelopes.
+      main.outbox.request(service, "m1", undefined); // occupies the behavior
       await pause(20);
-      main.outbox.send(service, "m2", undefined); // fills capacity 1
+      main.outbox.request(service, "m2", undefined); // fills request capacity 1
       await pause(20);
 
       const rejected = await capture(
@@ -651,7 +684,8 @@ idescribe("README samples", () => {
         "Actor mailbox capacity exceeded",
       );
 
-      main.outbox.send(service, "m4", undefined); // one-way overflow
+      main.outbox.send(service, "n1", undefined); // fills inbox capacity 1
+      main.outbox.send(service, "n2", undefined); // one-way overflow
       await waitFor(() => service.dropped === 1);
       expect(service.dropped).toBe(1);
 

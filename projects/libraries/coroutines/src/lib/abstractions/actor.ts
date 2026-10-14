@@ -20,7 +20,7 @@ import { createModuleWorker } from "../worker/module";
 import { buildActorWorkerRuntime } from "../worker/runtimes";
 import { ACTOR_CONCURRENCY_RUNTIME } from "../worker/concurrency";
 import { buildWorkerScript } from "../worker/script";
-import type { Actor, ActorExit, ActorOptions, ActorStopOptions, Supervisor, SupervisorOptions } from "../worker/types";
+import type { Actor, ActorExit, ActorOptions, ActorStopOptions } from "../worker/types";
 import {
   clearActorBusListeners,
   createActorBusMessage,
@@ -34,7 +34,6 @@ import {
   resolveActorTarget,
   setActorInternals,
   subscribeActorBus,
-  tryActorInternals,
   unregisterActorBusTarget,
 } from "./bus";
 import type {
@@ -112,11 +111,14 @@ export type WorkerOutbox<Q = any, D = any> = {
 /**
  * Inbox API for receiving messages routed to the actor worker.
  *
- * This includes direct messages from `main.outbox.send(...)` as well as actor-bus
- * deliveries routed through `main.bus`.
+ * `listen()` consumes the next bus message that arrives while the behavior
+ * is suspended: a message is delivered exactly once, either to a waiting
+ * `listen()` or as the next behavior invocation — never both. The message
+ * that triggered the current behavior is consumed by the behavior loop and
+ * is never returned by `listen()`.
  */
 export type WorkerInbox<Incoming = any> = {
-  /** Receives the next message routed to this actor, or `undefined` if the inbox closes. */
+  /** Consumes the next message routed to this actor, or `undefined` if the inbox closes. */
   listen: (signal?: AbortSignal) => Promise<Incoming | undefined>;
 };
 
@@ -134,7 +136,12 @@ export interface Initiator {
     /** Sends a one-way bus message to one or more named actor targets. */
     send<T = any>(to: Actor | string | string[], topic: string, payload: T, options?: Pick<ActorBusDispatchOptions, "from">): void;
 
-    /** Sends a request to an actor and awaits the response. */
+    /**
+     * Sends a request to an actor and awaits the response.
+     *
+     * Resolves with the value passed to `utils.reply(...)` by the behavior,
+     * or with the behavior's new state when it does not reply explicitly.
+     */
     request<Q = any, D = any>(to: Actor | string, topic: string, payload: Q, signal?: AbortSignal): Promise<D>;
 
     /** Stops the actor, terminates its worker, and releases resources. */
@@ -149,10 +156,15 @@ export interface Initiator {
   };
 }
 
-export type WorkerUtils<Q = any, D = any, Incoming = any, ToMain = any> = {
+export type WorkerUtils<Q = any, D = any, Incoming = any> = {
   concurrency: WorkerConcurrency;
   outbox: WorkerOutbox<Q, D>;
   inbox: WorkerInbox<Incoming>;
+  /**
+   * Overrides the response payload for the request currently being handled.
+   * Without it the response is the new state returned by the behavior.
+   */
+  reply: (value: D) => void;
 };
 
 /**
@@ -206,12 +218,23 @@ const toErrorMessage = (
 ): string => (error instanceof Error ? error.message : error ? String(error) : fallback);
 
 /**
- * Rebuilds typed rejections from error text that crossed the worker protocol,
- * which carries messages as strings. Known failures regain their class so
- * callers can branch with instanceof; anything else stays a plain Error.
+ * Rebuilds typed rejections from error data that crossed the worker protocol.
+ * The protocol carries an `errorName` alongside the message; known classes
+ * regain their identity so callers can branch with instanceof. The
+ * message-based fallback keeps compatibility with workers built before
+ * `errorName` existed.
  */
-const toRequestRejection = (message: string | undefined): Error => {
+const toRequestRejection = (
+  message: string | undefined,
+  errorName: string | undefined,
+): Error => {
   const text = message ?? "Actor request failed";
+  const types: Record<string, new (m: string) => Error> = {
+    ActorStoppedError,
+    ActorMailboxOverflowError,
+  };
+  const typed = errorName ? types[errorName] : undefined;
+  if (typed) return new typed(text);
   if (text === ACTOR_STOPPED_ERROR_MESSAGE) return new ActorStoppedError(text);
   if (text === "Actor mailbox capacity exceeded") {
     return new ActorMailboxOverflowError(text);
@@ -581,7 +604,7 @@ function createActor<S = any, Q = any, D = any, FromMain = any>(
     if (type === "response" && requestId) {
       takePendingRequest(requestId)?.resolve(payload);
     } else if (type === "error" && requestId) {
-      takePendingRequest(requestId)?.reject(toRequestRejection(msg.error));
+      takePendingRequest(requestId)?.reject(toRequestRejection(msg.error, msg.errorName));
     } else if (type === "error" && !requestId) {
       failActor(new Error(msg.error ?? "Actor behavior failed"));
     } else if (type === "overflow") {

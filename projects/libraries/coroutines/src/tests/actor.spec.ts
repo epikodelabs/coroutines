@@ -1,6 +1,7 @@
 import {
   actor,
   ActorBusMessage,
+  ActorMailboxOverflowError,
   ActorStoppedError,
   background,
   channel,
@@ -78,12 +79,14 @@ idescribe("actor", () => {
       terminated = false;
       readonly options: WorkerOptions | undefined;
       readonly sentMessages: any[] = [];
-      private workerInbox = channel<any>();
-      private busInbox = channel<any>();
+      private mailbox = channel<any>();
+      private actorInbox = channel<any>();
       private mailboxCapacity: number | undefined;
       private actorState: any = undefined;
       private actorRunning = false;
       private actorStopping = false;
+      private hasReply = false;
+      private replyValue: any = undefined;
       private workerId = 1;
       private taskId = "";
       private pendingWorkerRequests = new Map<string, { resolve: (value: any) => void; reject: (error: Error) => void }>();
@@ -162,16 +165,20 @@ idescribe("actor", () => {
           outbox,
           inbox: {
             listen: async (signal?: AbortSignal) => {
-              const result = await this.busInbox.receive(signal);
+              const result = await this.actorInbox.receive(signal);
               return result.ok ? result.value : undefined;
             },
+          },
+          reply: (value: any) => {
+            this.hasReply = true;
+            this.replyValue = value;
           },
           concurrency: {
             channel,
             receive,
             send,
             otherwise,
-  operation,
+            operation,
             select,
             background,
             withCancel,
@@ -186,8 +193,24 @@ idescribe("actor", () => {
         if (!mainTask) return;
 
         while (this.actorRunning && !this.terminated) {
-          const received = await this.workerInbox.receive();
-          if (!received.ok) break;
+          // Mailbox priority: request envelopes are answered before the next
+          // bus notification, mirroring the real actor runtime.
+          let received: any = this.mailbox.tryReceive();
+          if (received === undefined || !received.ok) {
+            received = this.actorInbox.tryReceive();
+          }
+
+          if (received === undefined || !received.ok) {
+            if (this.mailbox.closed && this.actorInbox.closed) break;
+
+            const cases: any[] = [];
+            if (!this.mailbox.closed) cases.push(receive(this.mailbox, "mailbox"));
+            if (!this.actorInbox.closed) cases.push(receive(this.actorInbox, "inbox"));
+            const selected = await select(cases, background());
+            if (!selected.ok) continue;
+            received = { ok: true, value: selected.value };
+          }
+
           const envelope = received.value;
 
           let item = envelope;
@@ -198,13 +221,22 @@ idescribe("actor", () => {
             item = envelope.msg;
           }
 
+          this.hasReply = false;
+          this.replyValue = undefined;
+
           try {
             const result = await Promise.resolve(mainTask(item, this.actorState, utils));
             this.actorState = result;
 
             if (requestId) {
               const event = {
-                data: { workerId: this.workerId, taskId: this.taskId, requestId, type: "response", payload: result }
+                data: {
+                  workerId: this.workerId,
+                  taskId: this.taskId,
+                  requestId,
+                  type: "response",
+                  payload: this.hasReply ? this.replyValue : result,
+                }
               } as any;
               this.onmessage?.(event);
               this.listeners["message"]?.forEach(fn => fn(event));
@@ -276,7 +308,8 @@ idescribe("actor", () => {
             this.actorState = msg.payload;
             this.mailboxCapacity = msg.mailboxCapacity;
             if (this.mailboxCapacity !== undefined) {
-              this.workerInbox = channel<any>(this.mailboxCapacity);
+              this.mailbox = channel<any>(this.mailboxCapacity);
+              this.actorInbox = channel<any>(this.mailboxCapacity);
             }
             this.actorStopping = false;
             this.actorRunning = true;
@@ -288,13 +321,15 @@ idescribe("actor", () => {
               pending.reject(new Error("Actor stopped"));
             }
             this.pendingWorkerRequests.clear();
-            this.workerInbox.close();
-            this.busInbox.close();
+            this.mailbox.close();
+            this.actorInbox.close();
           } else if (msg.type === "notify") {
+            if (this.actorStopping) return;
+
             const accepted =
               this.mailboxCapacity === undefined
-                ? (this.workerInbox.send(msg.payload).catch(() => {}), true)
-                : this.workerInbox.trySend(msg.payload);
+                ? (this.actorInbox.send(msg.payload).catch(() => {}), true)
+                : this.actorInbox.trySend(msg.payload);
 
             if (!accepted) {
               const overflowEvent = {
@@ -302,19 +337,29 @@ idescribe("actor", () => {
               } as any;
               this.onmessage?.(overflowEvent);
               this.listeners["message"]?.forEach(fn => fn(overflowEvent));
-            } else if (
-              msg.payload &&
-              typeof msg.payload === "object" &&
-              msg.payload.kind === "actor-bus"
-            ) {
-              this.busInbox.send(msg.payload).catch(() => {});
             }
           } else if (msg.type === "request" && msg.requestId) {
+            if (this.actorStopping) {
+              const stoppedEvent = {
+                data: {
+                  workerId: this.workerId,
+                  taskId: this.taskId,
+                  requestId: msg.requestId,
+                  type: "error",
+                  error: "Actor stopped",
+                  errorName: "ActorStoppedError",
+                }
+              } as any;
+              this.onmessage?.(stoppedEvent);
+              this.listeners["message"]?.forEach(fn => fn(stoppedEvent));
+              return;
+            }
+
             const envelope = { msg: msg.payload, requestId: msg.requestId, topic: msg.topic };
             const accepted =
               this.mailboxCapacity === undefined
-                ? (this.workerInbox.send(envelope).catch(() => {}), true)
-                : this.workerInbox.trySend(envelope);
+                ? (this.mailbox.send(envelope).catch(() => {}), true)
+                : this.mailbox.trySend(envelope);
 
             if (!accepted) {
               const overflowEvent = {
@@ -324,6 +369,7 @@ idescribe("actor", () => {
                   requestId: msg.requestId,
                   type: "error",
                   error: "Actor mailbox capacity exceeded",
+                  errorName: "ActorMailboxOverflowError",
                 }
               } as any;
               this.onmessage?.(overflowEvent);
@@ -359,7 +405,8 @@ idescribe("actor", () => {
         this.actorRunning = false;
         for (const handle of this.timers.values()) clearTimeout(handle);
         this.timers.clear();
-        this.workerInbox.close();
+        this.mailbox.close();
+        this.actorInbox.close();
         this.listeners = {};
         this.onmessage = null;
       }
@@ -546,7 +593,10 @@ idescribe("actor", () => {
     const second = main.outbox.request(a, "add", 2);
     const overflow = main.outbox.request(a, "add", 4);
 
-    await expectAsync(overflow).toBeRejectedWithError(/mailbox capacity exceeded/);
+    await expectAsync(overflow).toBeRejectedWithError(
+      ActorMailboxOverflowError,
+      /mailbox capacity exceeded/,
+    );
     expect(await first).toBe(1);
     expect(await second).toBe(3);
     expect(a.running).toBeTrue();
@@ -589,7 +639,10 @@ idescribe("actor", () => {
     const first = main.outbox.request(a, "work", undefined);
     const second = main.outbox.request(a, "work", undefined);
 
-    await expectAsync(second).toBeRejectedWithError(/mailbox capacity exceeded/);
+    await expectAsync(second).toBeRejectedWithError(
+      ActorMailboxOverflowError,
+      /mailbox capacity exceeded/,
+    );
     expect(await first).toBe(1);
     expect(a.running).toBeTrue();
 
@@ -809,7 +862,7 @@ idescribe("actor", () => {
     await new Promise(r => setTimeout(r, 10));
 
     await main.outbox.stop(a);
-    await expectAsync(main.outbox.request(a, "y", undefined)).toBeRejectedWithError("Actor stopped");
+    await expectAsync(main.outbox.request(a, "y", undefined)).toBeRejectedWithError(ActorStoppedError);
   });
 
   it("should reject in-flight requests when stopped", async () => {
@@ -829,7 +882,7 @@ idescribe("actor", () => {
     await new Promise(r => setTimeout(r, 10));
     await main.outbox.stop(a);
 
-    await expectAsync(pending).toBeRejectedWithError("Actor stopped");
+    await expectAsync(pending).toBeRejectedWithError(ActorStoppedError);
   });
 
   it("should support direct messages and requests", async () => {
@@ -1612,7 +1665,7 @@ idescribe("actor", () => {
     await pause(5);
     const stopping = main.outbox.stop(a);
 
-    await expectAsync(pending).toBeRejectedWithError("Actor stopped");
+    await expectAsync(pending).toBeRejectedWithError(ActorStoppedError);
     await stopping;
     await pause(30);
 
@@ -1762,6 +1815,80 @@ idescribe("actor", () => {
     await expectAsync(
       main.outbox.request(supervised, "state", undefined),
     ).toBeRejectedWithError(ActorStoppedError);
+  });
+
+  it("delivers each bus message once: to a waiting listen or as an invocation", async () => {
+    const seen: Array<[string, string]> = [];
+
+    async function behavior(msg: any, state: number, utils: any) {
+      if (msg?.kind === "actor-bus" && msg.topic === "collect") {
+        const first = await utils.inbox.listen();
+        seen.push(["listen", first?.topic]);
+        const second = await utils.inbox.listen();
+        seen.push(["listen", second?.topic]);
+        return state;
+      }
+      if (msg?.kind === "actor-bus") {
+        seen.push(["invoke", msg.topic]);
+        return state + 1;
+      }
+      return state;
+    }
+
+    (globalThis as any).currentMainTask = behavior;
+    const a = actor(nextActorName(), behavior, 0);
+
+    main.outbox.send(a, "collect", undefined);
+    await pause(5);
+    main.outbox.send(a, "m1", undefined);
+    await pause(5);
+    main.outbox.send(a, "m2", undefined);
+    await pause(10);
+    main.outbox.send(a, "m3", undefined); // arrives after listen() resolved: invocation
+    await pause(10);
+
+    // The old mirror design also delivered m1 and m2 as invocations.
+    expect(seen).toEqual([
+      ["listen", "m1"],
+      ["listen", "m2"],
+      ["invoke", "m3"],
+    ]);
+    await main.outbox.stop(a);
+  });
+
+  it("answers requests before consuming bus notifications while a behavior listens", async () => {
+    const seen: string[] = [];
+
+    async function behavior(msg: any, state: number, utils: any) {
+      if (msg?.kind === "actor-bus" && msg.topic === "hold") {
+        seen.push("hold");
+        const next = await utils.inbox.listen();
+        seen.push(next?.topic ?? "none");
+        return state + (next?.payload ?? 0);
+      }
+      if (msg?.kind === "actor-bus") {
+        seen.push(msg.topic);
+        return state;
+      }
+      return state;
+    }
+
+    (globalThis as any).currentMainTask = behavior;
+    const a = actor(nextActorName(), behavior, 0);
+
+    main.outbox.send(a, "hold", undefined);
+    await pause(10); // behavior is suspended in listen()
+    const pending = main.outbox.request(a, "state", undefined);
+    main.outbox.send(a, "release", 7);
+    await pause(10);
+
+    // The notify unblocked the behavior via listen (consumed, no second
+    // invocation); the request was then answered with the updated state.
+    // Requests reach the behavior as bus envelopes, hence the "state" entry.
+    expect(await pending).toBe(7);
+    expect(seen).toEqual(["hold", "release", "state"]);
+
+    await main.outbox.stop(a);
   });
 
   it("rejects restart-window requests with SupervisorBusyError when capacity is zero", async () => {

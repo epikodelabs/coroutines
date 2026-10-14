@@ -24,6 +24,8 @@ export type WorkerProtocolMessage = {
   type: WorkerProtocolMessageType;
   payload?: any;
   error?: string;
+  /** Typed error class name carried alongside `error` for rehydration. */
+  errorName?: string;
   requestId?: string;
   /** Direct actor or main-thread request/message target. */
   to?: string | string[];
