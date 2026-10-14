@@ -414,7 +414,17 @@ Timeout and deadline contexts clean up their timers when the context settles for
 
 Application data is passed explicitly through normal arguments and objects — never stored in the cancellation tree.
 
-The error types are `ContextCancelledError` (contexts, groups, select) and `ChannelClosedError` (channels). Cancellation reasons given to `cancel(reason)` are surfaced as-is when they are `Error` instances.
+The error types are:
+
+- `ContextCancelledError` — contexts, groups, select
+- `ChannelClosedError` — channels
+- `RunnerClosedError` — closed or disposed coroutine/compose runners
+- `GroupClosedError` — groups that no longer accept children
+- `ActorStoppedError` — actors that stopped, including buffered supervisor ingress
+- `ActorMailboxOverflowError` — requests that hit a saturated actor mailbox
+- `SupervisorBusyError` — requests that reach a supervisor while it is restarting or its ingress is full
+
+Cancellation reasons given to `cancel(reason)` are surfaced as-is when they are `Error` instances.
 
 ## Timing
 
@@ -506,7 +516,7 @@ const downloads = waitGroup();
 
 for (const url of urls) {
   downloads.add();
-  downloadOne(url).then(() => downloads.done());
+  downloadOne(url).finally(() => downloads.done());
 }
 
 await downloads.wait(signal);
@@ -588,8 +598,9 @@ main.inbox.clear();                                           // drop all bus li
 Behaviors receive a `utils` object with three parts:
 
 - `utils.concurrency` — the worker-side mirror of the standalone API: `channel()`, `receive()`, `send()`, `otherwise()`, `operation()`, `select()`, `background()`, `withCancel()`, `withTimeout()`, `withDeadline()`, `sleep()`, plus the error classes. Nothing needs to be imported inside a behavior; `sleep()` here uses the actor worker's own event loop.
-- `utils.outbox` — `request(to, topic, payload)` (use `"main"` to reach the main-thread side) and `send(to, topic, payload)` for actor-to-actor messaging.
-- `utils.inbox` — `listen(signal?)` resolves the next message routed to this actor, or `undefined` once the inbox closes.
+- `utils.outbox` — `request(to, topic, payload)` (use `"main"` to reach the main-thread side) and `send(to, topic, payload)` for actor-to-actor messaging. Requests to `"main"` require a main-thread handler registered with `registerActorRequestHandler("main", (topic, payload, message) => …)` (unregister with `unregisterActorRequestHandler`); messages routed between actors use the bus envelope helpers `createActorBusMessage` / `isActorBusMessage`.
+- `utils.reply` — `reply(value)` overrides the response payload for the request currently being handled. Without it, a request resolves with the behavior's new state, so `reply()` lets small answers flow back without cloning the whole state.
+- `utils.inbox` — `listen(signal?)` **consumes** the next bus message that arrives while the behavior is suspended: each message is delivered exactly once, either to a waiting `listen()` or as the next behavior invocation — never both. The message that triggered the current behavior is never returned by `listen()`. It resolves `undefined` once the inbox closes.
 
 ### Mailbox capacity and pressure
 
@@ -603,7 +614,8 @@ service.dropped;         // one-way overflow count
 ```
 
 - Omit `capacity` for the default unbounded mailbox.
-- Requests that arrive after saturation reject with `Actor mailbox capacity exceeded`.
+- Requests that arrive after saturation reject with `ActorMailboxOverflowError` (`Actor mailbox capacity exceeded`).
+- Bus notifications wait in a separate bounded inbox with the same capacity, so they can never crowd out request envelopes; the two streams together can buffer up to twice the configured capacity.
 - One-way sends cannot return a rejection, so they are dropped, counted in `dropped`, and warned.
 - Saturation does **not** terminate the actor.
 - `capacity: 0` provides rendezvous-like admission: a message is accepted only when the behavior loop is ready to receive it.
@@ -669,9 +681,10 @@ const pipeline = compose(parseStage, transformStage, encodeStage);
 const output = await pipeline.run(input);
 ```
 
-- `CoroutineScript` stages (produced by `coroutine()`) are merged into a single worker script, so the whole pipeline runs inside one worker task per concurrent invocation — intermediate results never cross a worker boundary.
-- `TaskRunner` inputs are chained on the main thread after the worker stage completes.
-- The composed runner exposes the same `run()` / `close()` / `dispose()` contract as a single coroutine.
+- Consecutive `CoroutineScript` stages (produced by `coroutine()`) are fused into one worker segment, so a segment's stages run inside a single worker task per concurrent invocation — intermediate results never cross a worker boundary.
+- Segments and `TaskRunner` inputs execute **strictly in argument order**: `compose(runnerA, coroutineB)` runs `runnerA` on the main thread, then `coroutineB` in its worker. Interleaved chains therefore pay one worker round-trip per segment.
+- The composed runner exposes the same `run()` / `close()` / `dispose()` contract as a single coroutine, and `size` reports the sum of the owned runners' worker counts.
+- **Compose does not dispose its inputs.** The composed runner owns only the fused worker segments; the original coroutines and task runners passed in remain the caller's responsibility (dispose them separately, as the samples do).
 
 **Lifecycle ownership:** once `close()` begins it rejects new pipeline runs, but a run already admitted is allowed to traverse **every** composed stage before any owned runner is closed — closing stage 2 while an admitted run is still finishing stage 1 would violate the drain guarantee. `close()` attempts to close every owned stage even if one stage reports an error. `dispose()` remains immediate and can override a concurrent graceful close; the close promise is settled by that teardown rather than left pending.
 
@@ -750,8 +763,13 @@ for (let i = 0; i < 4; i++) {
   });
 }
 
-await Promise.all(inputs.map((job) => input.send(job)));
-input.close();
+workers.spawn(async (signal) => {
+  try {
+    for (const job of inputs) await input.send(job, signal);
+  } finally {
+    input.close();
+  }
+});
 
 try {
   await workers.wait();

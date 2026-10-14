@@ -902,8 +902,13 @@ idescribe("README samples", () => {
         id: String(i),
         value: i,
       }));
-      await Promise.all(inputs.map((job) => input.send(job)));
-      input.close();
+      workers.spawn(async (signal) => {
+        try {
+          for (const job of inputs) await input.send(job, signal);
+        } finally {
+          input.close();
+        }
+      });
 
       await workers.wait();
       output.close();
