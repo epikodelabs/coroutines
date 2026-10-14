@@ -26,14 +26,14 @@ Coroutines code answers five questions explicitly:
 
 The most important boundary is:
 
-> **`group()` owns when work may start; `coroutine()` owns where worker work executes.**
+> **`coroutine()` defines worker code; `group().executor()` owns when and where it runs.**
 
 Each primitive keeps its own responsibility and composes with the others:
 
 | Concept | Owns | Does not own |
 | --- | --- | --- |
-| `coroutine()` | Stateless worker execution, worker reuse, worker lifecycle | Concurrency policy, persistent state |
-| `group()` | Structured child lifetime, FIFO admission, concurrency bounds, sibling cancellation | Worker creation, shared resource permits |
+| `coroutine()` | Immutable worker-task code and metadata | Worker pools, concurrency policy, lifecycle |
+| `group()` | Structured child lifetime, FIFO admission, concurrency bounds, sibling cancellation, executor pool lifetime | Worker script content |
 | `channel()` | Communication, buffering, backpressure, closure | Task lifetime |
 | `select()` | Waiting atomically for one of several possible operations | Long-lived scheduling |
 | `Context` | Cancellation lifetime and deadlines | Application data |
@@ -44,21 +44,24 @@ Each primitive keeps its own responsibility and composes with the others:
 | `waitGroup()` | Dynamic completion counting across generations | Task ownership, value transport |
 | `actor()` | Persistent worker identity, state, mailbox | Restart policy |
 | `supervisor()` | Stable actor identity across failed generations, restart policy | State persistence |
-| `compose()` | Fusing worker-backed stages behind one runner lifecycle | Streaming/backpressure |
+| `compose()` | Fusing definitions into one worker script | Lifecycle, streaming/backpressure |
+| `pipeline()` | Main-thread sequencing of runnable steps | Ownership, worker lifecycle |
 | Transfer controls | Ownership transfer across worker boundaries | Shared-memory synchronization |
 
 ## Table of contents
 
 - [Coroutine](#coroutine)
-  - [Defining and running a coroutine](#defining-and-running-a-coroutine)
-  - [Elastic workers and `maxWorkers`](#elastic-workers-and-maxworkers)
+  - [Defining a coroutine](#defining-a-coroutine)
+  - [Running a definition: `group().executor()`](#running-a-definition-groupexecutor)
+  - [Elastic workers, `maxWorkers`, `idleTimeout`, and `size`](#elastic-workers-maxworkers-idletimeout-and-size)
   - [Cancelling a submission](#cancelling-a-submission)
-  - [Graceful lifecycle: `close()` and `dispose()`](#graceful-lifecycle-close-and-dispose)
+  - [Group-owned lifecycle](#group-owned-lifecycle)
   - [Module workers and imports](#module-workers-and-imports)
 - [Group](#group)
   - [Spawning and admission](#spawning-and-admission)
   - [Fail-fast failure and cancellation](#fail-fast-failure-and-cancellation)
   - [`wait()` and `settle()`](#wait-and-settle)
+  - [Child scopes](#child-scopes)
 - [Channel](#channel)
 - [Select](#select)
 - [Contexts and cancellation](#contexts-and-cancellation)
@@ -84,11 +87,11 @@ Each primitive keeps its own responsibility and composes with the others:
 
 ## Coroutine
 
-A coroutine is a **stateless worker-backed operation**. It owns the generated worker script, lazily creates workers as concurrent calls require them, reuses idle workers, and releases those resources through `close()` or `dispose()`.
+A coroutine is an **immutable worker-task definition**: the serialized task body, its helper functions, and any raw helper snippets. It owns nothing at runtime — no workers, no lifecycle, no concurrency policy. It is executed through a group-owned executor.
 
-It deliberately has **no default concurrency limit and no admission queue**. Calling `run()` means the operation has been admitted for execution: if no idle worker is available, the coroutine creates another one. Expressing *how many* operations may run at once belongs to `group()` or `semaphore()`, not to the coroutine.
+It deliberately has **no default concurrency limit and no admission queue**. The executor lazily creates workers as concurrent calls require them and reuses idle workers. Expressing *how many* operations may run at once belongs to `group()` or `semaphore()`, not to the coroutine.
 
-### Defining and running a coroutine
+### Defining a coroutine
 
 ```ts
 import { coroutine } from '@epikodelabs/coroutines';
@@ -101,9 +104,6 @@ const hash = coroutine<string, string>(
   (value) => expensiveHash(value),
   expensiveHash,
 );
-
-const result = await hash.run('hello');
-await hash.dispose();
 ```
 
 A coroutine worker only receives the serialized task body plus any helper functions passed after it. **Referenced outer-scope functions are not captured automatically** — `expensiveHash` must be listed explicitly so it is serialized into the worker script. A body that references a function that was not passed fails fast inside the worker with a `ReferenceError` naming the missing helper. Raw string snippets can be injected before the task code through the optional trailing options object (`{ helpers: string[] }`).
@@ -117,35 +117,60 @@ type CoroutineTask<T, R> = (
 ) => R | TransferResult<R> | Promise<R | TransferResult<R>>;
 ```
 
-### Elastic workers and `maxWorkers`
+### Running a definition: `group().executor()`
 
-The worker script is baked once. When `run()` is called, Coroutines reuses an idle worker if one exists; otherwise it lazily creates another worker for that concurrent invocation. Completed workers return to the coroutine's reusable worker list. There is deliberately no implicit `navigator.hardwareConcurrency` limit.
-
-An optional `maxWorkers` caps how many workers one coroutine may own:
+Definitions do not run themselves. A worker pool is created inside a structured scope, and the scope owns it:
 
 ```ts
-const hash = coroutine(taskFn, { maxWorkers: 8 });
+import { coroutine, group } from '@epikodelabs/coroutines';
+
+const hash = coroutine<string, string>(
+  (value) => expensiveHash(value),
+  expensiveHash,
+);
+
+const pool = group();
+const executor = pool.executor(hash, { maxWorkers: 8 });
+
+const result = await executor.run('hello');
+await pool.settle(); // drains admitted runs, closes the pool
+```
+
+- `executor(def, options?)` creates the pool and ties its lifetime to the group.
+- `settle()`/`wait()` stop the pool from accepting new runs, let already-admitted runs finish, terminate the workers, and await that teardown before resolving. After the group settled, `run()` rejects with `GroupClosedError`.
+- `cancel()` — or a sibling failure — disposes the pool immediately and rejects active runs.
+- The pool is created lazily: an unused executor costs nothing. Executors created by an ancestor group survive this group's settlement, so shared pools belong to the nearest shared parent scope (see [child scopes](#child-scopes)).
+
+### Elastic workers, `maxWorkers`, `idleTimeout`, and `size`
+
+The worker script is baked once. When `run()` is called, the executor reuses an idle worker if one exists; otherwise it lazily creates another worker for that concurrent invocation. Completed workers return to the executor's reusable worker list. There is deliberately no implicit `navigator.hardwareConcurrency` limit.
+
+An optional `maxWorkers` caps how many workers one executor may own:
+
+```ts
+const executor = pool.executor(hash, { maxWorkers: 8 });
 ```
 
 When the cap is reached and no worker is idle, further submissions wait FIFO for the next worker to free up (cancellable through their signal). This is a resource cap on worker creation — not a scheduling policy. Structured admission still belongs to `group()`.
 
-Elasticity also works in reverse: an optional `idleTimeout` reaps workers that stay idle longer than the given number of milliseconds, and the next `run()` recreates one on demand. Without it, workers are kept for the lifetime of the coroutine. The runner exposes `size` — the number of workers it currently owns — for observability:
+Elasticity also works in reverse: an optional `idleTimeout` reaps workers that stay idle longer than the given number of milliseconds, and the next `run()` recreates one on demand. Without it, workers are kept for the lifetime of the group. The executor exposes `size` — the number of workers it currently owns — for observability:
 
 ```ts
-const hash = coroutine(taskFn, { idleTimeout: 30_000 });
-hash.size; // owned worker count right now
+const executor = pool.executor(hash, { idleTimeout: 30_000 });
+executor.size; // owned worker count right now
 ```
 
-If several groups share the same coroutine, each group applies its own concurrency policy while the coroutine reuses the same idle worker list.
+If several groups run the same definition, each group creates its own executor with its own pool and concurrency policy.
 
-Worker-script blob URLs are acquired lazily on first execution, so constructing an unused coroutine does not reserve browser worker resources.
+Worker-script blob URLs are acquired lazily on first execution, so a definition that is never executed does not reserve browser worker resources.
 
 ### Cancelling a submission
 
 `run()` accepts either an `AbortSignal` or per-run execution options:
 
 ```ts
-const parse = coroutine(parseLargeDocument);
+const pool = group();
+const parse = pool.executor(coroutine(parseLargeDocument));
 const controller = new AbortController();
 
 const result = parse.run(source, controller.signal);
@@ -156,25 +181,18 @@ await result.catch(() => undefined);
 const otherResult = parse.run(source, { signal: controller.signal });
 ```
 
-A worker task cannot be pre-empted safely inside arbitrary JavaScript, so Coroutines cancels an active submission by **terminating only the worker that owns it**. Concurrent sibling submissions continue on their own workers. Work waiting behind a `group()` concurrency permit — or behind a `maxWorkers` cap — can be cancelled before a coroutine worker is ever needed.
+A worker task cannot be pre-empted safely inside arbitrary JavaScript, so Coroutines cancels an active submission by **terminating only the worker that owns it**. Concurrent sibling submissions continue on their own workers. Work waiting behind a `group()` concurrency permit — or behind a `maxWorkers` cap — can be cancelled before a worker is ever needed.
 
-`compose()` forwards the same cancellation signal through every runner stage.
+`pipeline()` forwards the same cancellation signal through every step.
 
-### Graceful lifecycle: `close()` and `dispose()`
+### Group-owned lifecycle
 
-Worker-backed task runners distinguish graceful closure from immediate teardown:
+Worker pools have no manual `close()`/`dispose()` obligations: the owning group performs both roles.
 
-```ts
-// Already-admitted work is allowed to finish.
-await hash.close();
+- `settle()`/`wait()` is the graceful boundary — **stop accepting, drain, release**. Admitted runs finish, then workers are terminated.
+- `cancel()` is the immediate boundary — **terminate now**. Active runs are rejected and worker resources are released.
 
-// New submissions are rejected from the moment close begins.
-```
-
-- `close()` means **stop accepting, drain, release**. It is idempotent and is the normal lifecycle boundary when submitted work must not be lost.
-- `dispose()` means **terminate now**. Active work is rejected and worker resources are released immediately.
-
-Both are part of the shared `TaskRunner` contract (implemented by `coroutine()` and `compose()`), because graceful ownership and forced teardown are different concurrency semantics, not conveniences.
+Because the pool lives inside a scope, forgetting to tear it down is impossible: the group's own completion disposes it.
 
 ### Module workers and imports
 
@@ -194,35 +212,39 @@ Coroutines does not wrap or rewrite `import()`. CDN and other absolute module UR
 
 Relative imports inside an inline serialized coroutine are intentionally not rewritten. Their natural base is the generated worker module URL rather than the source TypeScript module — use an absolute URL when an inline coroutine needs to load another module.
 
-Module loading does not change concurrency ownership: `coroutine()` owns worker execution and module instances, while `group()` still owns the number of concurrent operations.
+Module loading does not change concurrency ownership: `coroutine()` defines the worker code, while `group()` owns the pool and the number of concurrent operations.
 
 ## Group
 
-A group is the **structured owner of a dynamic set of concurrent operations**. Every accepted child is owned immediately: the group propagates failure, cancels siblings, bounds admission, and reports terminal state.
+A group is the **structured owner of a dynamic set of concurrent operations**. Every accepted child is owned immediately: the group propagates failure, cancels siblings, bounds admission, reports terminal state — and owns the worker pools of its executors.
 
 ```ts
-import { group } from '@epikodelabs/coroutines';
+import { coroutine, group } from '@epikodelabs/coroutines';
 
+const hash = coroutine<string, string>(
+  (value) => expensiveHash(value),
+  expensiveHash,
+);
+
+const pool = group();
+const executor = pool.executor(hash); // the pool's workers belong to the group
 const work = group({ concurrency: 4 });
 
 const results = inputs.map((input) =>
-  work.spawn((signal) => hash.run(input, signal)),
+  work.spawn((signal) => executor.run(input, signal)),
 );
 
-try {
-  await work.wait();
-  console.log(await Promise.all(results));
-} finally {
-  await hash.dispose();
-}
+await work.wait();
+console.log(await Promise.all(results));
+await pool.settle(); // no children; drains and closes the pool
 ```
 
-The number `4` is the only concurrency policy in this example. The group owns a FIFO admission queue: at most four children execute at once, and queued child operations **have not started yet** — their operation function has not been invoked, no coroutine has been called, and no transferable input has left the caller. When an active child finishes, the next queued child is admitted.
+The number `4` is the only concurrency policy in this example. The group owns a FIFO admission queue: at most four children execute at once, and queued child operations **have not started yet** — their operation function has not been invoked, no executor has been called, and no transferable input has left the caller. When an active child finishes, the next queued child is admitted.
 
 This separation is what keeps worker count out of the execution primitive:
 
-- `group()` owns task lifetime, failure propagation, cancellation, and concurrency.
-- `coroutine()` owns worker execution, worker reuse, transfer ownership, and worker lifecycle.
+- `group()` owns task lifetime, failure propagation, cancellation, concurrency, and executor pool lifetime.
+- `coroutine()` defines the worker code, its helpers, and transfer semantics.
 
 ### Spawning and admission
 
@@ -230,13 +252,16 @@ This separation is what keeps worker count out of the execution primitive:
 type GroupOptions = {
   concurrency?: number;      // maximum children executing at once
   signal?: AbortSignal;      // parent signal; aborting it cancels the group
+  failure?: 'propagate' | 'isolate'; // child-scope failure policy (default 'propagate')
 };
 
 interface TaskGroup {
   readonly signal: AbortSignal;   // shared by all children
-  readonly running: number;       // accepted children not yet settled (active + queued)
+  readonly running: number;       // accepted children not yet settled (active + queued + child scopes)
   readonly accepting: boolean;    // whether new children may still be accepted
   spawn<T>(operation: (signal: AbortSignal) => T | Promise<T>): Promise<T>;
+  executor<T, R>(definition: Coroutine<T, R>, options?: ExecutorOptions): Executor<T, R>;
+  group(options?: GroupOptions): TaskGroup; // child scope
   cancel(reason?: unknown): void;
   wait(): Promise<void>;
   settle(): Promise<GroupReport>;
@@ -252,13 +277,14 @@ Groups are fail-fast. The first child failure:
 1. closes the group to new work;
 2. aborts the group signal;
 3. cancels queued children before they start (reported as `cancelled`);
-4. asks active cooperative siblings to stop through the shared signal.
+4. asks active cooperative siblings to stop through the shared signal;
+5. disposes the group's executor pools.
 
 `cancel(reason?)` performs the same teardown explicitly. Passing a parent `signal` ties the group's lifetime to a wider scope: aborting the parent cancels the whole group. The parent listener is detached as soon as the last owned child finishes.
 
 ### `wait()` and `settle()`
 
-`wait()` closes the group, waits for every accepted child to settle, and throws the group-level reason — the first child failure, explicit cancellation, or parent cancellation.
+`wait()` closes the group, waits for every accepted child to settle, drains and closes every executor pool, and throws the group-level reason — the first child failure, explicit cancellation, or parent cancellation.
 
 `settle()` closes the group but returns a non-throwing report with outcomes in **spawn order**, not completion order:
 
@@ -282,6 +308,35 @@ for (const outcome of report.outcomes) {
 - `settle()` — inspect the full structured outcome.
 
 No separate task-collection or `Promise.allSettled()` abstraction is introduced.
+
+### Child scopes
+
+`group()` creates a child scope of the same structured tree:
+
+```ts
+const appWork = group();
+const transform = appWork.executor(pipeline); // shared pool at the app scope
+
+const importWork = appWork.group(); // per-import scope
+await importWork.spawn(() => transform.run(file));
+await importWork.wait();            // import scope settles; the pool survives
+```
+
+The structured-concurrency rules hold across the tree:
+
+- **Parent cancellation cancels every descendant** — aborting `appWork` cancels `importWork` and its operations.
+- **Child failure fails the parent** — an unhandled import failure propagates up, cancels sibling scopes, and makes `appWork.wait()` reject. A parent never reports success while owned work has failed.
+- **Parent settlement closes children** — `appWork.settle()` stops child scopes from accepting new spawns and awaits their full settlement, including their own executor pools.
+
+Recoverable background work opts out of upward propagation explicitly with an isolation boundary:
+
+```ts
+const imports = appWork.group({ failure: 'isolate' });
+
+imports.spawn(() => retryImport(job)); // a failure stays inside `imports`
+```
+
+An isolated scope still receives parent cancellation and still counts toward parent settlement — only the upward *failure* flow is suppressed. `settle()` on the isolated scope observes its outcomes.
 
 ## Channel
 
@@ -673,32 +728,45 @@ All messaging goes through the stable supervisor identity, so callers never reta
 
 ## Compose
 
-`compose()` chains worker-backed stages behind **one** `Coroutine` lifecycle. Stages whose input/output types match are validated at compile time:
+`compose()` fuses multiple definitions into **one** immutable definition. Stages whose input/output types match are validated at compile time, and the fused stages run inside a single worker task per invocation — intermediate results never cross a worker boundary.
 
 ```ts
-const pipeline = compose(parseStage, transformStage, encodeStage);
+const fused = compose(parseStage, transformStage, encodeStage);
 
-const output = await pipeline.run(input);
+const pool = group();
+const output = await pool.executor(fused).run(input);
+await pool.settle();
 ```
 
-- Consecutive `CoroutineScript` stages (produced by `coroutine()`) are fused into one worker segment, so a segment's stages run inside a single worker task per concurrent invocation — intermediate results never cross a worker boundary.
-- Segments and `TaskRunner` inputs execute **strictly in argument order**: `compose(runnerA, coroutineB)` runs `runnerA` on the main thread, then `coroutineB` in its worker. Interleaved chains therefore pay one worker round-trip per segment.
-- The composed runner exposes the same `run()` / `close()` / `dispose()` contract as a single coroutine, and `size` reports the sum of the owned runners' worker counts.
-- **Compose does not dispose its inputs.** The composed runner owns only the fused worker segments; the original coroutines and task runners passed in remain the caller's responsibility (dispose them separately, as the samples do).
+- `compose()` accepts only definitions produced by `coroutine()` (or another `compose()`); anything else throws a `TypeError`. Nested composes are flattened into their leaf stages.
+- The result is a definition like any other: it owns no workers and has no lifecycle — run it through `group().executor()`.
+- The input definitions are untouched and reusable; nothing is disposed by `compose()`.
 
-**Lifecycle ownership:** once `close()` begins it rejects new pipeline runs, but a run already admitted is allowed to traverse **every** composed stage before any owned runner is closed — closing stage 2 while an admitted run is still finishing stage 1 would violate the drain guarantee. `close()` attempts to close every owned stage even if one stage reports an error. `dispose()` remains immediate and can override a concurrent graceful close; the close promise is settled by that teardown rather than left pending.
-
-**Cancellation:** `compose()` forwards the run signal through every stage.
-
-**Transfer:** an input transfer list applies to the first worker-backed stage only — it is never reused for later stages after ownership has moved. Intermediate transfer wrappers are unwrapped locally, and only a final-stage transfer is posted back to the caller.
+**Transfer:** an input transfer list applies to the whole fused task — intermediate transfer wrappers are unwrapped locally, and only a final-stage transfer is posted back to the caller.
 
 Composition is for worker-stage fusion, **not** for streaming dataflow — see [Streaming work by composition](#streaming-work-by-composition).
+
+### Main-thread sequencing: `pipeline()`
+
+When stages must run on the main thread — or when already-owned executors need chaining — `pipeline()` orders runnable steps sequentially:
+
+```ts
+const chain = pipeline(stepOne, groupA.executor(def), stepTwo);
+const output = await chain.run(input);
+```
+
+- A pipeline owns nothing: steps keep their own groups and worker pools. A step whose group has settled rejects the run with that group's error.
+- The run signal is forwarded to every step; an input transfer list applies to the first step only.
+- Steps are drained per executor: settle each pool's group to close it. `pipeline()` itself has no `close()`/`dispose()`/`size` — there is nothing for it to own.
 
 ## Transferable ownership
 
 Large `ArrayBuffer`, `MessagePort`, `ImageBitmap`, and other transferable values can move across the worker boundary without structured-clone copying. Input ownership is declared on the existing run call:
 
 ```ts
+const pool = group();
+const transform = pool.executor(def);
+
 const result = await transform.run(buffer, { transfer: [buffer] });
 
 // `buffer` is detached once it is posted to the worker.
@@ -707,7 +775,7 @@ const result = await transform.run(buffer, { transfer: [buffer] });
 Worker task functions mark a result for transfer back through the injected utilities:
 
 ```ts
-const transform = coroutine<ArrayBuffer, ArrayBuffer>(
+const def = coroutine<ArrayBuffer, ArrayBuffer>(
   (buffer, { transfer }) => {
     mutate(new Uint8Array(buffer));
     return transfer(buffer, buffer);
@@ -721,7 +789,7 @@ The rules, precisely:
 - The transfer wrapper is worker-internal: callers receive the value directly, never a wrapper object.
 - Duplicate entries in a transfer list are rejected **before** the post where Coroutines owns the list.
 - A submission transfers its objects only when it is actually posted to a worker. Cancellation before worker execution — including sitting behind a group permit — leaves its transferables owned by the caller.
-- Because group admission happens before coroutine execution, transferables belonging to queued group children stay with the caller until that child is admitted.
+- Because group admission happens before executor execution, transferables belonging to queued group children stay with the caller until that child is admitted.
 
 Transfer is an ownership operation: once posted successfully, the sender no longer owns a transferred `ArrayBuffer`.
 
@@ -731,17 +799,20 @@ Coroutines does not wrap `SharedArrayBuffer` or `Atomics`. Those platform primit
 
 ## Streaming work by composition
 
-Coroutines does not add a separate pipeline abstraction for bounded streaming work. Channels provide backpressure, groups own lifetime and failure propagation, and coroutines own worker execution:
+Streaming needs no dedicated pipeline abstraction. Channels provide backpressure, groups own lifetime and failure propagation, and group-owned executors own worker execution:
 
 ```ts
 const input = channel<Job>(8);
 const output = channel<Result>(8);
+const pool = group();
 const workers = group();
 
-const handleJob = coroutine<Job, Result>((job) => ({
-  id: job.id,
-  value: job.value * 2,
-}));
+const handleJob = pool.executor(
+  coroutine<Job, Result>((job) => ({
+    id: job.id,
+    value: job.value * 2,
+  })),
+);
 
 const consume = (async () => {
   const results: Result[] = [];
@@ -778,10 +849,10 @@ try {
 }
 
 const results = await consume;
-await handleJob.dispose();
+await pool.settle(); // drains the executor's workers
 ```
 
-The composition remains explicit: channel capacity bounds data in flight, the number of spawned workers bounds parallel processing, `group()` owns worker-loop lifetime and failure propagation, and the coroutine owns only worker execution and reuse.
+The composition remains explicit: channel capacity bounds data in flight, the number of spawned workers bounds parallel processing, `group()` owns worker-loop lifetime, failure propagation, and the executor pool, and the definition owns only the worker code.
 
 ## Choosing between neighboring concepts
 
@@ -835,7 +906,7 @@ These rules add no new primitives; they tighten the lifecycle guarantees of the 
 - Cancellation and failure close structured ownership immediately: a cancelled or failed `group()` reports `accepting === false` before `wait()`/`settle()` is called, and its parent abort listener is detached as soon as the last owned child finishes. `wait()`/`settle()` then establish the final closed boundary for `spawn()`.
 - Task-group reports are complete by construction and never contain internal placeholder states.
 - `select()` registration is defensive on its own — see [Select](#select) for the exact invariants.
-- Coroutine workers are tested under lifecycle pressure: graceful close lets already-admitted work finish, while `dispose()` may escalate an in-progress close and settle the close promise without stranding callers.
+- Executor pools are tested under lifecycle pressure: group settle lets already-admitted runs finish and terminates every worker before resolving, while cancel may escalate an in-progress drain without stranding callers.
 - The shared timer runtime binds its cached worker to the host `Worker` constructor that created it; if the host changes while idle — for example between isolated browser test environments — the old worker is discarded rather than reused. Test mocks implement the same `set`/`clear` timer protocol, so restart delays, context timeouts, and timer tests exercise identical scheduling semantics.
 
 ## Design rule

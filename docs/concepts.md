@@ -8,8 +8,8 @@ This document explains **what each concept means, what it owns, what it does not
 
 | Concept | Owns | Does not own |
 | --- | --- | --- |
-| `coroutine()` | Stateless worker execution, worker reuse, worker lifecycle | Concurrency policy, persistent state |
-| `group()` | Structured child lifetime, FIFO admission, concurrency bounds, sibling cancellation | Worker creation, shared resource permits |
+| `coroutine()` | Immutable worker-task code and metadata | Worker pools, concurrency policy, lifecycle |
+| `group()` | Structured child lifetime, FIFO admission, concurrency bounds, sibling cancellation, executor pool lifetime | Worker script content |
 | `channel()` | Communication, buffering, backpressure, closure | Task lifetime |
 | `select()` | Waiting atomically for one of several possible operations | Long-lived scheduling |
 | `semaphore()` | Shared permit budget | Task ownership |
@@ -20,16 +20,17 @@ This document explains **what each concept means, what it owns, what it does not
 | `sleep()` | Cancellable delay | Repetition or scheduling policy |
 | `actor()` | Persistent worker identity, state, mailbox | Restart policy |
 | `supervisor()` | Stable actor identity across failed generations and restart policy | State persistence |
-| `compose()` | Fusing worker-backed stages behind one runner lifecycle | Streaming/backpressure |
+| `compose()` | Fusing definitions into one worker script | Lifecycle, streaming/backpressure |
+| `pipeline()` | Main-thread sequencing of runnable steps | Ownership, worker lifecycle |
 | transfer controls | Ownership transfer across worker boundaries | Shared-memory synchronization |
 
 The most important boundary is:
 
-> **`group()` owns when work may start; `coroutine()` owns where worker work executes.**
+> **`coroutine()` defines worker code; `group().executor()` owns when and where it runs.**
 
 ## Coroutine
 
-A coroutine is a **stateless worker-backed operation**.
+A coroutine is an **immutable worker-task definition**: the serialized task body, its helper functions, and any raw helper snippets. It owns nothing at runtime — no workers, no lifecycle, no concurrency policy.
 
 ```ts
 import { coroutine } from '@epikodelabs/coroutines';
@@ -41,13 +42,23 @@ function expensiveHash(value: string): string {
 const hash = coroutine((value: string) => {
   return expensiveHash(value);
 }, expensiveHash);
-
-const result = await hash.run('hello');
 ```
 
-A coroutine owns the generated worker script, lazily creates workers as concurrent calls require them, reuses idle workers, and releases those resources through `close()` or `dispose()`.
+A definition runs through a group-owned executor:
 
-It deliberately has **no concurrency limit and no admission queue**. Calling `run()` means the operation has been admitted for execution. If an idle worker is unavailable, the coroutine may create another worker.
+```ts
+import { group } from '@epikodelabs/coroutines';
+
+const pool = group();
+const executor = pool.executor(hash, { maxWorkers: 8 });
+
+const result = await executor.run('hello');
+await pool.settle(); // drains admitted runs, closes the pool
+```
+
+The executor owns the generated worker script, lazily creates workers as concurrent calls require them, and reuses idle workers. Its lifetime belongs to the group: `settle()`/`wait()` drain admitted runs and terminate the workers; `cancel()` — or a sibling failure — disposes them immediately. After the group closed, `run()` rejects with `GroupClosedError`.
+
+It deliberately has **no concurrency limit and no admission queue**. Calling `run()` means the operation has been admitted for execution. If an idle worker is unavailable, the executor may create another worker.
 
 Use `coroutine()` when the operation is stateless and should execute away from the caller thread.
 
@@ -60,13 +71,13 @@ Do not use it to express how many application tasks may execute at once. That be
 ```ts
 const controller = new AbortController();
 
-const result = hash.run('hello', controller.signal);
+const result = executor.run('hello', controller.signal);
 
 controller.abort();
 await result.catch(() => undefined);
 ```
 
-Cancelling active arbitrary JavaScript cannot safely pre-empt the function in place, so Coroutines terminates the worker executing that submission. Other coroutine workers remain independent.
+Cancelling active arbitrary JavaScript cannot safely pre-empt the function in place, so Coroutines terminates the worker executing that submission. Other workers remain independent.
 
 ### Module workers
 
@@ -88,25 +99,29 @@ Inline coroutine functions are serialized into a generated blob module, so a rel
 
 ## Group
 
-A group is the **structured owner of dynamic asynchronous work**.
+A group is the **structured owner of dynamic asynchronous work** — and of its executor pools.
 
 ```ts
-import { group } from '@epikodelabs/coroutines';
+import { coroutine, group } from '@epikodelabs/coroutines';
+
+const pool = group();
+const executor = pool.executor(coroutine(hashTask)); // pool lifetime = pool's lifetime
 
 const work = group({ concurrency: 4 });
 
 const results = inputs.map((input) =>
-  work.spawn((signal) => hash.run(input, signal)),
+  work.spawn((signal) => executor.run(input, signal)),
 );
 
 await work.wait();
+await pool.settle();
 ```
 
 Every successful `spawn()` is immediately owned by the group. With `concurrency: 4`, at most four child operations are active. Additional children remain in the group's **FIFO admission queue** and their operation functions have not started yet.
 
 When an active child finishes, the next queued child is admitted.
 
-This distinction matters for worker-backed work: a queued group child has not called the coroutine yet, so it does not need a coroutine worker and has not transferred its input ownership.
+This distinction matters for worker-backed work: a queued group child has not called the executor yet, so it does not need a worker and has not transferred its input ownership.
 
 ### Failure and cancellation
 
@@ -115,13 +130,14 @@ Groups are fail-fast. The first child failure:
 1. closes the group to new work;
 2. aborts the group signal;
 3. cancels queued children before they start;
-4. asks active cooperative siblings to stop through the shared signal.
+4. asks active cooperative siblings to stop through the shared signal;
+5. disposes the group's executor pools.
 
 `cancel()` performs the same ownership teardown explicitly.
 
 ### `wait()` and `settle()`
 
-`wait()` closes the group, waits for every accepted child to settle, and throws the group-level failure or cancellation reason.
+`wait()` closes the group, waits for every accepted child to settle, drains and closes every executor pool, and throws the group-level failure or cancellation reason.
 
 `settle()` closes the group but returns a non-throwing report with outcomes in **spawn order**.
 
@@ -134,6 +150,21 @@ for (const outcome of report.outcomes) {
   }
 }
 ```
+
+### Child scopes
+
+`group()` creates a child scope of the same structured tree. Parent cancellation cancels every descendant; child failure fails the parent and cancels siblings; parent settlement closes children to new spawns and awaits their full settlement.
+
+```ts
+const appWork = group();
+const transform = appWork.executor(pipeline); // shared pool at the app scope
+
+const importWork = appWork.group(); // per-import scope
+await importWork.spawn(() => transform.run(file));
+await importWork.wait();            // import scope settles; the pool survives
+```
+
+Recoverable background work opts out of upward propagation with `group({ failure: 'isolate' })`: its failures stay local, while parent cancellation and settlement still reach it.
 
 Use `group()` whenever a scope owns a dynamic set of concurrent operations.
 
@@ -387,15 +418,19 @@ Its `capacity` has a specific meaning: it bounds traffic waiting **between gener
 
 ## Compose
 
-`compose()` combines worker-backed stages behind one `Coroutine` lifecycle.
+`compose()` fuses multiple definitions into one immutable definition.
 
 ```ts
-const pipeline = compose(parseScript, transformScript, encodeScript);
+const fused = compose(parseScript, transformScript, encodeScript);
 
-const output = await pipeline.run(input);
+const pool = group();
+const output = await pool.executor(fused).run(input);
+await pool.settle();
 ```
 
-Composition is for worker-stage fusion, not for streaming dataflow.
+`compose()` accepts only definitions and owns nothing: the result runs like any other definition. Composition is for worker-stage fusion, not for streaming dataflow.
+
+Main-thread sequencing uses `pipeline(...runnables)`, which orders steps and owns nothing — the steps keep their own groups.
 
 For streaming pipelines, compose the primitives directly:
 
@@ -412,12 +447,13 @@ type Result = {
   value: number;
 };
 
-const process = coroutine<Job, Result>((job) => {
+const pool = group();
+const process = pool.executor(coroutine<Job, Result>((job) => {
   return {
     id: job.id,
     value: job.value * 2,
   };
-});
+}));
 
 const work = group({ concurrency: 4 });
 
@@ -431,19 +467,23 @@ try {
   const results = await Promise.all(pending);
   console.log(results);
 } finally {
-  await process.dispose();
+  await pool.settle();
 }
 ```
 
 Here the channel owns backpressure, the number of spawned workers bounds
-parallel processing, the group owns worker-loop lifetime and failure
-propagation, and the coroutine owns worker execution.
+parallel processing, the group owns worker-loop lifetime, failure
+propagation, and the executor pool, and the definition owns the worker
+code.
 
 ## Transferable ownership
 
 Worker calls can transfer ownership of transferable objects instead of structured-cloning them.
 
 ```ts
+const pool = group();
+const transform = pool.executor(def);
+
 const output = await transform.run(input, {
   transfer: [input],
 });
@@ -469,7 +509,7 @@ const transform = coroutine<ArrayBuffer, ArrayBuffer>(
 
 Transfer is an ownership operation. Once posted successfully, the sender no longer owns a transferred `ArrayBuffer`.
 
-Because group admission happens before coroutine execution, transferables belonging to group-queued operations remain with the caller until that child is actually admitted and invokes the coroutine.
+Because group admission happens before executor execution, transferables belonging to group-queued operations remain with the caller until that child is actually admitted and invokes the executor.
 
 Coroutines does not wrap `SharedArrayBuffer` or `Atomics`; those platform primitives already provide shared-memory semantics.
 
@@ -511,9 +551,11 @@ A **group** owns a finite set of child operations and fails/cancels them as one 
 
 A **supervisor** owns a long-lived actor identity and may replace failed generations.
 
-### Compose or channels?
+### Compose, pipeline, or channels?
 
-Use **`compose()`** when several worker-backed transformations should behave as one task runner.
+Use **`compose()`** when several worker-backed transformations should fuse into one worker task.
+
+Use **`pipeline()`** when already-owned executors or main-thread steps must run in sequence.
 
 Use **channels + groups** when values flow continuously and backpressure/lifetime need to remain explicit.
 
@@ -524,9 +566,9 @@ Coroutines's primitives are small because ownership stays explicit.
 A useful way to read Coroutines code is to ask:
 
 1. **Who owns this work?** — usually a `group`, actor, or supervisor.
-2. **Where does it execute?** — a coroutine or actor worker.
+2. **Where does it execute?** — a group-owned executor or actor worker.
 3. **How does data move?** — ordinary values, channels, actor messages, or transferables.
 4. **How is pressure bounded?** — group concurrency, channel capacity, semaphore permits, or mailbox capacity.
-5. **How does it stop?** — `AbortSignal`, `Context`, group cancellation, runner lifecycle, or actor lifecycle.
+5. **How does it stop?** — `AbortSignal`, `Context`, group cancellation, or actor lifecycle.
 
 If one primitive appears to answer several of those questions at once, it is worth checking whether two smaller Coroutines concepts should be composed instead.
