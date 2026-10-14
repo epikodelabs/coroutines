@@ -4,7 +4,7 @@
   "scripts": {
     "ng": "ng",
     "start": "ng serve app1",
-    "build": "ng build app1 && ng build coroutines",
+    "build": "ng build app1 && ng build coroutines && node scripts/copy-package-assets.mjs",
     "build:app": "ng build app1",
     "build:lib": "ng build coroutines && node scripts/copy-package-assets.mjs",
     "watch": "ng build app1 --watch --configuration development",
