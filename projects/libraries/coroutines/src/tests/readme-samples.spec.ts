@@ -9,7 +9,6 @@ import {
   ContextCancelledError,
   CoroutineTask,
   GroupClosedError,
-  RunnerClosedError,
   Semaphore,
   TaskGroup,
   WorkerTaskUtils,
@@ -65,16 +64,20 @@ idescribe("README samples", () => {
   let nameCounter = 0;
   const nextName = (prefix: string) => `${prefix}-readme-${++nameCounter}`;
 
-  // Fresh coroutine per call: each test owns and disposes its own workers.
-  const makeHashCoroutine = () => {
+  // Fresh pool per call: each test owns its executor through its own group.
+  const makeHashPool = () => {
     function expensiveHash(value: string): string {
       return `${value}!`;
     }
 
-    return coroutine<string, string>(
-      (value) => expensiveHash(value),
-      expensiveHash,
+    const pool = group();
+    const hash = pool.executor(
+      coroutine<string, string>(
+        (value) => expensiveHash(value),
+        expensiveHash,
+      ),
     );
+    return { pool, hash };
   };
 
   // Resolves with the payload of the next bus message matching any of the
@@ -98,11 +101,11 @@ idescribe("README samples", () => {
 
   describe("coroutine", () => {
     it("defines and runs a coroutine with serialized helpers", async () => {
-      const hash = makeHashCoroutine();
+      const { pool, hash } = makeHashPool();
 
       const result = await hash.run("hello");
       expect(result).toBe("hello!");
-      await hash.dispose();
+      await pool.settle();
     });
 
     it("accepts the documented CoroutineTask shape", async () => {
@@ -120,21 +123,23 @@ idescribe("README samples", () => {
       async function taskFn(value: number): Promise<number> {
         return value + 1;
       }
-      const hash = coroutine(taskFn, { maxWorkers: 2 });
+      const pool = group();
+      const hash = pool.executor(coroutine(taskFn), { maxWorkers: 2 });
 
       const results = await Promise.all(
         Array.from({ length: 5 }, (_, i) => hash.run(i)),
       );
 
       expect(results).toEqual([1, 2, 3, 4, 5]);
-      await hash.dispose();
+      await pool.settle();
     });
 
     it("reaps idle workers after idleTimeout and recreates them on demand", async () => {
       async function increment(value: number): Promise<number> {
         return value + 1;
       }
-      const counter = coroutine(increment, { idleTimeout: 15 });
+      const pool = group();
+      const counter = pool.executor(coroutine(increment), { idleTimeout: 15 });
 
       expect(counter.size).toBe(0);
       await Promise.all([counter.run(1), counter.run(2), counter.run(3)]);
@@ -144,7 +149,7 @@ idescribe("README samples", () => {
       expect(await counter.run(4)).toBe(5);
       expect(counter.size).toBe(1);
 
-      await counter.dispose();
+      await pool.settle();
     });
 
     it("cancels a submission by signal and by options", async () => {
@@ -152,36 +157,39 @@ idescribe("README samples", () => {
         return text;
       }
 
-      const parse = coroutine(parseLargeDocument);
+      const parsePool = group();
+      const parse = parsePool.executor(coroutine(parseLargeDocument));
       const never = () => new Promise(() => undefined);
 
       const controller = new AbortController();
-      const throwaway = coroutine(never);
+      const throwawayPool = group();
+      const throwaway = throwawayPool.executor(coroutine(never));
       const pending = throwaway.run("x", controller.signal);
       controller.abort();
       expect(await capture(pending)).toBeInstanceOf(Error);
-      await throwaway.dispose();
+      await throwawayPool.settle();
 
       const otherController = new AbortController();
       const otherPending = parse.run("x", { signal: otherController.signal });
       otherController.abort();
       expect(await capture(otherPending)).toBeInstanceOf(Error);
 
-      await parse.dispose();
+      await parsePool.settle();
     });
 
-    it("lets close() drain admitted work and rejects new submissions", async () => {
+    it("lets settle() drain admitted work and rejects new submissions", async () => {
       async function slowTask(value: number): Promise<number> {
         await new Promise<void>((resolve) => setTimeout(resolve, 10));
         return value;
       }
-      const slow = coroutine(slowTask);
+      const pool = group();
+      const slow = pool.executor(coroutine(slowTask));
 
       const admitted = slow.run(1);
-      await slow.close();
+      const settling = pool.settle();
       expect(await admitted).toBe(1);
-      expect(await capture(slow.run(2))).toBeInstanceOf(RunnerClosedError);
-      await slow.dispose();
+      expect(await capture(slow.run(2))).toBeInstanceOf(GroupClosedError);
+      await settling;
     });
 
     it("supports absolute dynamic imports inside the module worker", async () => {
@@ -190,26 +198,28 @@ idescribe("README samples", () => {
         'return import("data:text/javascript,export default v => v.toUpperCase()")' +
           ".then((module) => module.default(value));",
       ) as (value: string) => Promise<string>;
-      const fix = coroutine(normalize);
+      const pool = group();
+      const fix = pool.executor(coroutine(normalize));
 
       expect(await fix.run("readme")).toBe("README");
-      await fix.dispose();
+      await pool.settle();
     });
 
     it("names the missing helper when a body references an unpassed function", async () => {
-      const broken = coroutine((value: string) => missingHelper(value));
+      const pool = group();
+      const broken = pool.executor(coroutine((value: string) => missingHelper(value)));
 
       const error = (await capture(broken.run("x"))) as Error;
       expect(error.message).toContain("missingHelper");
       expect(error.message).toContain("not captured automatically");
 
-      await broken.dispose();
+      await pool.settle();
     });
   });
 
   describe("group", () => {
     it("runs the structured concurrent work sample", async () => {
-      const hash = makeHashCoroutine();
+      const { pool, hash } = makeHashPool();
       const work = group({ concurrency: 4 });
 
       const inputs = ["a", "b", "c", "d", "e", "f"];
@@ -228,7 +238,7 @@ idescribe("README samples", () => {
           "f!",
         ]);
       } finally {
-        await hash.dispose();
+        await pool.settle();
       }
     });
 
@@ -801,18 +811,19 @@ idescribe("README samples", () => {
   });
 
   describe("compose", () => {
-    it("runs the pipeline sample through one lifecycle", async () => {
+    it("runs the fused pipeline sample through one group-owned pool", async () => {
       const parse = coroutine((input: string) => input.split(","));
       const transform = coroutine((values: string[]) =>
         values.map((value) => value.trim().toUpperCase()),
       );
       const encode = coroutine((values: string[]) => values.join("|"));
 
-      const pipeline = compose(parse, transform, encode);
-      const output = await pipeline.run("a, b, c");
+      const fused = compose(parse, transform, encode);
+      const pool = group();
+      const output = await pool.executor(fused).run("a, b, c");
 
       expect(output).toBe("A|B|C");
-      await pipeline.dispose();
+      await pool.settle();
     });
   });
 
@@ -822,12 +833,15 @@ idescribe("README samples", () => {
         for (let i = 0; i < bytes.length; i++) bytes[i] ^= 0xff;
       }
 
-      const transform = coroutine<ArrayBuffer, ArrayBuffer>(
-        (buffer, { transfer }) => {
-          mutate(new Uint8Array(buffer));
-          return transfer(buffer, buffer);
-        },
-        mutate,
+      const pool = group();
+      const transform = pool.executor(
+        coroutine<ArrayBuffer, ArrayBuffer>(
+          (buffer, { transfer }) => {
+            mutate(new Uint8Array(buffer));
+            return transfer(buffer, buffer);
+          },
+          mutate,
+        ),
       );
 
       const input = new ArrayBuffer(16);
@@ -845,12 +859,13 @@ idescribe("README samples", () => {
       // The result was transferred back and mutated in place.
       expect(new Uint8Array(output)[0]).toBe(0xff);
 
-      await transform.dispose();
+      await pool.settle();
     });
 
     it("keeps transferables with the caller when cancelled before posting", async () => {
       const input = new ArrayBuffer(8);
-      const runner = coroutine((_value: ArrayBuffer) => _value);
+      const runnerPool = group();
+      const runner = runnerPool.executor(coroutine((_value: ArrayBuffer) => _value));
       const work = group({ concurrency: 1 });
       work.spawn(async () => {
         await pause(20);
@@ -862,7 +877,7 @@ idescribe("README samples", () => {
 
       expect(await capture(queued)).toBeInstanceOf(Error);
       expect(input.byteLength).toBe(8); // never posted, still owned
-      await runner.dispose();
+      await runnerPool.settle();
     });
   });
 
@@ -871,10 +886,13 @@ idescribe("README samples", () => {
       type Job = { id: string; value: number };
       type Result = { id: string; value: number };
 
-      const handleJob = coroutine<Job, Result>((job) => ({
-        id: job.id,
-        value: job.value * 2,
-      }));
+      const pool = group();
+      const handleJob = pool.executor(
+        coroutine<Job, Result>((job) => ({
+          id: job.id,
+          value: job.value * 2,
+        })),
+      );
 
       const input = channel<Job>(8);
       const output = channel<Result>(8);
@@ -916,7 +934,7 @@ idescribe("README samples", () => {
       const results = await consume;
       expect(results.length).toBe(10);
       expect(results.map((r) => r.value).sort((a, b) => a - b)).toEqual([0, 2, 4, 6, 8, 10, 12, 14, 16, 18]);
-      await handleJob.dispose();
+      await pool.settle();
     });
   });
 });

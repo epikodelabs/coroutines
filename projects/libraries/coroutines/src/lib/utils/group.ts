@@ -1,4 +1,7 @@
 import { createAbortError, ContextCancelledError } from "./context";
+import { createDefinitionExecutor, isCoroutineDefinition } from "../worker/definition";
+import type { Coroutine, Executor, ExecutorOptions } from "../worker/types";
+import type { TaskRunControl } from "./transfer";
 
 /**
  * Thrown when a group no longer accepts children: after `wait()`/`settle()`,
@@ -25,6 +28,19 @@ export type GroupOptions = {
   concurrency?: number;
   /** Optional parent signal. Aborting it cancels the whole group. */
   signal?: AbortSignal;
+  /**
+   * Failure policy for this group.
+   *
+   * `"propagate"` (default) is the structured-concurrency rule: a child
+   * failure fails this group and — for a child scope — propagates to the
+   * parent, which cancels sibling work and makes `parent.wait()` reject.
+   *
+   * `"isolate"` suppresses upward propagation: this group's failures stay
+   * local, so a parent can contain recoverable background work. The parent
+   * still awaits this group's completion and still cancels it on its own
+   * cancellation.
+   */
+  failure?: "propagate" | "isolate";
 };
 
 /** Terminal outcome of one child, ordered by spawn order in a group report. */
@@ -62,7 +78,8 @@ export interface TaskGroup {
   /**
    * Number of accepted children that have not settled yet.
    *
-   * This includes both actively executing and queued children.
+   * This includes actively executing children, queued children, and child
+   * scopes created via `group()`.
    */
   readonly running: number;
   /** Whether new child operations may still be accepted. */
@@ -70,6 +87,30 @@ export interface TaskGroup {
 
   /** Accepts one child operation owned by this group. */
   spawn<T>(operation: GroupOperation<T>): Promise<T>;
+
+  /**
+   * Creates a worker-pool executor for a coroutine definition.
+   *
+   * The pool's lifetime belongs to this group: `settle()`/`wait()` stop it
+   * from accepting new runs, drain admitted runs, and terminate its workers;
+   * cancellation disposes it immediately. Runs submitted after the group
+   * closed reject with `GroupClosedError`. Executors created by an ancestor
+   * group survive this group's settlement — reuse them across child scopes
+   * by lifting ownership to the nearest shared parent.
+   */
+  executor<T, R>(definition: Coroutine<T, R>, options?: ExecutorOptions): Executor<T, R>;
+
+  /**
+   * Creates a child scope of this group.
+   *
+   * The child is aborted when this group is cancelled, and this group's
+   * `settle()`/`wait()` close the child to new spawns and await its full
+   * settlement (including its executor pools). By default child failures
+   * propagate to this group and fail it; pass `{ failure: "isolate" }` to
+   * contain a recoverable background scope. The child's own cancellation and
+   * settlement are local to the child.
+   */
+  group(options?: GroupOptions): TaskGroup;
 
   /** Cancels this group and every cooperative child operation. */
   cancel(reason?: unknown): void;
@@ -98,36 +139,54 @@ type QueuedChild = {
   reject: (error: Error) => void;
 };
 
+/**
+ * Internal handle shared between a group and its parent scope.
+ */
+type GroupInternals = {
+  readonly controller: AbortController;
+  readonly cancel: (reason?: unknown) => void;
+  readonly fail: (error: Error) => void;
+  readonly beginSettlement: () => void;
+  readonly adoptScope: (child: GroupInternals) => void;
+  /** Resolves when the group is closed and fully quiescent (children and executor pools). */
+  readonly whenDrained: Promise<void>;
+};
+
 const normalizeError = (reason: unknown): Error => {
   if (reason instanceof Error) return reason;
   if (reason === undefined) return new ContextCancelledError("task group cancelled");
   return new ContextCancelledError(String(reason));
 };
 
-/**
- * Creates a structured task group.
- *
- * This is intentionally different from `Promise.all()`: the group owns child
- * lifetime, propagates cancellation, cancels siblings on failure, queues excess
- * bounded work itself, and can report the terminal state of every owned child.
- */
-export function group(options: GroupOptions = {}): TaskGroup {
-  const { concurrency, signal: parentSignal } = options;
+function createGroup(
+  options: GroupOptions = {},
+  scopeParent?: GroupInternals,
+): { group: TaskGroup; internals: GroupInternals } {
+  const { concurrency, signal: parentSignal, failure = "propagate" } = options;
 
   if (concurrency !== undefined && (!Number.isInteger(concurrency) || concurrency <= 0)) {
     throw new RangeError("group concurrency must be a positive integer");
   }
+  if (failure !== "propagate" && failure !== "isolate") {
+    throw new RangeError('group failure must be "propagate" or "isolate"');
+  }
+
+  const isolateFailure = failure === "isolate";
 
   const controller = new AbortController();
   const limit = concurrency ?? Number.POSITIVE_INFINITY;
   const queue: QueuedChild[] = [];
   const waiters: GroupWaiter[] = [];
   const outcomes: Array<GroupOutcome | undefined> = [];
+  const executors: Executor[] = [];
+  const childScopes: GroupInternals[] = [];
 
   let active = 0;
   let running = 0;
   let accepting = true;
   let settlementRequested = false;
+  let drainsStarted = false;
+  let drainsPending = 0;
   let firstError: Error | undefined;
   let finalReport: GroupReport | undefined;
 
@@ -151,12 +210,23 @@ export function group(options: GroupOptions = {}): TaskGroup {
     return finalReport;
   };
 
+  const drainedResolvers: Array<() => void> = [];
+  const whenDrained = new Promise<void>((resolve) => {
+    drainedResolvers.push(resolve);
+  });
+  const checkDrained = (): void => {
+    if (running === 0 && drainsPending === 0 && (settlementRequested || !accepting)) {
+      for (const resolve of drainedResolvers.splice(0)) resolve();
+    }
+  };
+
   const settleWaiters = (): void => {
-    if (running !== 0 || waiters.length === 0) return;
+    if (running !== 0 || drainsPending !== 0 || waiters.length === 0) return;
 
     const report = createReport();
     const settled = waiters.splice(0, waiters.length);
     for (const waiter of settled) waiter.resolve(report);
+    checkDrained();
   };
 
   const onParentAbort = (): void => cancel(parentSignal?.reason);
@@ -171,6 +241,7 @@ export function group(options: GroupOptions = {}): TaskGroup {
     running -= 1;
     if (!accepting && running === 0) detachParent();
     settleWaiters();
+    checkDrained();
   };
 
   const cancelQueued = (): void => {
@@ -185,14 +256,39 @@ export function group(options: GroupOptions = {}): TaskGroup {
     }
   };
 
+  const startExecutorDrains = (): void => {
+    if (drainsStarted) return;
+    drainsStarted = true;
+
+    for (const executor of executors) {
+      drainsPending += 1;
+      void executor
+        .close()
+        .catch(() => undefined)
+        .finally(() => {
+          drainsPending -= 1;
+          settleWaiters();
+          checkDrained();
+        });
+    }
+  };
+
+  const disposeExecutors = (): void => {
+    for (const executor of executors) {
+      void executor.dispose().catch(() => undefined);
+    }
+  };
+
   const cancel = (
     reason: unknown = new ContextCancelledError("task group cancelled"),
   ): void => {
     accepting = false;
     if (!controller.signal.aborted) controller.abort(reason);
     cancelQueued();
+    disposeExecutors();
     if (running === 0) detachParent();
     settleWaiters();
+    checkDrained();
   };
 
   if (parentSignal?.aborted) {
@@ -202,14 +298,18 @@ export function group(options: GroupOptions = {}): TaskGroup {
     parentListenerAttached = true;
   }
 
-  const fail = (error: Error, outcomeIndex: number): void => {
+  const fail = (error: Error, outcomeIndex?: number): void => {
     if (firstError || controller.signal.aborted) return;
 
     firstError = error;
     accepting = false;
-    outcomes[outcomeIndex] = { status: "rejected", error };
+    if (outcomeIndex !== undefined) {
+      outcomes[outcomeIndex] = { status: "rejected", error };
+    }
     controller.abort(error);
     cancelQueued();
+    disposeExecutors();
+    if (!isolateFailure) scopeParent?.fail(error);
   };
 
   const pump = (): void => {
@@ -286,11 +386,54 @@ export function group(options: GroupOptions = {}): TaskGroup {
     return child;
   };
 
-  const settle = (): Promise<GroupReport> => {
+  const executor = <T, R>(
+    definition: Coroutine<T, R>,
+    options: ExecutorOptions = {},
+  ): Executor<T, R> => {
+    if (!isCoroutineDefinition(definition)) {
+      throw new TypeError(
+        "executor requires a definition created by coroutine() or compose()",
+      );
+    }
+    if (settlementRequested) throw new GroupClosedError();
+    if (controller.signal.aborted) throw createAbortError(controller.signal);
+    if (!accepting) throw new GroupClosedError();
+
+    const pool = createDefinitionExecutor(definition, options);
+    executors.push(pool);
+
+    // The wrapper re-checks the group state so group closure always surfaces
+    // as GroupClosedError instead of the pool's internal RunnerClosedError.
+    const run = (data: T, control?: TaskRunControl): Promise<R> => {
+      if (settlementRequested) return Promise.reject(new GroupClosedError());
+      if (controller.signal.aborted) return Promise.reject(createAbortError(controller.signal));
+      if (!accepting) return Promise.reject(new GroupClosedError());
+      return pool.run(data, control);
+    };
+
+    return {
+      get size() {
+        return pool.size;
+      },
+      run,
+      close: pool.close,
+      dispose: pool.dispose,
+    };
+  };
+
+  const beginSettlement = (): void => {
+    if (settlementRequested) return;
     settlementRequested = true;
     accepting = false;
+    startExecutorDrains();
+    for (const child of childScopes) child.beginSettlement();
+    checkDrained();
+  };
 
-    if (running === 0) {
+  const settle = (): Promise<GroupReport> => {
+    beginSettlement();
+
+    if (running === 0 && drainsPending === 0) {
       detachParent();
       return Promise.resolve(createReport());
     }
@@ -305,19 +448,78 @@ export function group(options: GroupOptions = {}): TaskGroup {
     if (report.error) throw report.error;
   };
 
-  return {
-    get signal() {
-      return controller.signal;
-    },
-    get running() {
-      return running;
-    },
-    get accepting() {
-      return accepting;
-    },
-    spawn,
-    cancel,
-    wait,
-    settle,
+  const adoptScope = (child: GroupInternals): void => {
+    running += 1;
+    void child.whenDrained.then(() => {
+      running -= 1;
+      if (!accepting && running === 0) detachParent();
+      settleWaiters();
+      checkDrained();
+    });
   };
+
+  const internals: GroupInternals = {
+    controller,
+    cancel,
+    fail,
+    beginSettlement,
+    adoptScope,
+    whenDrained,
+  };
+
+  const createChildScope = (childOptions: GroupOptions = {}): TaskGroup => {
+    const child = createGroup(childOptions, internals);
+    childScopes.push(child.internals);
+
+    const onParentAbortChild = (): void =>
+      child.internals.cancel(controller.signal.reason);
+    if (controller.signal.aborted) {
+      onParentAbortChild();
+    } else {
+      controller.signal.addEventListener("abort", onParentAbortChild, { once: true });
+    }
+    void child.internals.whenDrained.then(() => {
+      controller.signal.removeEventListener("abort", onParentAbortChild);
+    });
+
+    if (settlementRequested) {
+      child.internals.beginSettlement();
+    }
+
+    adoptScope(child.internals);
+    return child.group;
+  };
+
+  return {
+    group: {
+      get signal() {
+        return controller.signal;
+      },
+      get running() {
+        return running;
+      },
+      get accepting() {
+        return accepting;
+      },
+      spawn,
+      executor,
+      group: createChildScope,
+      cancel,
+      wait,
+      settle,
+    },
+    internals,
+  };
+}
+
+/**
+ * Creates a structured task group.
+ *
+ * This is intentionally different from `Promise.all()`: the group owns child
+ * lifetime, propagates cancellation, cancels siblings on failure, queues excess
+ * bounded work itself, can report the terminal state of every owned child, and
+ * owns the worker pools of its executors.
+ */
+export function group(options: GroupOptions = {}): TaskGroup {
+  return createGroup(options).group;
 }

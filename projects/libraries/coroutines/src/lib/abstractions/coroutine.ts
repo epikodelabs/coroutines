@@ -1,7 +1,7 @@
-import { createTaskRunner } from "../worker/runner";
 import { buildCoroutineWorkerRuntime } from "../worker/runtimes";
 import { buildWorkerScript } from "../worker/script";
-import type { Coroutine, CoroutineScript } from "../worker/types";
+import { registerDefinition } from "../worker/definition";
+import type { Coroutine } from "../worker/types";
 import type { WorkerTaskResult, WorkerTaskUtils } from "../utils/transfer";
 
 /**
@@ -12,31 +12,25 @@ export type CoroutineTask<T = any, R = any> = (data: T, utils: WorkerTaskUtils) 
   | Promise<WorkerTaskResult<R>>;
 
 /**
- * Optional settings for plain one-way coroutine workers.
+ * Optional settings for a coroutine definition.
  */
 export type CoroutineOptions = {
   /** Raw helper snippets injected into the worker before task code. */
   helpers?: string[];
-  /** Maximum number of workers this coroutine may own concurrently. */
-  maxWorkers?: number;
-  /** Terminates workers that stay idle longer than this many milliseconds. */
-  idleTimeout?: number;
 };
 
 type CoroutineDefinitionRest = Function[] | [...Function[], CoroutineOptions];
 
-function createCoroutineImpl<T, R>(
+function createCoroutineDefinition<T, R>(
   main: CoroutineTask<T, R>,
   functions: Function[],
   options: CoroutineOptions,
-): Coroutine<T, R> & CoroutineScript<T, R> {
-  const runner = createTaskRunner<T, R>({
-    name: "coroutine",
-    maxWorkers: options.maxWorkers,
-    idleTimeout: options.idleTimeout,
-    config: options.helpers && options.helpers.length > 0 ? { helpers: options.helpers } : undefined,
+): Coroutine<T, R> {
+  return registerDefinition<T, R>({
     main,
+    helpers: options.helpers || [],
     functions,
+    name: "coroutine",
     generateWorkerScript: (task, dependencies, workerConfig) =>
       buildWorkerScript({
         helpers: workerConfig?.helpers,
@@ -45,37 +39,31 @@ function createCoroutineImpl<T, R>(
         runtime: buildCoroutineWorkerRuntime(),
       }),
   });
-
-  return {
-    get size() {
-      return runner.size;
-    },
-    run: runner.run,
-    close: runner.close,
-    dispose: runner.dispose,
-    helpers: options.helpers || [],
-    main,
-    functions,
-  } as Coroutine<T, R> & CoroutineScript<T, R>;
 }
 
 /**
- * Creates a reusable stateless worker-backed task runner.
+ * Creates an immutable worker-task definition.
  *
- * The task script is baked once. Concurrent `run()` calls reuse idle workers or
- * lazily create additional workers as demand requires. Coroutine itself does
- * not impose a concurrency policy; use `group()` or `semaphore()` when work
- * should be bounded. Call `.dispose()` when done to terminate all owned workers.
- * Raw helper snippets can be provided through an optional trailing options object.
+ * A definition is pure executable code and metadata: it owns no workers and
+ * has no lifecycle. Run it by creating a group-owned executor —
+ * `group().executor(def)` — whose pool lifetime belongs to that group.
+ *
+ * Raw helper snippets can be provided through an optional trailing options
+ * object; named helper functions are passed as trailing arguments and are
+ * serialized into the worker alongside the task.
  */
 export function coroutine<T, R>(
   main: CoroutineTask<T, R>,
   ...rest: CoroutineDefinitionRest
-): Coroutine<T, R> & CoroutineScript<T, R>;
+): Coroutine<T, R>;
 export function coroutine<T, R>(
   main: CoroutineTask<T, R>,
   ...rest: CoroutineDefinitionRest
-): Coroutine<T, R> & CoroutineScript<T, R> {
+): Coroutine<T, R> {
+  if (typeof main !== "function") {
+    throw new TypeError("coroutine requires a task function");
+  }
+
   const last = rest[rest.length - 1];
   const hasOptions =
     typeof last === "object" &&
@@ -86,8 +74,7 @@ export function coroutine<T, R>(
   const options = (hasOptions ? last : undefined) as CoroutineOptions | undefined;
   const functions = (hasOptions ? rest.slice(0, -1) : rest) as Function[];
 
-  return createCoroutineImpl(main, functions, options || {});
+  return createCoroutineDefinition(main, functions, options || {});
 }
 
-export type { CoroutineScript } from "../worker/types";
 export { RunnerClosedError } from "../worker/types";

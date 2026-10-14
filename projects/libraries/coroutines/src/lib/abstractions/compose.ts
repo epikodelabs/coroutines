@@ -1,21 +1,12 @@
 import { buildCoroutineWorkerRuntime } from "../worker/runtimes";
 import { buildWorkerScript, serializeScript } from "../worker/script";
-import { createTaskRunner } from "../worker/runner";
-import { normalizeTaskRunControl } from "../worker/control";
-import type { TaskRunControl } from "../utils/transfer";
-import type { Coroutine, CoroutineScript, Executor } from "../worker/types";
+import { getDefinition, isCoroutineDefinition, registerDefinition } from "../worker/definition";
+import type { DefinitionInternals } from "../worker/definition";
+import type { Coroutine } from "../worker/types";
 
-type Composable<I = any, O = any> = CoroutineScript<I, O> | Executor<I, O>;
-type InputOf<T> = T extends CoroutineScript<infer I, any>
-  ? I
-  : T extends Executor<infer I, any>
-    ? I
-    : never;
-type OutputOf<T> = T extends CoroutineScript<any, infer O>
-  ? O
-  : T extends Executor<any, infer O>
-    ? O
-    : never;
+type Composable = Coroutine<any, any>;
+type InputOf<T> = T extends Coroutine<infer I, any> ? I : never;
+type OutputOf<T> = T extends Coroutine<any, infer O> ? O : never;
 type Last<T extends readonly unknown[]> = T extends readonly [...unknown[], infer L] ? L : never;
 type IsComposableChain<T extends readonly Composable[]> =
   T extends readonly [infer A extends Composable, infer B extends Composable, ...infer Rest extends Composable[]]
@@ -25,14 +16,6 @@ type IsComposableChain<T extends readonly Composable[]> =
     : true;
 type ValidComposableChain<T extends readonly [Composable, ...Composable[]]> =
   IsComposableChain<T> extends true ? T : never;
-
-function isCoroutineScript(value: unknown): value is CoroutineScript {
-  return (
-    typeof value === "object" &&
-    value !== null &&
-    typeof (value as CoroutineScript).main === "function"
-  );
-}
 
 async function composedCoroutineMain(data: any, utils: any): Promise<any> {
   const stages = (globalThis as typeof globalThis & {
@@ -60,22 +43,44 @@ async function composedCoroutineMain(data: any, utils: any): Promise<any> {
 }
 
 /**
- * Merges multiple `CoroutineScript`s into a single composed script suitable for
- * baking into a worker blob via `createTaskRunner`.
+ * Merges multiple definitions into a single composed script suitable for
+ * baking into a worker blob.
  *
  * Each stage is wrapped in an IIFE so that dependency function names
  * and internal variables do not collide across stages.
  */
-function mergeCoroutineScripts(scripts: CoroutineScript[]): {
+function mergeCoroutineScripts(scripts: Coroutine[]): {
   main: Function;
   helpers: string[];
   generateScript: (main: Function, helpers?: string[]) => string;
 } {
+  // Nested composes are flattened into their leaf definitions: a composed
+  // definition's main reads a `globalThis.__composeStages` registry that is
+  // only meaningful for its own merge, so nesting one inside another would
+  // otherwise recurse forever.
+  const flatten = (definitions: Coroutine[]): DefinitionInternals[] => {
+    const leaves: DefinitionInternals[] = [];
+    for (const definition of definitions) {
+      const record = getDefinition(definition);
+      if (!record) {
+        throw new TypeError("compose() accepts only definitions created by coroutine() or compose()");
+      }
+      if (record.stages && record.stages.length > 0) {
+        leaves.push(...flatten(record.stages));
+      } else {
+        leaves.push(record);
+      }
+    }
+    return leaves;
+  };
+
+  const internals = flatten(scripts);
+
   const helpers = Array.from(
-    new Set(scripts.flatMap((s) => s.helpers || []))
+    new Set(internals.flatMap((s) => s.helpers))
   );
 
-  const stageBodies = scripts
+  const stageBodies = internals
     .map((s, i) => {
       const { code, deps } = serializeScript(s);
       const depsSection = deps.length > 0 ? deps.join(";\n") + ";" : "";
@@ -84,7 +89,7 @@ ${depsSection ? '  ' + depsSection.replace(/\n/g, '\n  ') + '\n' : ''}  return (
 })();`;
     })
     .reduce((acc, body, i) => `${acc}${i > 0 ? '\n\n' : ''}${body}`, '');
-  const stageRegistry = `globalThis.__composeStages = [${scripts
+  const stageRegistry = `globalThis.__composeStages = [${internals
     .map((_, i) => `__stage${i}`)
     .join(", ")}];`;
 
@@ -104,16 +109,16 @@ ${depsSection ? '  ' + depsSection.replace(/\n/g, '\n  ') + '\n' : ''}  return (
 }
 
 /**
- * Chains multiple coroutines sequentially into a single `Coroutine`.
+ * Fuses multiple coroutine definitions into a single immutable definition.
  *
- * Consecutive `CoroutineScript` inputs (created by `coroutine()`) are fused
- * into one worker segment so the stages inside it run within a single worker
- * task per concurrent invocation. Segments and `Executor` inputs are
- * executed strictly in the order they are passed, so interleaved chains such
- * as `compose(runnerA, coroutineB)` run `runnerA` before `coroutineB`.
+ * The stages' input/output types are validated at compile time, and all
+ * stages are merged into one worker script so the whole pipeline runs inside
+ * a single worker task per invocation — intermediate results never cross a
+ * worker boundary.
  *
- * The input scripts and runners are not disposed by the composed coroutine —
- * callers remain responsible for their lifecycle.
+ * `compose()` is pure code fusion: it owns no workers and has no lifecycle.
+ * Run the result like any other definition — `group().executor(composed)`.
+ * The input definitions are untouched and reusable.
  */
 export function compose(): Coroutine<any, any>;
 export function compose<const S extends readonly [Composable, ...Composable[]]>(
@@ -121,191 +126,25 @@ export function compose<const S extends readonly [Composable, ...Composable[]]>(
 ): Coroutine<InputOf<S[0]>, OutputOf<Last<S>>>;
 
 export function compose<T = any, R = any>(
-  ...scripts: Array<CoroutineScript<any, any> | Executor<any, any>>
+  ...scripts: Coroutine[]
 ): Coroutine<T, R> {
-  const segments: Array<{ kind: "worker" | "task"; runner: Executor<any, any> }> = [];
-  let scriptBuffer: CoroutineScript<any, any>[] = [];
-
-  const flushWorkerSegment = (): void => {
-    if (scriptBuffer.length === 0) return;
-
-    const merged = mergeCoroutineScripts(scriptBuffer);
-    segments.push({
-      kind: "worker",
-      runner: createTaskRunner<any, any>({
-        name: "compose",
-        config: merged.helpers.length > 0 ? { helpers: merged.helpers } : undefined,
-        main: merged.main,
-        functions: [],
-        generateWorkerScript: (task, _dependencies, workerConfig) =>
-          merged.generateScript(task, workerConfig?.helpers),
-      }),
-    });
-    scriptBuffer = [];
-  };
-
-  for (const s of scripts) {
-    if (isCoroutineScript(s)) {
-      scriptBuffer.push(s);
-    } else if (s && typeof (s as Executor).run === "function") {
-      flushWorkerSegment();
-      segments.push({ kind: "task", runner: s as Executor });
+  for (const script of scripts) {
+    if (!isCoroutineDefinition(script)) {
+      throw new TypeError(
+        "compose() accepts only definitions created by coroutine() or compose()",
+      );
     }
   }
-  flushWorkerSegment();
 
-  let lifecycle: "open" | "closing" | "finalizing" | "finalized" = "open";
-  let activeRuns = 0;
-  let gracefulCloseStarted = false;
-  let closePromise: Promise<void> | null = null;
-  let resolveClose: (() => void) | null = null;
-  let rejectClose: ((error: Error) => void) | null = null;
-  let disposePromise: Promise<void> | null = null;
+  const merged = mergeCoroutineScripts(scripts);
 
-  const ownedRunners = (): Executor<any, any>[] =>
-    segments.map((segment) => segment.runner);
-
-  const closeOwnedRunners = async (): Promise<void> => {
-    const errors: Error[] = [];
-
-    for (const runner of ownedRunners()) {
-      try {
-        await runner.close();
-      } catch (error) {
-        errors.push(error instanceof Error ? error : new Error(String(error)));
-      }
-    }
-
-    if (errors.length > 0) throw errors[0];
-  };
-
-  const disposeOwnedRunners = async (): Promise<void> => {
-    const errors: Error[] = [];
-
-    for (const runner of ownedRunners()) {
-      try {
-        await runner.dispose();
-      } catch (error) {
-        errors.push(error instanceof Error ? error : new Error(String(error)));
-      }
-    }
-
-    if (errors.length > 0) throw errors[0];
-  };
-
-  const ensureClosePromise = (): Promise<void> => {
-    if (closePromise) return closePromise;
-
-    closePromise = new Promise<void>((resolve, reject) => {
-      resolveClose = resolve;
-      rejectClose = reject;
-    });
-    return closePromise;
-  };
-
-  const settleLifecycle = (outcome: "resolve" | "reject", error?: Error): void => {
-    lifecycle = "finalized";
-    if (outcome === "reject" && error) rejectClose?.(error);
-    else resolveClose?.();
-    resolveClose = null;
-    rejectClose = null;
-  };
-
-  const maybeStartGracefulClose = (): void => {
-    if (
-      lifecycle !== "closing" ||
-      activeRuns !== 0 ||
-      gracefulCloseStarted
-    ) {
-      return;
-    }
-
-    gracefulCloseStarted = true;
-    void closeOwnedRunners().then(
-      () => settleLifecycle("resolve"),
-      (error) =>
-        settleLifecycle(
-          "reject",
-          error instanceof Error ? error : new Error(String(error)),
-        ),
-    );
-  };
-
-  const run = async (data: T, control?: TaskRunControl): Promise<R> => {
-    if (lifecycle !== "open") {
-      throw new Error("compose is closed");
-    }
-
-    activeRuns += 1;
-    try {
-      let result: any = data;
-      const { signal, transfer } = normalizeTaskRunControl(control);
-      let transferPending = transfer.length > 0;
-
-      for (const segment of segments) {
-        result = await segment.runner.run(
-          result,
-          transferPending
-            ? { signal, transfer }
-            : signal,
-        );
-        transferPending = false;
-      }
-
-      return result;
-    } finally {
-      activeRuns = Math.max(0, activeRuns - 1);
-      maybeStartGracefulClose();
-    }
-  };
-
-  const close = (): Promise<void> => {
-    if (lifecycle === "finalized") {
-      return closePromise ?? Promise.resolve();
-    }
-    if (lifecycle === "finalizing") {
-      return ensureClosePromise();
-    }
-
-    if (lifecycle === "open") {
-      lifecycle = "closing";
-    }
-
-    const pendingClose = ensureClosePromise();
-    maybeStartGracefulClose();
-    return pendingClose;
-  };
-
-  const dispose = (): Promise<void> => {
-    if (disposePromise) return disposePromise;
-    if (lifecycle === "finalized") {
-      return Promise.resolve();
-    }
-
-    lifecycle = "finalizing";
-    ensureClosePromise();
-
-    disposePromise = disposeOwnedRunners().then(
-      () => {
-        settleLifecycle("resolve");
-      },
-      (error) => {
-        const normalized =
-          error instanceof Error ? error : new Error(String(error));
-        settleLifecycle("resolve");
-        throw normalized;
-      },
-    );
-
-    return disposePromise;
-  };
-
-  return {
-    run,
-    close,
-    dispose,
-    get size(): number {
-      return ownedRunners().reduce((sum, runner) => sum + (runner.size ?? 0), 0);
-    },
-  } as Coroutine<T, R>;
+  return registerDefinition<T, R>({
+    main: merged.main,
+    helpers: merged.helpers,
+    functions: [],
+    name: "compose",
+    stages: scripts,
+    generateWorkerScript: (task, _dependencies, workerConfig) =>
+      merged.generateScript(task, workerConfig?.helpers),
+  });
 }

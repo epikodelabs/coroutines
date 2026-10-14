@@ -1,7 +1,16 @@
-import { compose, coroutine, type TaskRunControl } from "../public-api";
+import { compose, coroutine, group } from "../public-api";
 import { idescribe } from "./env";
 
 idescribe("compose coroutines", () => {
+  const run = async <T, R>(def: any, value: T): Promise<R> => {
+    const work = group();
+    try {
+      return await work.executor(def).run(value);
+    } finally {
+      await work.settle();
+    }
+  };
+
   it("preserves types across more than three composed stages", async () => {
     const c1 = coroutine((value: number) => String(value));
     const c2 = coroutine((value: string) => value.length);
@@ -9,117 +18,50 @@ idescribe("compose coroutines", () => {
     const c4 = coroutine((value: boolean) => (value ? 1 : 0));
     const c5 = coroutine((value: number) => `result:${value}`);
 
-    const pipeline = compose(c1, c2, c3, c4, c5);
-    const result: string = await pipeline.run(42);
+    const fused = compose(c1, c2, c3, c4, c5);
+    const result: string = await run<number, string>(fused, 42);
 
     expect(result).toBe("result:1");
-    await pipeline.dispose();
   });
 
   it("should process tasks sequentially via run", async () => {
     const c1 = coroutine((x: number) => x + 1);
     const c2 = coroutine((x: number) => x * 2);
 
-    const composed = compose(c1, c2);
+    const fused = compose(c1, c2);
 
-    const result = await composed.run(3); // (3 + 1) * 2
+    const result = await run<number, number>(fused, 3); // (3 + 1) * 2
     expect(result).toBe(8);
-
-    await composed.dispose();
   });
 
-  it("runs task runners and coroutine stages in argument order", async () => {
-    const script = coroutine((x: number) => x + 1);
-    const runner = {
-      run: async (x: number) => x * 2,
-      close: async () => undefined,
-      dispose: async () => undefined,
-    };
-    const tail = coroutine((x: number) => x - 1);
+  it("returns an immutable definition with no executor surface", () => {
+    const fused = compose(coroutine((x: number) => x + 1), coroutine((x: number) => x * 2));
 
-    const composed = compose(script, runner as any, tail);
-    // ((3+1)*2)-1; the old workers-first order would give (3+1-1)*2 = 6
-    await expectAsync(composed.run(3)).toBeResolvedTo(7);
-
-    await composed.dispose();
-    await script.dispose();
-    await tail.dispose();
+    expect(Object.isFrozen(fused)).toBeTrue();
+    expect('run' in fused).toBeFalse();
+    expect('close' in fused).toBeFalse();
+    expect('dispose' in fused).toBeFalse();
+    expect('size' in fused).toBeFalse();
   });
 
-  it("interleaves fused segments and task runners in argument order", async () => {
-    const plusOne = coroutine((x: number) => x + 1);
-    const timesTwo = {
-      run: async (x: number) => x * 2,
-      close: async () => undefined,
-      dispose: async () => undefined,
-    };
-    const minusOne = coroutine((x: number) => x - 1);
-    const timesThree = {
-      run: async (x: number) => x * 3,
-      close: async () => undefined,
-      dispose: async () => undefined,
-    };
+  it("rejects non-definition inputs", () => {
+    const def = coroutine((x: number) => x + 1);
 
-    const composed = compose(plusOne, timesTwo as any, minusOne, timesThree as any);
-    // (((2+1)*2)-1)*3
-    await expectAsync(composed.run(2)).toBeResolvedTo(15);
-
-    await composed.dispose();
-    await plusOne.dispose();
-    await minusOne.dispose();
+    expect(() => compose(def, { run: async (x: number) => x } as any)).toThrowError(
+      TypeError,
+      /accepts only definitions/,
+    );
   });
 
-  it("exposes size as the sum of owned runner sizes", async () => {
-    const script = coroutine((x: number) => x + 1);
-    const composed = compose(script);
+  it("accepts composed definitions as stages", async () => {
+    const pair = compose(
+      coroutine((x: number) => x + 1),
+      coroutine((x: number) => x * 2),
+    );
+    const fused = compose(pair, coroutine((x: number) => x - 1));
 
-    expect(composed.size).toBe(0);
-    await composed.run(1);
-    expect(composed.size).toBeGreaterThanOrEqual(1);
-
-    await composed.dispose();
-    await script.dispose();
-  });
-
-  it("reports the size of plain task runners", async () => {
-    const runner = {
-      run: async (x: number) => x,
-      size: 3,
-      close: async () => undefined,
-      dispose: async () => undefined,
-    };
-    const composed = compose(runner as any);
-
-    expect(composed.size).toBe(3);
-    await composed.dispose();
-  });
-
-  it("reports a size of zero for an empty compose", () => {
-    expect(compose().size).toBe(0);
-  });
-
-  it("applies an input transfer list only to the first segment", async () => {
-    const controls: TaskRunControl[] = [];
-    const script = coroutine((value: ArrayBuffer) => value);
-    const tail = {
-      run: async (value: ArrayBuffer, control?: TaskRunControl) => {
-        controls.push(control);
-        return value.byteLength;
-      },
-      close: async () => undefined,
-      dispose: async () => undefined,
-    };
-
-    const controller = new AbortController();
-    const buffer = new ArrayBuffer(8);
-    const composed = compose(script, tail as any);
-    await expectAsync(
-      composed.run(buffer, { signal: controller.signal, transfer: [buffer] }),
-    ).toBeResolvedTo(8);
-
-    expect(controls[0]).toBe(controller.signal);
-    await composed.dispose();
-    await script.dispose();
+    // ((5+1)*2)-1
+    expect(await run<number, number>(fused, 5)).toBe(11);
   });
 
   it("should process tasks sequentially in a stream", async () => {
@@ -132,17 +74,18 @@ idescribe("compose coroutines", () => {
       yield 3;
     })();
 
-    const composed = compose(c1, c2);
+    const work = group();
+    const fused = work.executor(compose(c1, c2));
 
     const results: number[] = [];
     for await (const v of stream) {
-      results.push(await composed.run(v));
+      results.push(await fused.run(v));
     }
 
     // (1+1)*2 = 4, (2+1)*2 = 6, (3+1)*2 = 8
     expect(results).toEqual([4, 6, 8]);
 
-    await composed.dispose();
+    await work.settle();
   });
 
   it("should await async coroutine stages before passing values to the next stage", async () => {
@@ -152,12 +95,10 @@ idescribe("compose coroutines", () => {
     });
     const c2 = coroutine((x: number) => x * 2);
 
-    const composed = compose(c1, c2);
+    const fused = compose(c1, c2);
 
-    const result = await composed.run(3);
+    const result = await run<number, number>(fused, 3);
     expect(result).toBe(8);
-
-    await composed.dispose();
   });
 
   it("should propagate errors from inner coroutine", async () => {
@@ -167,46 +108,21 @@ idescribe("compose coroutines", () => {
       return x * 2;
     });
 
-    const composed = compose(c1, c2);
+    const fused = compose(c1, c2);
 
     try {
-      await composed.run(1); // (1+1) => 2, then boom
+      await run<number, number>(fused, 1); // (1+1) => 2, then boom
       fail("Expected error to be thrown");
     } catch (err: any) {
       expect(err.message).toBe("boom");
     }
-
-    await composed.dispose();
-  });
-
-  it("should dispose all tasks", async () => {
-    const finalized: string[] = [];
-
-    const c1 = {
-      run: async (x: number) => x + 1,
-      dispose: async () => finalized.push("c1"),
-    } as any;
-    const c2 = {
-      run: async (x: number) => x * 2,
-      dispose: async () => finalized.push("c2"),
-    } as any;
-
-    const composed = compose(c1, c2);
-
-    const result = await composed.run(5);
-    expect(result).toBe(12);
-
-    await composed.dispose();
-    expect(finalized).toEqual(["c1", "c2"]);
   });
 
   it("should handle empty composes gracefully", async () => {
     const composed = compose(); // no tasks
-    const result = await composed.run(42);
+    const result = await run<number, number>(composed, 42);
 
     expect(result).toBe(42);
-
-    await composed.dispose();
   });
 
   it("passes through values when no tasks are provided", async () => {
@@ -218,140 +134,10 @@ idescribe("compose coroutines", () => {
     const passThrough = compose();
     const results: number[] = [];
     for await (const v of stream) {
-      results.push(await passThrough.run(v));
+      results.push(await run<number, number>(passThrough, v));
     }
 
     expect(results).toEqual([1, 2]);
-  });
-
-  it("should dispose every task even when one finalizer throws", async () => {
-    const finalized: string[] = [];
-
-    const composed = compose(
-      {
-        run: async (x: number) => x + 1,
-        dispose: async () => {
-          finalized.push("c1");
-          throw new Error("boom");
-        },
-      } as any,
-      {
-        run: async (x: number) => x * 2,
-        dispose: async () => {
-          finalized.push("c2");
-        },
-      } as any
-    );
-
-    await expectAsync(composed.dispose()).toBeRejectedWithError("boom");
-    expect(finalized).toEqual(["c1", "c2"]);
-  });
-
-  it("forwards cancellation to every runner stage", async () => {
-    const seenSignals: AbortSignal[] = [];
-    const first = {
-      run: async (value: number, control?: TaskRunControl) => {
-        const signal = control instanceof AbortSignal ? control : control?.signal;
-        if (signal) seenSignals.push(signal);
-        return value + 1;
-      },
-      close: async () => undefined,
-      dispose: async () => undefined,
-    };
-    const second = {
-      run: async (value: number, control?: TaskRunControl) => {
-        const signal = control instanceof AbortSignal ? control : control?.signal;
-        if (signal) seenSignals.push(signal);
-        return value * 2;
-      },
-      close: async () => undefined,
-      dispose: async () => undefined,
-    };
-
-    const controller = new AbortController();
-    const composed = compose(first, second);
-    await expectAsync(composed.run(3, controller.signal)).toBeResolvedTo(8);
-
-    expect(seenSignals).toEqual([controller.signal, controller.signal]);
-    await composed.dispose();
-  });
-
-
-  it("close drains and closes every composed runner", async () => {
-    const lifecycle: string[] = [];
-    const first = {
-      run: async (value: number) => value + 1,
-      close: async () => { lifecycle.push("close:first"); },
-      dispose: async () => { lifecycle.push("dispose:first"); },
-    };
-    const second = {
-      run: async (value: number) => value * 2,
-      close: async () => { lifecycle.push("close:second"); },
-      dispose: async () => { lifecycle.push("dispose:second"); },
-    };
-
-    const composed = compose(first, second);
-    expect(await composed.run(2)).toBe(6);
-
-    await composed.close();
-    expect(lifecycle).toEqual(["close:first", "close:second"]);
-  });
-
-  it("close attempts every composed runner even when one close fails", async () => {
-    const lifecycle: string[] = [];
-    const composed = compose(
-      {
-        run: async (value: number) => value,
-        close: async () => {
-          lifecycle.push("first");
-          throw new Error("close failed");
-        },
-        dispose: async () => undefined,
-      },
-      {
-        run: async (value: number) => value,
-        close: async () => {
-          lifecycle.push("second");
-        },
-        dispose: async () => undefined,
-      },
-    );
-
-    await expectAsync(composed.close()).toBeRejectedWithError("close failed");
-    expect(lifecycle).toEqual(["first", "second"]);
-  });
-
-
-  it("applies an input transfer list only to the first composed runner", async () => {
-    const controls: TaskRunControl[] = [];
-    const first = {
-      run: async (value: ArrayBuffer, control?: TaskRunControl) => {
-        controls.push(control);
-        return value;
-      },
-      close: async () => undefined,
-      dispose: async () => undefined,
-    };
-    const second = {
-      run: async (value: ArrayBuffer, control?: TaskRunControl) => {
-        controls.push(control);
-        return value.byteLength;
-      },
-      close: async () => undefined,
-      dispose: async () => undefined,
-    };
-
-    const controller = new AbortController();
-    const buffer = new ArrayBuffer(8);
-    const composed = compose(first, second);
-    await expectAsync(
-      composed.run(buffer, { signal: controller.signal, transfer: [buffer] }),
-    ).toBeResolvedTo(8);
-
-    expect((controls[0] as any).transfer).toEqual([buffer]);
-    expect((controls[0] as any).signal).toBe(controller.signal);
-    expect(controls[1]).toBe(controller.signal);
-    await composed.dispose();
   });
 
   it("keeps transfer ownership inside merged coroutine stages and returns only the final value", async () => {
@@ -363,19 +149,21 @@ idescribe("compose coroutines", () => {
       new Uint8Array(buffer)[0] += 1;
       return transfer(buffer, buffer);
     });
-    const composed = compose(first, second);
+    const fused = compose(first, second);
 
     const input = new ArrayBuffer(4);
     new Uint8Array(input)[0] = 40;
-    const output = await composed.run(input, { transfer: [input] });
 
-    expect(input.byteLength).toBe(0);
-    expect(output.byteLength).toBe(4);
-    expect(new Uint8Array(output)[0]).toBe(42);
+    const work = group();
+    try {
+      const output = await work.executor(fused).run(input, { transfer: [input] });
 
-    await composed.dispose();
-    await first.dispose();
-    await second.dispose();
+      expect(input.byteLength).toBe(0);
+      expect(output.byteLength).toBe(4);
+      expect(new Uint8Array(output)[0]).toBe(42);
+    } finally {
+      await work.settle();
+    }
   });
 
   it("supports arrow-function helpers inside merged coroutine stages", async () => {
@@ -384,108 +172,8 @@ idescribe("compose coroutines", () => {
 
     const first = coroutine((value: number) => addOne(value), addOne);
     const second = coroutine((value: number) => double(value), double);
-    const composed = compose(first, second);
+    const fused = compose(first, second);
 
-    await expectAsync(composed.run(3)).toBeResolvedTo(8);
-
-    await composed.dispose();
-    await first.dispose();
-    await second.dispose();
+    expect(await run<number, number>(fused, 3)).toBe(8);
   });
-
-
-  it("close drains the entire admitted pipeline before closing any stage", async () => {
-    const lifecycle: string[] = [];
-    let releaseFirst!: () => void;
-    const firstGate = new Promise<void>((resolve) => {
-      releaseFirst = resolve;
-    });
-
-    const first = {
-      run: async (value: number) => {
-        lifecycle.push("run:first");
-        await firstGate;
-        return value + 1;
-      },
-      close: async () => {
-        lifecycle.push("close:first");
-      },
-      dispose: async () => {
-        lifecycle.push("dispose:first");
-      },
-    };
-    const second = {
-      run: async (value: number) => {
-        lifecycle.push("run:second");
-        return value * 2;
-      },
-      close: async () => {
-        lifecycle.push("close:second");
-      },
-      dispose: async () => {
-        lifecycle.push("dispose:second");
-      },
-    };
-
-    const composed = compose(first, second);
-    const admitted = composed.run(2);
-    await Promise.resolve();
-
-    const closing = composed.close();
-
-    await expectAsync(composed.run(3)).toBeRejectedWithError("compose is closed");
-    expect(lifecycle).toEqual(["run:first"]);
-
-    releaseFirst();
-
-    await expectAsync(admitted).toBeResolvedTo(6);
-    await expectAsync(closing).toBeResolved();
-    expect(lifecycle).toEqual([
-      "run:first",
-      "run:second",
-      "close:first",
-      "close:second",
-    ]);
-  });
-
-  it("dispose settles a concurrent graceful close and rejects unfinished pipeline work", async () => {
-    let rejectActive!: (error: Error) => void;
-    const lifecycle: string[] = [];
-
-    const first = {
-      run: () =>
-        new Promise<number>((_resolve, reject) => {
-          rejectActive = reject;
-        }),
-      close: async () => {
-        lifecycle.push("close:first");
-      },
-      dispose: async () => {
-        lifecycle.push("dispose:first");
-        rejectActive(new Error("disposed active pipeline"));
-      },
-    };
-    const second = {
-      run: async (value: number) => value,
-      close: async () => {
-        lifecycle.push("close:second");
-      },
-      dispose: async () => {
-        lifecycle.push("dispose:second");
-      },
-    };
-
-    const composed = compose(first, second);
-    const active = composed.run(1);
-    active.catch(() => undefined);
-
-    const closing = composed.close();
-    await composed.dispose();
-
-    await expectAsync(active).toBeRejectedWithError("disposed active pipeline");
-    await expectAsync(closing).toBeResolved();
-    expect(lifecycle).toEqual(["dispose:first", "dispose:second"]);
-  });
-
-
 });

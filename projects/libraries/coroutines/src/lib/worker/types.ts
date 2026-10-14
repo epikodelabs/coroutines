@@ -1,18 +1,16 @@
-import type { TaskRunControl, WorkerTaskResult, WorkerTaskUtils } from "../utils/transfer";
+import type { TaskRunControl } from "../utils/transfer";
+
+declare const __coroutineBrand: unique symbol;
 
 /**
- * Task descriptor ready to be baked into a worker blob.
+ * Immutable worker-task definition produced by `coroutine()` or `compose()`.
  *
- * `main` and `functions` are the single source of truth.
- * String forms are derived on demand via `serializeScript()`.
+ * A definition is pure executable code and metadata — it owns no workers,
+ * accepts no runs, and has no lifecycle. It is an opaque branded handle; its
+ * script internals are held privately by the library.
  */
-export interface CoroutineScript<T = any, R = any> {
-  /** Raw worker-side snippets injected before the serialized functions. */
-  helpers?: string[];
-  /** Main task body executed inside the worker. */
-  main: (data: T, utils: WorkerTaskUtils) => WorkerTaskResult<R> | Promise<WorkerTaskResult<R>>;
-  /** Additional named helper functions serialized alongside `main`. */
-  functions?: Function[];
+export interface Coroutine<I = any, O = I> {
+  readonly [__coroutineBrand]: true;
 }
 
 /**
@@ -36,15 +34,31 @@ export interface Executor<T = any, R = any> {
 }
 
 /**
- * Stateless background-task executor backed by an elastic reusable worker list.
- *
- * Created by `group().executor(def)` for a definition produced by
- * `coroutine()` or `compose()`.
+ * Any run-shaped step accepted by `pipeline()`.
  */
-export interface Coroutine<T = any, R = T> extends Executor<T, R> {
-  /** Number of workers this executor currently owns (idle plus active). */
-  readonly size: number;
+export interface Runnable<T = any, R = any> {
+  run: (data: T, control?: TaskRunControl) => Promise<R>;
 }
+
+/**
+ * Main-thread sequencing of runnable steps.
+ *
+ * A pipeline owns nothing: it orders execution only. The steps' worker pools
+ * and lifetimes belong to their groups.
+ */
+export interface Pipeline<T = any, R = any> {
+  run: (data: T, control?: TaskRunControl) => Promise<R>;
+}
+
+/**
+ * Options for a group-owned executor pool.
+ */
+export type ExecutorOptions = {
+  /** Maximum number of workers this executor may own concurrently. */
+  readonly maxWorkers?: number;
+  /** Terminates workers that stay idle longer than this many milliseconds. */
+  readonly idleTimeout?: number;
+};
 
 /**
  * Thrown when a task runner refuses work because it was closed or disposed.

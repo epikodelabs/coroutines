@@ -1,4 +1,4 @@
-import type { CoroutineScript } from "./types";
+import type { DefinitionInternals } from "./definition";
 
 /**
  * Internal bootstrap required by transpiled async/generator code inside worker
@@ -67,11 +67,11 @@ export function serializeFunction(fn: Function): string {
 }
 
 /**
- * Derives the string representation of a `CoroutineScript` from its
- * function source(s).  This is the single source-of-truth for how
- * `main` and `functions` are turned into worker-transmittable code.
+ * Derives the string representation of a definition from its function
+ * source(s). This is the single source-of-truth for how `main` and
+ * `functions` are turned into worker-transmittable code.
  */
-export function serializeScript<T, R>(script: CoroutineScript<T, R>): {
+export function serializeScript(script: Pick<DefinitionInternals, "main" | "functions">): {
   code: string;
   deps: string[];
 } {
