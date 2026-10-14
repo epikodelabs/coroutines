@@ -1,6 +1,7 @@
 {
   "name": "@epikodelabs/coroutines",
   "version": "1.0.3",
+  "description": "Structured concurrency for TypeScript: coroutines, channels, select, actors, and supervision on web workers.",
   "keywords": [
     "coroutines",
     "concurrency",
@@ -10,6 +11,11 @@
     "channels",
     "typescript"
   ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/epikodelabs/coroutines.git"
+  },
   "dependencies": {
     "tslib": "^2.8.1"
   },
