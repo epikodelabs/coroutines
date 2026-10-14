@@ -50,13 +50,17 @@ export type KitchenLogEntry = {
   kind: 'normal' | 'started' | 'ready' | 'cancelled' | 'closed';
 };
 
-function createOvenCoroutine() {
-  return coroutine(ovenBakeTask);
+// One immutable bake definition shared by every oven; each service owns its
+// own group-owned executor pool for it.
+const ovenBakeDefinition = coroutine(ovenBakeTask);
+
+function createOvenExecutor(pool: TaskGroup) {
+  return pool.executor(ovenBakeDefinition);
 }
 
 type OvenWorker = {
   id: string;
-  worker: ReturnType<typeof createOvenCoroutine>;
+  worker: ReturnType<typeof createOvenExecutor>;
 };
 
 const RECIPES = new Map<string, Recipe>([
@@ -83,7 +87,7 @@ async function ovenBakeTask(task: { order: Order; recipe: Recipe }) {
 function cashierBehavior(
   msg: any,
   state: { routed: number },
-  utils: WorkerUtils<any, any, any, any>,
+  utils: WorkerUtils<any, any, any>,
 ) {
   if (msg.kind !== 'actor-bus') return state;
 
@@ -122,10 +126,11 @@ export class KitchenService {
   readonly running = signal(false);
   readonly isProcessing = computed(() => this.running() || this.stats().active > 0);
 
+  private readonly ovenPool = group();
   private readonly ovenWorkers: OvenWorker[] = [
-    { id: 'Oven #1', worker: createOvenCoroutine() },
-    { id: 'Oven #2', worker: createOvenCoroutine() },
-    { id: 'Oven #3', worker: createOvenCoroutine() },
+    { id: 'Oven #1', worker: createOvenExecutor(this.ovenPool) },
+    { id: 'Oven #2', worker: createOvenExecutor(this.ovenPool) },
+    { id: 'Oven #3', worker: createOvenExecutor(this.ovenPool) },
   ];
   private readonly freeOvens: OvenWorker[] = [...this.ovenWorkers];
   private readonly orderControllers = new Map<string, AbortController>();
@@ -279,10 +284,8 @@ export class KitchenService {
     this.onMessageUnsubscribe?.();
     this.onMessageUnsubscribe = null;
 
-    await Promise.all([
-      main.outbox.stop(this.cashier),
-      ...this.ovenWorkers.map(({ worker }) => worker.dispose()),
-    ]);
+    await main.outbox.stop(this.cashier);
+    this.ovenPool.cancel();
   }
 
   private enqueueOrder(order: Order): void {

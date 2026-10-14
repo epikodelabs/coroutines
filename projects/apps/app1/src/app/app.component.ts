@@ -340,7 +340,13 @@ export class AppComponent implements AfterViewInit, OnDestroy {
   readonly progress = signal(0);
   readonly elapsed = signal(0);
 
-  private runner = coroutine<BatchParams, Pixel[]>(juliaBatchWorker);
+  // The batch task is an immutable definition; the component-lifetime pool
+  // owns its workers and is disposed with the component.
+  private readonly juliaBatch = coroutine<BatchParams, Pixel[]>(juliaBatchWorker);
+  private readonly pool = group();
+  private readonly runner = this.pool.executor(this.juliaBatch, {
+    maxWorkers: Math.max(1, navigator.hardwareConcurrency || 4),
+  });
   private abortController: AbortController | null = null;
   private renderGeneration = 0;
 
@@ -350,7 +356,7 @@ export class AppComponent implements AfterViewInit, OnDestroy {
 
   ngOnDestroy(): void {
     this.abortController?.abort();
-    void this.runner.dispose();
+    this.pool.cancel();
   }
 
   loadPreset(p: JuliaPreset): void {

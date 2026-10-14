@@ -39,6 +39,8 @@ export class ImagePipelineService {
 
   private destroyed = false;
   private readonly processor = coroutine<ProcessInput, ProcessOutput>(processImage);
+  private readonly pool = group();
+  private readonly executor = this.pool.executor(this.processor);
   private readonly work = group({
     concurrency: Math.max(
       1,
@@ -154,7 +156,7 @@ export class ImagePipelineService {
     this.destroyed = true;
     this.work.cancel(new Error('Image pipeline destroyed'));
     await this.work.settle();
-    await this.processor.dispose();
+    this.pool.cancel();
 
     this.clearAll();
   }
@@ -195,7 +197,7 @@ export class ImagePipelineService {
         fileName: task.file.name,
       };
 
-      const output = await this.processor.run(input, signal);
+      const output = await this.executor.run(input, signal);
       if (this.destroyed || signal.aborted) {
         return;
       }
