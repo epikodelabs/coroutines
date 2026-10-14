@@ -18,9 +18,9 @@ export interface CoroutineScript<T = any, R = any> {
 /**
  * Base contract for anything that can process a task and be finalized.
  */
-export interface TaskRunner<T = any, R = any> {
-  /** Number of workers this runner currently owns (idle plus active). Built-in runners always provide it. */
-  readonly size?: number;
+export interface Executor<T = any, R = any> {
+  /** Number of workers this executor currently owns (idle plus active). */
+  readonly size: number;
   /** Submits one value for worker-side processing. */
   run: (data: T, control?: TaskRunControl) => Promise<R>;
   /**
@@ -36,12 +36,13 @@ export interface TaskRunner<T = any, R = any> {
 }
 
 /**
- * Stateless background-task runner backed by an elastic reusable worker list.
+ * Stateless background-task executor backed by an elastic reusable worker list.
  *
- * Created by `coroutine(mainTask)` and accepted by `compose(...)`.
+ * Created by `group().executor(def)` for a definition produced by
+ * `coroutine()` or `compose()`.
  */
-export interface Coroutine<T = any, R = T> extends TaskRunner<T, R> {
-  /** Number of workers this runner currently owns (idle plus active). */
+export interface Coroutine<T = any, R = T> extends Executor<T, R> {
+  /** Number of workers this executor currently owns (idle plus active). */
   readonly size: number;
 }
 

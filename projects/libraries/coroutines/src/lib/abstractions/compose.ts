@@ -3,17 +3,17 @@ import { buildWorkerScript, serializeScript } from "../worker/script";
 import { createTaskRunner } from "../worker/runner";
 import { normalizeTaskRunControl } from "../worker/control";
 import type { TaskRunControl } from "../utils/transfer";
-import type { Coroutine, CoroutineScript, TaskRunner } from "../worker/types";
+import type { Coroutine, CoroutineScript, Executor } from "../worker/types";
 
-type Composable<I = any, O = any> = CoroutineScript<I, O> | TaskRunner<I, O>;
+type Composable<I = any, O = any> = CoroutineScript<I, O> | Executor<I, O>;
 type InputOf<T> = T extends CoroutineScript<infer I, any>
   ? I
-  : T extends TaskRunner<infer I, any>
+  : T extends Executor<infer I, any>
     ? I
     : never;
 type OutputOf<T> = T extends CoroutineScript<any, infer O>
   ? O
-  : T extends TaskRunner<any, infer O>
+  : T extends Executor<any, infer O>
     ? O
     : never;
 type Last<T extends readonly unknown[]> = T extends readonly [...unknown[], infer L] ? L : never;
@@ -108,7 +108,7 @@ ${depsSection ? '  ' + depsSection.replace(/\n/g, '\n  ') + '\n' : ''}  return (
  *
  * Consecutive `CoroutineScript` inputs (created by `coroutine()`) are fused
  * into one worker segment so the stages inside it run within a single worker
- * task per concurrent invocation. Segments and `TaskRunner` inputs are
+ * task per concurrent invocation. Segments and `Executor` inputs are
  * executed strictly in the order they are passed, so interleaved chains such
  * as `compose(runnerA, coroutineB)` run `runnerA` before `coroutineB`.
  *
@@ -121,9 +121,9 @@ export function compose<const S extends readonly [Composable, ...Composable[]]>(
 ): Coroutine<InputOf<S[0]>, OutputOf<Last<S>>>;
 
 export function compose<T = any, R = any>(
-  ...scripts: Array<CoroutineScript<any, any> | TaskRunner<any, any>>
+  ...scripts: Array<CoroutineScript<any, any> | Executor<any, any>>
 ): Coroutine<T, R> {
-  const segments: Array<{ kind: "worker" | "task"; runner: TaskRunner<any, any> }> = [];
+  const segments: Array<{ kind: "worker" | "task"; runner: Executor<any, any> }> = [];
   let scriptBuffer: CoroutineScript<any, any>[] = [];
 
   const flushWorkerSegment = (): void => {
@@ -147,9 +147,9 @@ export function compose<T = any, R = any>(
   for (const s of scripts) {
     if (isCoroutineScript(s)) {
       scriptBuffer.push(s);
-    } else if (s && typeof (s as TaskRunner).run === "function") {
+    } else if (s && typeof (s as Executor).run === "function") {
       flushWorkerSegment();
-      segments.push({ kind: "task", runner: s as TaskRunner });
+      segments.push({ kind: "task", runner: s as Executor });
     }
   }
   flushWorkerSegment();
@@ -162,7 +162,7 @@ export function compose<T = any, R = any>(
   let rejectClose: ((error: Error) => void) | null = null;
   let disposePromise: Promise<void> | null = null;
 
-  const ownedRunners = (): TaskRunner<any, any>[] =>
+  const ownedRunners = (): Executor<any, any>[] =>
     segments.map((segment) => segment.runner);
 
   const closeOwnedRunners = async (): Promise<void> => {
