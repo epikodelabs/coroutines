@@ -50,7 +50,6 @@ export {
   unregisterActorRequestHandler,
 } from "./bus";
 export type {
-  ActorBus,
   ActorBusDispatchOptions,
   ActorBusHandler,
   ActorBusMessage,

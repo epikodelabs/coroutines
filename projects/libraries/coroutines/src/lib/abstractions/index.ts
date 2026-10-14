@@ -1,3 +1,5 @@
 export * from './actor';
+export * from './bus';
+export * from './compose';
 export * from './coroutine';
 export * from './supervisor';

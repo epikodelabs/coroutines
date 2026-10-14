@@ -26,10 +26,6 @@ export type TaskRunnerOptions = {
     functions: Function[],
     config?: WorkerScriptConfig,
   ) => string;
-  createMessageHandler?: (
-    worker: Worker,
-    pendingTasks: PendingTaskMap,
-  ) => (event: MessageEvent<WorkerProtocolMessage>) => void;
 };
 
 const toError = (error: unknown, fallback: string): Error =>
@@ -50,7 +46,6 @@ export function createTaskRunner<T, R>({
   main,
   functions,
   generateWorkerScript,
-  createMessageHandler,
 }: TaskRunnerOptions): TaskRunner<T, R> {
   if (
     maxWorkers !== undefined &&
@@ -247,9 +242,7 @@ export function createTaskRunner<T, R>({
   const createWorker = (): Worker => {
     const workerId = ++nextWorkerId;
     const worker = createModuleWorker(getWorkerScriptUrl());
-    const messageHandler = createMessageHandler
-      ? createMessageHandler(worker, pendingMessages)
-      : createDefaultMessageHandler(worker, pendingMessages);
+    const messageHandler = createDefaultMessageHandler(pendingMessages);
     const errorHandler = (event: ErrorEvent) => {
       const error =
         event.error instanceof Error

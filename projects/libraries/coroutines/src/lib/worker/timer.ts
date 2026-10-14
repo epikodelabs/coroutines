@@ -41,17 +41,17 @@ const createHostTimer = (
   ms: number,
   elapsed: () => void,
 ): WorkerTimer => {
-  let pending = true;
+  let unsettled = true;
   const handle = setTimeout(() => {
-    if (!pending) return;
-    pending = false;
+    if (!unsettled) return;
+    unsettled = false;
     elapsed();
   }, ms);
 
   return {
     cancel(): boolean {
-      if (!pending) return false;
-      pending = false;
+      if (!unsettled) return false;
+      unsettled = false;
       clearTimeout(handle);
       return true;
     },

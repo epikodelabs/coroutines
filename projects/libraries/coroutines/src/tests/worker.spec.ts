@@ -33,8 +33,7 @@ idescribe("worker helpers", () => {
   describe("createDefaultMessageHandler", () => {
     it("resolves and rejects pending tasks, including fallback worker errors", async () => {
       const pendingTasks: PendingTaskMap = new Map();
-      const worker = {} as Worker;
-      const handler = createDefaultMessageHandler(worker, pendingTasks);
+      const handler = createDefaultMessageHandler(pendingTasks);
 
       let resolvedValue: unknown;
       let rejectedError: Error | undefined;
@@ -64,49 +63,13 @@ idescribe("worker helpers", () => {
       expect(warnSpy).not.toHaveBeenCalled();
     });
 
-    it("routes request and notify hooks and warns when hooks fail or are missing", async () => {
+    it("warns on unknown message types from the worker", async () => {
       const pendingTasks: PendingTaskMap = new Map();
-      const worker = {} as Worker;
-      const onRequest = jasmine.createSpy("onRequest").and.resolveTo();
-      const onWorkerMessage = jasmine.createSpy("onWorkerMessage").and.resolveTo();
-      const handler = createDefaultMessageHandler(worker, pendingTasks, {
-        onRequest,
-        onWorkerMessage,
-      });
+      const handler = createDefaultMessageHandler(pendingTasks);
 
-      const requestMessage = { workerId: 1, taskId: "r", type: "request", payload: "rq" } as const;
-      const notifyMessage = { workerId: 1, taskId: "n", type: "notify", payload: "nt" } as const;
-
-      handler({ data: requestMessage } as any);
-      handler({ data: notifyMessage } as any);
-      await flush();
-
-      expect(onRequest).toHaveBeenCalledWith(requestMessage);
-      expect(onWorkerMessage).toHaveBeenCalledWith(notifyMessage);
-
-      const failingHandler = createDefaultMessageHandler(worker, pendingTasks, {
-        onRequest: async () => {
-          throw new Error("request hook boom");
-        },
-        onWorkerMessage: async () => {
-          throw new Error("notify hook boom");
-        },
-      });
-
-      failingHandler({ data: requestMessage } as any);
-      failingHandler({ data: notifyMessage } as any);
-      await flush();
-
-      const defaultHandler = createDefaultMessageHandler(worker, pendingTasks);
-      defaultHandler({ data: requestMessage } as any);
-      defaultHandler({ data: notifyMessage } as any);
-      defaultHandler({ data: { workerId: 1, taskId: "u", type: "stopped" } } as any);
+      handler({ data: { workerId: 1, taskId: "u", type: "stopped" } } as any);
 
       expect(warnSpy.calls.allArgs().map(args => String(args[0]))).toEqual([
-        "Worker request hook failed:",
-        "Worker message hook failed:",
-        "Unhandled worker request:",
-        "Unhandled worker message:",
         "Unknown message type from worker:",
       ]);
     });

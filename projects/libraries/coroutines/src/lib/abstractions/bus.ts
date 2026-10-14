@@ -20,29 +20,6 @@ export type ActorBusHandler<T = any> = (
   message: ActorBusMessage<T>
 ) => void | Promise<void>;
 
-export interface ActorBus {
-  publish: <T = any>(
-    topic: string,
-    payload: T,
-    options?: ActorBusDispatchOptions
-  ) => void;
-  send: <T = any>(
-    to: ActorBusTarget,
-    topic: string,
-    payload: T,
-    options?: Pick<ActorBusDispatchOptions, "from">
-  ) => void;
-  dispatch: <T = any>(
-    message: ActorBusMessage<T>,
-    options?: Pick<ActorBusDispatchOptions, "includeSelf">
-  ) => void;
-  listen: {
-    <T = any>(handler: ActorBusHandler<T>): () => void;
-    <T = any>(name: string, handler: ActorBusHandler<T>): () => void;
-  };
-  clear: () => void;
-}
-
 export type ActorMessageContext = {
   from?: string;
   to?: ActorBusTarget;

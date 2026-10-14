@@ -1,4 +1,8 @@
-import { buildCoroutineWorkerRuntime, buildWorkerScript, createTaskRunner, serializeScript } from "../worker";
+import { buildCoroutineWorkerRuntime } from "../worker/runtimes";
+import { buildWorkerScript, serializeScript } from "../worker/script";
+import { createTaskRunner } from "../worker/runner";
+import { normalizeTaskRunControl } from "../worker/control";
+import type { TaskRunControl } from "../utils/transfer";
 import type { Coroutine, CoroutineScript, TaskRunner } from "../worker/types";
 
 type Composable<I = any, O = any> = CoroutineScript<I, O> | TaskRunner<I, O>;
@@ -21,8 +25,6 @@ type IsComposableChain<T extends readonly Composable[]> =
     : true;
 type ValidComposableChain<T extends readonly [Composable, ...Composable[]]> =
   IsComposableChain<T> extends true ? T : never;
-import type { TaskRunControl } from "./transfer";
-import { normalizeTaskRunControl } from "../worker/control";
 
 function isCoroutineScript(value: unknown): value is CoroutineScript {
   return (
