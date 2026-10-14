@@ -1,5 +1,5 @@
 import { compose, coroutine, type TaskRunControl } from "../public-api";
-import { idescribe } from "./env.spec";
+import { idescribe } from "./env";
 
 idescribe("compose coroutines", () => {
   it("preserves types across more than three composed stages", async () => {

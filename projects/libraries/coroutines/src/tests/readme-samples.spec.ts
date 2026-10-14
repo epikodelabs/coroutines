@@ -34,7 +34,7 @@ import {
   withDeadline,
   withTimeout,
 } from "../public-api";
-import { idescribe } from "./env.spec";
+import { idescribe } from "./env";
 
 // Type-only declaration: erased at runtime, so a coroutine body that calls it
 // hits a genuine ReferenceError inside the worker.
@@ -849,7 +849,6 @@ idescribe("README samples", () => {
     });
 
     it("keeps transferables with the caller when cancelled before posting", async () => {
-      const controller = new AbortController();
       const input = new ArrayBuffer(8);
       const runner = coroutine((_value: ArrayBuffer) => _value);
       const work = group({ concurrency: 1 });
@@ -859,7 +858,6 @@ idescribe("README samples", () => {
       const queued = work.spawn((signal) =>
         runner.run(input, { signal, transfer: [input] }),
       );
-      controller.abort();
       work.cancel();
 
       expect(await capture(queued)).toBeInstanceOf(Error);

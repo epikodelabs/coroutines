@@ -6,95 +6,10 @@ import {
 } from "../lib/worker";
 import { createTaskRunner } from "../lib/worker/runner";
 import { scheduleWorkerTimer } from "../lib/worker/timer";
-import { idescribe } from "./env.spec";
+import { idescribe } from "./env";
+import { FakeWorker } from "./helpers/worker-harness";
 
 const flush = () => new Promise(resolve => setTimeout(resolve, 0));
-
-class MockWorker {
-  static instances: MockWorker[] = [];
-  static postMessageError: unknown = null;
-
-  onmessage: ((event: MessageEvent<any>) => void) | null = null;
-  onerror: ((event: ErrorEvent) => void) | null = null;
-  private timers = new Map<number, ReturnType<typeof setTimeout>>();
-
-  readonly listeners = new Map<string, Array<(event: any) => void>>();
-  readonly url: string;
-  readonly options: WorkerOptions | undefined;
-  readonly sentMessages: WorkerProtocolMessage[] = [];
-  readonly sentTransfers: Transferable[][] = [];
-  terminated = false;
-  __id?: number;
-
-  constructor(url: string, options?: WorkerOptions) {
-    this.url = url;
-    this.options = options;
-    MockWorker.instances.push(this);
-  }
-
-  addEventListener(type: string, listener: (event: any) => void) {
-    const listeners = this.listeners.get(type) || [];
-    listeners.push(listener);
-    this.listeners.set(type, listeners);
-  }
-
-  removeEventListener(type: string, listener: (event: any) => void) {
-    const listeners = this.listeners.get(type);
-    if (!listeners) return;
-    const index = listeners.indexOf(listener);
-    if (index >= 0) listeners.splice(index, 1);
-  }
-
-  postMessage(message: WorkerProtocolMessage | any, transfer: Transferable[] = []) {
-    if (MockWorker.postMessageError !== null) {
-      throw MockWorker.postMessageError;
-    }
-
-    this.sentMessages.push(message);
-    this.sentTransfers.push([...transfer]);
-
-    if (message?.type === "set" && typeof message.id === "number") {
-      const handle = setTimeout(() => {
-        this.timers.delete(message.id);
-        this.onmessage?.({
-          data: { type: "elapsed", id: message.id },
-        } as MessageEvent<any>);
-      }, message.ms);
-      this.timers.set(message.id, handle);
-    } else if (message?.type === "clear" && typeof message.id === "number") {
-      const handle = this.timers.get(message.id);
-      if (handle !== undefined) {
-        clearTimeout(handle);
-        this.timers.delete(message.id);
-      }
-    }
-  }
-
-  terminate() {
-    this.terminated = true;
-    for (const handle of this.timers.values()) clearTimeout(handle);
-    this.timers.clear();
-    this.onmessage = null;
-    this.onerror = null;
-  }
-
-  dispatch(message: WorkerProtocolMessage) {
-    const event = { data: message } as MessageEvent<WorkerProtocolMessage>;
-    for (const listener of [...(this.listeners.get("message") || [])]) {
-      listener(event);
-    }
-  }
-
-  dispatchError(error: unknown, message = "worker failed") {
-    const event = {
-      error,
-      message,
-    } as ErrorEvent;
-    for (const listener of [...(this.listeners.get("error") || [])]) {
-      listener(event);
-    }
-  }
-}
 
 idescribe("worker helpers", () => {
   let originalWorker: any;
@@ -102,12 +17,12 @@ idescribe("worker helpers", () => {
 
   beforeAll(() => {
     originalWorker = (globalThis as any).Worker;
-    (globalThis as any).Worker = MockWorker;
+    (globalThis as any).Worker = FakeWorker;
   });
 
   beforeEach(() => {
-    MockWorker.instances.length = 0;
-    MockWorker.postMessageError = null;
+    FakeWorker.instances.length = 0;
+    FakeWorker.postMessageError = null;
     warnSpy = spyOn(console, "warn");
   });
 
@@ -210,7 +125,7 @@ idescribe("worker helpers", () => {
       const pending = runner.run(1);
       await flush();
 
-      const worker = MockWorker.instances[0];
+      const worker = FakeWorker.instances[0];
       expect(worker.options?.type).toBe("module");
 
       const message = worker.sentMessages[0];
@@ -221,7 +136,7 @@ idescribe("worker helpers", () => {
 
     it("creates the shared timer worker as a native ES module worker", () => {
       const timer = scheduleWorkerTimer(10000, () => fail("timer should not elapse"));
-      const worker = MockWorker.instances[0];
+      const worker = FakeWorker.instances[0];
 
       expect(worker.options?.type).toBe("module");
 
@@ -256,7 +171,7 @@ idescribe("worker helpers", () => {
       await flush();
 
       expect(createUrl).toHaveBeenCalledTimes(1);
-      const worker = MockWorker.instances[MockWorker.instances.length - 1];
+      const worker = FakeWorker.instances[FakeWorker.instances.length - 1];
       const message = worker.sentMessages[0];
       worker.dispatch({ ...message, type: "response", payload: 1 });
       await expectAsync(pending).toBeResolvedTo(1);
@@ -264,8 +179,6 @@ idescribe("worker helpers", () => {
 
       expect(revokeUrl).toHaveBeenCalledWith("blob:coroutines-lazy");
     });
-
-;
   });
 
   describe("createTaskRunner", () => {
@@ -285,9 +198,9 @@ idescribe("worker helpers", () => {
       const third = runner.run(3);
       await flush();
 
-      expect(MockWorker.instances.length).toBe(3);
+      expect(FakeWorker.instances.length).toBe(3);
 
-      MockWorker.instances.forEach((worker, index) => {
+      FakeWorker.instances.forEach((worker, index) => {
         const message = worker.sentMessages[0];
         worker.dispatch({ ...message, type: "response", payload: index + 10 });
       });
@@ -298,8 +211,8 @@ idescribe("worker helpers", () => {
 
       const reused = runner.run(4);
       await flush();
-      expect(MockWorker.instances.length).toBe(3);
-      const reusedWorker = MockWorker.instances.find(worker => worker.sentMessages.length === 2)!;
+      expect(FakeWorker.instances.length).toBe(3);
+      const reusedWorker = FakeWorker.instances.find(worker => worker.sentMessages.length === 2)!;
       const message = reusedWorker.sentMessages[1];
       reusedWorker.dispatch({ ...message, type: "response", payload: 40 });
       await expectAsync(reused).toBeResolvedTo(40);
@@ -320,8 +233,8 @@ idescribe("worker helpers", () => {
       const second = runner.run(2);
       await flush();
 
-      expect(MockWorker.instances.length).toBe(1);
-      const worker = MockWorker.instances[0];
+      expect(FakeWorker.instances.length).toBe(1);
+      const worker = FakeWorker.instances[0];
       expect(worker.sentMessages.length).toBe(1);
 
       const firstMessage = worker.sentMessages[0];
@@ -344,8 +257,8 @@ idescribe("worker helpers", () => {
       const healthy = runner.run(2);
       await flush();
 
-      const failedWorker = MockWorker.instances[0];
-      const healthyWorker = MockWorker.instances[1];
+      const failedWorker = FakeWorker.instances[0];
+      const healthyWorker = FakeWorker.instances[1];
 
       failedWorker.dispatchError(new Error("worker boom"));
       await expectAsync(failed).toBeRejectedWithError("worker boom");
@@ -366,8 +279,8 @@ idescribe("worker helpers", () => {
       const healthy = runner.run(2);
       await flush();
 
-      const cancelledWorker = MockWorker.instances[0];
-      const healthyWorker = MockWorker.instances[1];
+      const cancelledWorker = FakeWorker.instances[0];
+      const healthyWorker = FakeWorker.instances[1];
 
       controller.abort(new Error("cancel task"));
       await expectAsync(cancelled).toBeRejectedWithError("cancel task");
@@ -391,7 +304,7 @@ idescribe("worker helpers", () => {
       const pending = runner.run(buffer, { transfer: [buffer] });
       await flush();
 
-      const worker = MockWorker.instances[0];
+      const worker = FakeWorker.instances[0];
       expect(worker.sentTransfers[0]).toEqual([buffer]);
       const message = worker.sentMessages[0];
       worker.dispatch({ ...message, type: "response", payload: 16 });
@@ -409,7 +322,7 @@ idescribe("worker helpers", () => {
       const closing = runner.close();
       await expectAsync(runner.run(3)).toBeRejectedWithError("closing-runner is closed");
 
-      MockWorker.instances.forEach((worker, index) => {
+      FakeWorker.instances.forEach((worker, index) => {
         const message = worker.sentMessages[0];
         worker.dispatch({ ...message, type: "response", payload: index + 1 });
       });
@@ -417,7 +330,7 @@ idescribe("worker helpers", () => {
       await expectAsync(first).toBeResolvedTo(1);
       await expectAsync(second).toBeResolvedTo(2);
       await expectAsync(closing).toBeResolved();
-      expect(MockWorker.instances.every(worker => worker.terminated)).toBeTrue();
+      expect(FakeWorker.instances.every(worker => worker.terminated)).toBeTrue();
     });
 
     it("dispose immediately rejects all active submissions and settles close", async () => {
@@ -432,7 +345,7 @@ idescribe("worker helpers", () => {
       await expectAsync(first).toBeRejectedWithError(/finalized before the worker task completed/);
       await expectAsync(second).toBeRejectedWithError(/finalized before the worker task completed/);
       await expectAsync(closing).toBeResolved();
-      expect(MockWorker.instances.every(worker => worker.terminated)).toBeTrue();
+      expect(FakeWorker.instances.every(worker => worker.terminated)).toBeTrue();
     });
 
     it("wraps worker construction and postMessage failures", async () => {
@@ -450,7 +363,7 @@ idescribe("worker helpers", () => {
       await ctorRunner.dispose();
 
       (globalThis as any).Worker = originalWorkerCtor;
-      MockWorker.postMessageError = new Error("postMessage boom");
+      FakeWorker.postMessageError = new Error("postMessage boom");
       const postRunner = createRunner("post-runner");
       await expectAsync(postRunner.run(1)).toBeRejectedWithError("postMessage boom");
       await postRunner.dispose();
@@ -504,11 +417,11 @@ idescribe("worker helpers", () => {
         },
       );
 
-      MockWorker.postMessageError = new Error("timer post failed");
+      FakeWorker.postMessageError = new Error("timer post failed");
 
       expect(first.cancel()).toBeTrue();
       expect(otherError?.message).toBe("timer post failed");
-      expect(MockWorker.instances[0].terminated).toBeTrue();
+      expect(FakeWorker.instances[0].terminated).toBeTrue();
     });
 
 
@@ -517,8 +430,8 @@ idescribe("worker helpers", () => {
         scheduleWorkerTimer(10000, () => fail("cancelled timer elapsed")),
       );
 
-      expect(MockWorker.instances.length).toBe(1);
-      const timerWorker = MockWorker.instances[0];
+      expect(FakeWorker.instances.length).toBe(1);
+      const timerWorker = FakeWorker.instances[0];
 
       for (let index = 0; index < timers.length - 1; index++) {
         expect(timers[index].cancel()).toBeTrue();
@@ -563,7 +476,7 @@ idescribe("worker helpers", () => {
         },
       );
 
-      const timerWorker = MockWorker.instances[0] as any;
+      const timerWorker = FakeWorker.instances[0] as any;
 
       expect(() =>
         timerWorker.onerror({
@@ -587,7 +500,7 @@ idescribe("worker helpers", () => {
         },
       );
 
-      const timerWorker = MockWorker.instances[0] as any;
+      const timerWorker = FakeWorker.instances[0] as any;
       const setMessage = timerWorker.sentMessages[0] as any;
 
       expect(() =>
@@ -601,7 +514,7 @@ idescribe("worker helpers", () => {
 
     it("ignores stale timer worker errors after the worker has been released", () => {
       const timer = scheduleWorkerTimer(1000, () => {});
-      const oldWorker = MockWorker.instances[0] as any;
+      const oldWorker = FakeWorker.instances[0] as any;
 
       expect(timer.cancel()).toBeTrue();
       expect(oldWorker.terminated).toBeTrue();

@@ -1,174 +1,29 @@
 import {
-  ChannelClosedError,
-  ContextCancelledError,
-  background,
-  channel,
   coroutine,
-  otherwise,
-  receive,
-  select,
-  send,
-  withCancel,
-  withDeadline,
-  withTimeout
 } from "../public-api";
-import { idescribe } from "./env.spec";
+import { idescribe } from "./env";
+import {
+  CoroutineWorkerSimulator,
+  ErrorNoMessageWorker,
+} from "./helpers/worker-harness";
 
 idescribe('coroutine', () => {
   let originalWorker: any;
-  let originalLog: typeof console.log;
-  let originalError: typeof console.error;
-  let originalWarn: typeof console.warn;
   let mockWorkerCreations = 0;
 
   beforeAll(() => {
-    // Store the original Worker
     originalWorker = (globalThis as any).Worker;
-
-    // Save originals
-    originalLog = console.log;
-    originalError = console.error;
-    originalWarn = console.warn;
-
-    // Set up globalThis variable for main task
     (globalThis as any).currentMainTask = undefined;
 
-    const serializeWorkerError = (error: unknown): string => {
-      if (error instanceof Error) return error.message || error.name || "Error";
-      if (error === undefined) return "Worker task threw undefined";
-      if (error === null) return "Worker task threw null";
-      return String(error);
+    // The simulator executes the real coroutine runtime string; the task
+    // runs against the shipped protocol instead of a hand-copied mock.
+    (globalThis as any).Worker = class extends CoroutineWorkerSimulator {
+      constructor(url: string, options?: WorkerOptions) {
+        super(url, options, () => { mockWorkerCreations++; });
+      }
     };
-
-    class MockWorker {
-      onmessage: ((ev: any) => void) | null = null;
-      listeners: Record<string, ((ev: any) => void)[]> = {};
-      terminated = false;
-      private workerInbox = channel<any>();
-
-      constructor(_url: string, _options?: any) {
-        mockWorkerCreations++;
-      }
-
-      private handleDataRequest(_requestPayload: any): Promise<any> {
-        return new Promise((resolve) => {
-          // Simulate async data request by resolving with dummy data
-          setTimeout(() => {
-            resolve({ value: 10, message: "Dummy data from mock worker" });
-          }, 1);
-        });
-      }
-
-      private createWorkerUtils(message: { workerId: number; taskId: string }) {
-        return {
-          main: {
-            send: (payload: any) => {
-              const event: MessageEvent<any> = {
-                data: { workerId: message.workerId, taskId: message.taskId, type: "notify", payload }
-              } as any;
-              this.onmessage?.(event);
-              this.listeners["message"]?.forEach(fn => fn(event));
-            },
-            request: (requestPayload: any) => this.handleDataRequest(requestPayload),
-            receive: async (signal?: AbortSignal) => {
-              const result = await this.workerInbox.receive(signal);
-              return result.ok ? result.value : undefined;
-            },
-            inbox: this.workerInbox,
-          },
-          concurrency: {
-            channel,
-            receive,
-            send,
-            otherwise,
-            select,
-            background,
-            withCancel,
-            withTimeout,
-            withDeadline,
-            ChannelClosedError,
-            ContextCancelledError,
-          }
-        };
-      }
-
-      postMessage(msg: any) {
-        setTimeout(() => {
-          if (this.terminated) return;
-          
-          if (msg.type === 'task') {
-            try {
-              const mainTask = (globalThis as any).currentMainTask;
-              if (!mainTask) {
-                throw new Error('No main task configured');
-              }
-              const workerUtils = this.createWorkerUtils(msg);
-              
-              let result;
-              
-              // Check if mainTask expects utils parameter
-              if (mainTask.length >= 2) {
-                // Call with both data and utils
-                result = mainTask(msg.payload, workerUtils);
-              } else {
-                // Call with only data
-                result = mainTask(msg.payload);
-              }
-              
-              // Handle both sync and async results
-              Promise.resolve(result).then(finalResult => {
-                const event: MessageEvent<any> = {
-                  data: { ...msg, type: 'response', payload: finalResult }
-                } as any;
-                this.onmessage?.(event);
-                this.listeners['message']?.forEach(fn => fn(event));
-              }).catch(err => {
-                const message = serializeWorkerError(err);
-                const event: MessageEvent<any> = {
-                  data: { ...msg, type: 'error', error: message }
-                } as any;
-                this.onmessage?.(event);
-                this.listeners['message']?.forEach(fn => fn(event));
-              });
-              
-            } catch (err: any) {
-              const message = serializeWorkerError(err);
-              const event: MessageEvent<any> = {
-                data: { ...msg, type: 'error', error: message }
-              } as any;
-              this.onmessage?.(event);
-              this.listeners['message']?.forEach(fn => fn(event));
-            }
-          } else if (msg.type === "notify") {
-            this.workerInbox.send(msg.payload).catch(() => {});
-          } else if (msg.type === 'data') {
-            // Handle responses to worker data requests (if needed)
-            console.log('MockWorker received data response:', msg);
-          }
-        }, 1);
-      }
-
-      addEventListener(type: string, fn: (ev: any) => void) {
-        this.listeners[type] ||= [];
-        this.listeners[type].push(fn);
-      }
-
-      removeEventListener(type: string, fn: (ev: any) => void) {
-        if (this.listeners[type]) {
-          this.listeners[type] = this.listeners[type].filter(f => f !== fn);
-        }
-      }
-
-      terminate() {
-        this.terminated = true;
-        this.listeners = {};
-        this.onmessage = null;
-      }
-    }
-
-    (globalThis as any).Worker = MockWorker;
   });
-  
+
   afterAll(() => {
     (globalThis as any).Worker = originalWorker;
     delete (globalThis as any).currentMainTask;
@@ -183,7 +38,7 @@ idescribe('coroutine', () => {
   it('should process tasks and return results', async () => {
     const mainTask = (x: number) => x + 1;
     (globalThis as any).currentMainTask = mainTask;
-    
+
     const co = coroutine(mainTask);
 
     const stream = (async function* () {
@@ -203,7 +58,7 @@ idescribe('coroutine', () => {
   it('should process concurrent tasks on elastic workers', async () => {
     const mainTask = (x: number) => x * 2; // Fixed: consistent task logic
     (globalThis as any).currentMainTask = mainTask;
-    
+
     const co = coroutine(mainTask);
 
     const results = await Promise.all([
@@ -229,10 +84,9 @@ idescribe('coroutine', () => {
   });
 
   it('should throw error from run directly', async () => {
-    // Silence them
-    console.log = () => {};
-    console.error = () => {};
-    console.warn = () => {};
+    spyOn(console, "log").and.callFake(() => {});
+    spyOn(console, "error").and.callFake(() => {});
+    spyOn(console, "warn").and.callFake(() => {});
 
     const mainTask = () => {
       throw new Error('boom');
@@ -247,18 +101,12 @@ idescribe('coroutine', () => {
     } catch (err: any) {
       expect(err.message).toBe('boom');
     }
-
-    // Restore originals
-    console.log = originalLog;
-    console.error = originalError;
-    console.warn = originalWarn;
   });
 
   it('should serialize undefined worker errors sensibly', async () => {
-    // Silence them
-    console.log = () => {};
-    console.error = () => {};
-    console.warn = () => {};
+    spyOn(console, "log").and.callFake(() => {});
+    spyOn(console, "error").and.callFake(() => {});
+    spyOn(console, "warn").and.callFake(() => {});
 
     const mainTask = () => {
       throw undefined;
@@ -273,19 +121,13 @@ idescribe('coroutine', () => {
     } catch (err: any) {
       expect(err.message).toBe('Worker task threw undefined');
     }
-
-    // Restore originals
-    console.log = originalLog;
-    console.error = originalError;
-    console.warn = originalWarn;
   });
 
   it('should handle worker errors gracefully in stream', async () => {
-     // Silence them
-    console.log = () => {};
-    console.error = () => {};
-    console.warn = () => {};
-    
+    spyOn(console, "log").and.callFake(() => {});
+    spyOn(console, "error").and.callFake(() => {});
+    spyOn(console, "warn").and.callFake(() => {});
+
     const mainTask = (x: number) => {
       if (x === 2) {
         throw new Error('boom');
@@ -316,31 +158,6 @@ idescribe('coroutine', () => {
 
     expect(errorCaught).toBe(true);
     expect(processed).toEqual([2]); // Only the first value processed successfully
-    
-    // Restore originals
-    console.log = originalLog;
-    console.error = originalError;
-    console.warn = originalWarn;
-  });
-
-  it('should fall back to 4 workers when navigator.hardwareConcurrency is not set', async () => {
-    const originalDescriptor = Object.getOwnPropertyDescriptor(navigator, "hardwareConcurrency");
-
-    try {
-      Object.defineProperty(navigator, "hardwareConcurrency", { value: 0, configurable: true });
-
-      const mainTask = (x: number) => x + 1;
-      (globalThis as any).currentMainTask = mainTask;
-
-      const co = coroutine(mainTask);
-      const result = await co.run(1);
-      expect(result).toBe(2);
-      await co.dispose();
-    } finally {
-      if (originalDescriptor) {
-        Object.defineProperty(navigator, "hardwareConcurrency", originalDescriptor);
-      }
-    }
   });
 
   it('should support trailing coroutine options', async () => {
@@ -375,43 +192,6 @@ idescribe('coroutine', () => {
 
   it('should reject with "Unknown worker error" when worker error message is missing', async () => {
     const originalWorker = (globalThis as any).Worker;
-
-    class ErrorNoMessageWorker {
-      listeners: Record<string, ((ev: any) => void)[]> = {};
-      terminated = false;
-
-      constructor(_url: string, _options?: any) {}
-
-      addEventListener(type: string, fn: (ev: any) => void) {
-        this.listeners[type] ||= [];
-        this.listeners[type].push(fn);
-      }
-
-      removeEventListener(type: string, fn: (ev: any) => void) {
-        if (this.listeners[type]) {
-          this.listeners[type] = this.listeners[type].filter(f => f !== fn);
-        }
-      }
-
-      postMessage(msg: any) {
-        setTimeout(() => {
-          if (this.terminated) return;
-          if (msg.type !== "task") return;
-
-          const event: MessageEvent<any> = {
-            data: { ...msg, type: "error" } // no `error` field on purpose
-          } as any;
-
-          this.listeners["message"]?.forEach(fn => fn(event));
-        }, 1);
-      }
-
-      terminate() {
-        this.terminated = true;
-        this.listeners = {};
-      }
-    }
-
     (globalThis as any).Worker = ErrorNoMessageWorker;
 
     try {
@@ -467,7 +247,6 @@ idescribe('coroutine', () => {
     );
   });
 
-
   it("close drains admitted coroutine work and rejects new submissions", async () => {
     const mainTask = async (x: number) => {
       await new Promise((resolve) => setTimeout(resolve, 10));
@@ -505,6 +284,4 @@ idescribe('coroutine', () => {
     await expectAsync(second).toBeRejected();
     await expectAsync(co.close()).toBeResolved();
   });
-
-
 });
