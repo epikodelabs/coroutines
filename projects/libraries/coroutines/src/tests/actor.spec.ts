@@ -1757,11 +1757,14 @@ idescribe("actor", () => {
     (globalThis as any).actorPostMessageError = (msg: any) =>
       msg.type === "notify" ? new Error("flush transport failed") : undefined;
 
-    await pause(35);
+    // WebKit processes the restart timer and the failed flush more slowly than
+    // V8. Wait for the second restart while the transport error is still armed,
+    // then let the replacement generation start.
+    await waitFor(() => supervised.restarts >= 2, 1000);
     delete (globalThis as any).actorPostMessageError;
+    await waitFor(() => supervised.running, 1000);
 
     expect(supervised.restarts).toBe(2);
-    expect(supervised.running).toBeTrue();
     expect(supervised.pending).toBe(0);
     expect(await main.outbox.request(supervised, "state", "state")).toBe(11);
 
