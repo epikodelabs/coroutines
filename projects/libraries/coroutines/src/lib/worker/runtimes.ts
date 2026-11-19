@@ -8,7 +8,9 @@
 const workerErrorSerializerSnippet = (helperHint: string): string => `
 const __serializeWorkerError = (error) => {
   if (error instanceof ReferenceError) {
-    const missing = /^([A-Za-z_$][\\w$]*) is not defined/.exec(error.message);
+    const missing =
+      /^([A-Za-z_$][\\w$]*) is not defined/.exec(error.message) ||
+      /^(?:ReferenceError:\\s*)?Can't find variable: ([A-Za-z_$][\\w$]*)/.exec(error.message);
     if (missing) {
       return (
         error.message +
